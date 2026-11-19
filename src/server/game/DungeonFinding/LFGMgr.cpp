@@ -626,6 +626,17 @@ namespace lfg
         if (grp && (grp->isBGGroup() || grp->isBFGroup()))
             return;
 
+        if (grp && guid != grp->GetLeaderGUID())
+        {
+            LfgQueuePolicy policy;
+            sScriptMgr->OnResolveLfgQueuePolicy(guid, policy);
+            if (policy.compositionMode == LfgCompositionMode::CURRENT_PARTY)
+            {
+                ChatHandler(player->GetSession()).SendNotification("Only the group leader can initiate a Current Party dungeon queue.");
+                return;
+            }
+        }
+
         if (!sScriptMgr->OnPlayerCanJoinLfg(player, roles, dungeons, comment))
             return;
 
@@ -1526,7 +1537,13 @@ namespace lfg
 
             if (itRoles == roleCheck.roles.end())
             {
-                roleCheck.state = CheckGroupRoles(roleCheck.roles) ? LFG_ROLECHECK_FINISHED : LFG_ROLECHECK_WRONG_ROLES;
+                LfgQueuePolicy policy;
+                sScriptMgr->OnResolveLfgQueuePolicy(roleCheck.leader, policy);
+
+                if (!policy.requireStandardRoles)
+                    roleCheck.state = LFG_ROLECHECK_FINISHED;
+                else
+                    roleCheck.state = CheckGroupRoles(roleCheck.roles) ? LFG_ROLECHECK_FINISHED : LFG_ROLECHECK_WRONG_ROLES;
             }
         }
 
@@ -2548,6 +2565,14 @@ namespace lfg
 
         LOG_DEBUG("lfg", "LFGMgr::GetState: [{}] = {}", guid.ToString(), state);
         return state;
+    }
+
+    uint32 LFGMgr::GetProposalIdForPlayer(ObjectGuid guid) const
+    {
+        for (auto const& [proposalId, proposal] : ProposalsStore)
+            if (proposal.players.find(guid) != proposal.players.end())
+                return proposalId;
+        return 0;
     }
 
     LfgState LFGMgr::GetOldState(ObjectGuid guid)

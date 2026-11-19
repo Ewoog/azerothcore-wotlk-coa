@@ -17847,3 +17847,8 @@ void Player::SendSystemMessage(std::string_view msg, bool escapeCharacters)
 {
     ChatHandler(GetSession()).SendSysMessage(msg, escapeCharacters);
 }
+
+bool Player::IsBot() const
+{
+    return m_session && m_session->IsBot();
+}

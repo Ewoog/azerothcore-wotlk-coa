@@ -396,6 +396,7 @@ public: /* PlayerScript */
     void OnPlayerUnequip(Player* player, Item* it);
     void OnPlayerJoinBG(Player* player);
     void OnPlayerJoinArena(Player* player);
+    void OnPetitionOffered(Player* player, ObjectGuid petitionGuid);
     void OnPlayerGetMaxPersonalArenaRatingRequirement(Player const* player, uint32 minSlot, uint32& maxArenaRating) const;
     void OnPlayerLootItem(Player* player, Item* item, uint32 count, ObjectGuid lootguid);
     void OnPlayerBeforeFillQuestLootItem(Player* player, LootItem& item);
@@ -612,6 +613,10 @@ public: /* GlobalScript */
     void OnInstanceIdRemoved(uint32 instanceId);
     void OnBeforeSetBossState(uint32 id, EncounterState newState, EncounterState oldState, Map* instance);
     void AfterInstanceGameObjectCreate(Map* instance, GameObject* go);
+    void OnResolveLfgQueuePolicy(ObjectGuid const& guid, lfg::LfgQueuePolicy& policy);
+    void OnLfgProposalMadeGroup(lfg::LfgProposal const& proposal, Group* group);
+    void OnInstanceMapCreated(InstanceMap* instanceMap, Player* player);
+    bool HasLfgAutoFillProvider() const;
 
 public: /* Scheduled scripts */
     uint32 IncreaseScheduledScriptsCount() { return ++_scheduledScripts; }

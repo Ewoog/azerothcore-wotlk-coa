@@ -26,6 +26,9 @@ struct ItemTemplate;
 
 namespace LocalLevelScaling
 {
+// Level at which companion bots (mod-coa-playerbots) may use flying mounts.
+inline std::atomic<std::uint8_t> FlightUnlockLevel{60};
+
 using PersonalInstanceScalingResolver = bool (*)(Map const*, Player const*);
 inline std::atomic<PersonalInstanceScalingResolver> PersonalInstanceScalingOwner{nullptr};
 
