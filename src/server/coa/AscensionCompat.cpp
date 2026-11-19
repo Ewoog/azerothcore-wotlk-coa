@@ -12,6 +12,7 @@
 #include "AscensionClassServiceBridge.h"
 #include "AscensionFelsworn.h"
 #include "AscensionResourceQuery.h"
+#include "AscensionNecromancer.h"
 #include "AscensionHighRiskPolicy.h"
 #include "AscensionRemovedSpellActionBars.h"
 #include "AscensionRulesets.h"
@@ -12141,7 +12142,7 @@ namespace AscensionCompatData
     MinionCapacityState QueryMinionCapacityState(Player* player)
     {
         MinionCapacityState state;
-        if (!player || !UsesAscensionClassMechanics(player, CLASS_NECROMANCER))
+        if (!player || !player->getClass() == CLASS_NECROMANCER)
             return state;
 
         state.Maximum = AscensionNecromancer::Capacity(player);
@@ -12151,7 +12152,7 @@ namespace AscensionCompatData
 
     uint32 QueryMinionCapacityCost(Player* player, uint32 resolvedSpellId)
     {
-        if (!player || !UsesAscensionClassMechanics(player, CLASS_NECROMANCER))
+        if (!player || !player->getClass() == CLASS_NECROMANCER)
             return 0;
         return AscensionNecromancer::Cost(player, resolvedSpellId);
     }

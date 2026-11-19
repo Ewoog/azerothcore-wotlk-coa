@@ -603,6 +603,16 @@ inline constexpr std::array<ResourceCostRule, 75> ResourceCostRules =
     {22, 807952, 807952, 804455, 1, ResourceConsumption::All},
     {22, 807953, 807953, 804455, 1, ResourceConsumption::All}
 }};
+
+// Real enforced caps for custom resources whose hand-written Resource() function clamps to a
+// hardcoded value not reliably reflected in that resource's own ResourceDisplays row / DBC
+// StackAmount (see AscensionCultist::Resource, AscensionTinker::Resource, AscensionSunCleric::
+// Resource) -- shared by that gameplay code and AscensionResourceQuery.h's QueryAuraResourceState
+// so both read the exact same number instead of two independently hardcoded literals that could
+// silently drift apart from each other over time.
+constexpr std::uint32_t CULTIST_INSANITY_MAX = 100;
+constexpr std::uint32_t TINKER_SCRAP_MAX = 100;
+constexpr std::uint32_t SUN_CLERIC_SOLAR_POWER_MAX = 20;
 }
 
 #endif

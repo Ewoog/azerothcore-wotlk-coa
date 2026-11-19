@@ -59,6 +59,10 @@ bool Derived(SpellInfo const* info)
                 return true;
     return false;
 }
+bool IsInsanitySpender(SpellInfo const* info)
+{
+    return Any(info, {805116, 804152});
+}
 uint32 Count(Unit const* unit, uint32 id)
 {
     Aura const* aura = unit ? unit->GetAura(id) : nullptr;
