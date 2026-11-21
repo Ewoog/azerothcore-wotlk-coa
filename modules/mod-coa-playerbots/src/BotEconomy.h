@@ -93,6 +93,12 @@ namespace BotEconomy
     // GetStockLines: replies for GETSTOCK, `STOCK:<entry>,<count>,<limit>,<name>|...` (chunked by length).
     // SetStockLimit: keep >= 0 sets the limit, keep < 0 clears it. Guild master or officers only (not checked for console).
     std::vector<std::string> GetStockLines(Player* requester);
+
+    // Replies for GETECONOMY (the addon's Economy tab), for the requester's guild-mate and group bots:
+    // `ECONSTATE:<enabled>,<live>,<buy gear>,<craft sourcing>,<hourly cap left, -1 = none>`,
+    // `ECONBOT:<guid>,<name>,<money>,<sold 24h>,<bought 24h>|...` (chunked) and
+    // `ECONLOG:<bot>,<item>,<count>,<verdict>,<unit copper>,<minutes ago>|...` (latest executed journal rows), then `ECONEND`.
+    std::vector<std::string> GetEconomyLines(Player* requester);
     void SetStockLimit(Player* requester, uint32 itemEntry, int64 keep, ChatHandler* handler);
 
     // `.botcmd economy ...` (plan <guid>, journal [n], status, protect <item>, unprotect <item>).
@@ -147,6 +153,8 @@ namespace BotEconomy
     uint64 CraftReagentBudgetCopper();
     // 0: a crafting order waits for its reagents forever.
     uint32 CraftOrderTimeoutMs();
+    // Failed casts in a row before a crafting order is given up; 0: never.
+    uint32 CraftMaxCastFailures();
 }
 
 #endif // COA_PLAYERBOTS_BOT_ECONOMY_H

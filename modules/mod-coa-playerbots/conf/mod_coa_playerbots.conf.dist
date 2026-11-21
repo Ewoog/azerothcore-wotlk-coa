@@ -637,6 +637,27 @@ CoaBots.MarkSessionsAsBots = 1
 #                     between two looks for upgrades by the same bot.
 #        Default:     200000 - (20 gold) / 120
 #
+#    CoaBots.Economy.AuctionBuyHourlyCapCopper
+#        Description: What all bots together may spend at the auction houses in one hour (gear and crafting
+#                     reagents). Keeps a large bot population from emptying the auction houses. 0 = no cap.
+#        Default:     5000000 - (500 gold)
+#
+#    CoaBots.Economy.AuctionBuyMaxVendorMultiple
+#        Description: A bot never pays more per item than this many times the item's vendor sell price (items a
+#                     vendor buys for nothing have no ceiling). 0 = no ceiling.
+#        Default:     20
+#
+#    CoaBots.Economy.CraftForMarket
+#        Description: 1 = on every auction house visit a bot crafts goods from its own materials with the recipes it
+#                     knows, when the product fetches CraftForMarketMarginPercent more than the materials are worth,
+#                     and lists them. Reagents held for a crafting or gather order and protected items are never used.
+#                     `.botcmd economy crafts <bot guid>` shows what a bot would craft. Needs Enable = 1 and DryRun = 0.
+#        Default:     0
+#
+#    CoaBots.Economy.CraftForMarketMaxCasts / CraftForMarketMarginPercent
+#        Description: Crafts per auction house visit; how much more than its materials a product must fetch.
+#        Default:     10 / 25
+#
 
 CoaBots.Economy.Enable = 0
 CoaBots.Economy.MinTripCopper = 50000
@@ -667,6 +688,11 @@ CoaBots.Economy.AuctionBuyMinUpgradePercent = 10
 CoaBots.Economy.AuctionBuyFromBots = 1
 CoaBots.Economy.ShoppingMinSpareCopper = 200000
 CoaBots.Economy.ShoppingIntervalMin = 120
+CoaBots.Economy.AuctionBuyHourlyCapCopper = 5000000
+CoaBots.Economy.AuctionBuyMaxVendorMultiple = 20
+CoaBots.Economy.CraftForMarket = 0
+CoaBots.Economy.CraftForMarketMaxCasts = 10
+CoaBots.Economy.CraftForMarketMarginPercent = 25
 
 ###################################################################################################
 # CRAFTING ORDERS
@@ -696,12 +722,19 @@ CoaBots.Economy.ShoppingIntervalMin = 120
 #                     out of its mailbox while it waits. 0 = wait forever.
 #        Default:     120
 #
+#    CoaBots.Crafting.MaxCastFailures
+#        Description: A crafting order whose cast fails this many times in a row (no tool, not at an anvil or forge,
+#                     skill too low, bags full) is given up and the requester is told why. Failed casts are retried
+#                     every 5 seconds instead of every tick. 0 = keep trying.
+#        Default:     10
+#
 
 CoaBots.Crafting.ReagentsFromGuildBank = 0
 CoaBots.Crafting.ReagentsFromVendor = 0
 CoaBots.Crafting.ReagentsFromAuction = 0
 CoaBots.Crafting.ReagentBudgetCopper = 100000
 CoaBots.Crafting.OrderTimeoutMin = 120
+CoaBots.Crafting.MaxCastFailures = 10
 
 ###################################################################################################
 # COMBAT INTELLIGENCE

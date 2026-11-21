@@ -233,7 +233,9 @@ public:
     // TOPQUEUED). Each returns a short result token for the addon reply ("ok", "denied", "none").
     // Allowed when `commander` is in the bot's (or queued order's) guild and is either a guild
     // master/officer (rank 0/1) or the player who placed the order.
+    // Cancels the bot's gather order, or its crafting order when it has no gather order.
     std::string CancelGatherOrder(Player* commander, ObjectGuid::LowType botLowGuid);
+    std::string CancelCraftOrder(Player* commander, ObjectGuid::LowType botLowGuid);
     std::string PrioritizeGatherOrder(Player* commander, ObjectGuid::LowType botLowGuid);
     std::string CancelQueuedGatherOrder(Player* commander, uint32 queueId);
     std::string TopQueuedGatherOrder(Player* commander, uint32 queueId);
@@ -267,6 +269,10 @@ public:
         uint32 nextSourcingAtMs = 0;
         uint64 reagentBudgetLeftCopper = 0;
         bool toldMissing = false;
+        // Failed casts in a row (CoaBots.Crafting.MaxCastFailures ends the order) and when the next try may start.
+        uint32 failedCasts = 0;
+        uint32 nextCastAtMs = 0;
+        uint32 orderedCount = 0;
     };
     CraftOrderState const* GetCraftOrder(ObjectGuid const& guid) const;
 
@@ -723,6 +729,8 @@ private:
     std::unordered_map<ObjectGuid, CraftOrderState> _craftOrders;
     void ProcessCraftOrders();
     bool WaitForCraftReagents(Player* crafter, SpellInfo const* info, CraftOrderState& order);
+    // Counts a failed or empty cast; false when the order is given up (the requester is told why).
+    bool NoteCraftFailure(Player* crafter, CraftOrderState& order, std::string const& why);
 
     std::vector<WorldSession*> _botSessions;
     // One detached login per GUID; concurrent callers share its completion.

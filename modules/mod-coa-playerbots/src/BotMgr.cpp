@@ -17,6 +17,7 @@
 #include "BotAI.h"
 #include "BotMovement.h"
 #include "BotEconomy.h"
+#include "BotEconomyPolicy.h"
 #include "engine/SpecStrategyRegistry.h"
 #include "engine/ActionEvaluator.h"
 #include "BotSpawnRandom.h"
@@ -2581,7 +2582,7 @@ std::string BotMgr::CancelGatherOrder(Player* commander, ObjectGuid::LowType bot
     ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(botLowGuid);
     auto it = _guildGatherOrders.find(guid);
     if (it == _guildGatherOrders.end())
-        return "none";
+        return CancelCraftOrder(commander, botLowGuid);
     Player* bot = FindBotPlayer(botLowGuid);
     uint32 const guildId = bot ? bot->GetGuildId() : sCharacterCache->GetCharacterGuildIdByGuid(guid);
     if (!CanManageGatherOrder(commander, guildId, it->second.requesterLowGuid))
@@ -2596,6 +2597,26 @@ std::string BotMgr::CancelGatherOrder(Player* commander, ObjectGuid::LowType bot
     LOG_INFO("module.coa-playerbots", "BotMgr: '{}' cancelled the gather order of bot {} ({}x item {}).",
         commander->GetName(), botLowGuid, order.targetCount, order.itemEntry);
     // The bot's next idle tick finds no order and drops back to its own open-world life.
+    return "ok";
+}
+
+std::string BotMgr::CancelCraftOrder(Player* commander, ObjectGuid::LowType botLowGuid)
+{
+    ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(botLowGuid);
+    auto it = _craftOrders.find(guid);
+    if (it == _craftOrders.end())
+        return "none";
+    Player* bot = FindBotPlayer(botLowGuid);
+    uint32 const guildId = bot ? bot->GetGuildId() : sCharacterCache->GetCharacterGuildIdByGuid(guid);
+    if (!CanManageGatherOrder(commander, guildId, it->second.requesterGuid.GetCounter()))
+        return "denied";
+    CraftOrderState const order = it->second;
+    _craftOrders.erase(it);
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(order.itemEntry);
+    ChatHandler(commander->GetSession()).PSendSysMessage("|cff33ff99Crafting order cancelled:|r {} stops crafting {} ({}/{} made).",
+        bot ? bot->GetName() : std::string("the bot"), proto ? proto->Name1 : std::to_string(order.itemEntry),
+        order.orderedCount - std::min(order.orderedCount, order.remainingCount), order.orderedCount);
+    LOG_INFO("module.coa-playerbots", "BotMgr: '{}' cancelled the crafting order of bot {} (item {}).", commander->GetName(), botLowGuid, order.itemEntry);
     return "ok";
 }
 
@@ -2839,6 +2860,7 @@ void BotMgr::CraftOrder(ObjectGuid::LowType requesterCharLowGuid, uint32 itemEnt
     order.spellId = chosenSpell;
     order.itemEntry = itemEntry;
     order.remainingCount = count;
+    order.orderedCount = count;
     order.placedAtMs = std::max<uint32>(1, GameTime::GetGameTimeMS().count());
     order.nextSourcingAtMs = order.placedAtMs;
     order.reagentBudgetLeftCopper = BotEconomy::CraftReagentBudgetCopper();
@@ -2892,6 +2914,11 @@ std::vector<std::string> BotMgr::GetGuildRosterInfo(Player* commander) const
         {
             taskItemEntry = craftItr->second.itemEntry;
             task = "crafting " + std::to_string(craftItr->second.remainingCount) + "x " + itemName(taskItemEntry);
+            if (SpellInfo const* recipe = sSpellMgr->GetSpellInfo(craftItr->second.spellId); recipe && !CrafterHasReagentsFor(bot, recipe))
+                task += " - needs " + BotEconomy::DescribeReagents(BotEconomy::MissingReagents(bot, recipe, 1));
+            orderTarget = craftItr->second.orderedCount;
+            orderGathered = orderTarget - std::min(orderTarget, craftItr->second.remainingCount);
+            canManage = CanManageGatherOrder(commander, guildId, craftItr->second.requesterGuid.GetCounter());
         }
         else if (auto gatherItr = _guildGatherOrders.find(bot->GetGUID()); gatherItr != _guildGatherOrders.end())
         {
@@ -3129,6 +3156,45 @@ void BotMgr::DumpRecipeCoverage(ChatHandler* handler) const
     handler->PSendSysMessage("  (custom/unresolved skill line): {} distinct craftable item(s)", uint32(itemsUnresolvedSkillLine.size()));
 }
 
+static std::string CraftCastFailureText(SpellCastResult result)
+{
+    switch (result)
+    {
+        case SPELL_FAILED_TOTEMS:
+        case SPELL_FAILED_TOTEM_CATEGORY:
+            return "it does not carry the tool the recipe needs";
+        case SPELL_FAILED_REQUIRES_SPELL_FOCUS:
+            return "it is not standing at the anvil, forge or fire the recipe needs";
+        case SPELL_FAILED_REAGENTS:
+            return "it is missing reagents";
+        case SPELL_FAILED_TOO_MANY_OF_ITEM:
+            return "its bags have no room for the result";
+        case SPELL_FAILED_MIN_SKILL:
+        case SPELL_FAILED_LOW_CASTLEVEL:
+            return "its skill is too low";
+        default:
+            return Acore::StringFormat("the cast failed (result {})", uint32(result));
+    }
+}
+
+bool BotMgr::NoteCraftFailure(Player* crafter, CraftOrderState& order, std::string const& why)
+{
+    constexpr uint32 RETRY_DELAY_MS = 5 * 1000;
+    order.nextCastAtMs = GameTime::GetGameTimeMS().count() + RETRY_DELAY_MS;
+    ++order.failedCasts;
+    if (!BotEconomyPolicy::GiveUpAfterFailures(order.failedCasts, BotEconomy::CraftMaxCastFailures()))
+        return true;
+    if (Player* requester = ObjectAccessor::FindPlayer(order.requesterGuid))
+    {
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(order.itemEntry);
+        ChatHandler(requester->GetSession()).PSendSysMessage("|cffff6060Crafting order:|r {} gave up on {}x {} after {} failed tries: {}.",
+            crafter->GetName(), order.remainingCount, proto ? proto->Name1 : std::to_string(order.itemEntry), order.failedCasts, why);
+    }
+    LOG_INFO("module.coa-playerbots", "BotMgr: craft order for bot '{}' (spell {}) given up after {} failed casts: {}.", crafter->GetName(),
+        order.spellId, order.failedCasts, why);
+    return false;
+}
+
 // A crafter short of reagents fetches them once a minute (guild bank, vendors, auction house -- whichever
 // CoaBots.Crafting.* allows), tells the requester once what is still missing, and gives the order up after
 // CoaBots.Crafting.OrderTimeoutMin. Returns false when the order is given up.
@@ -3216,12 +3282,18 @@ void BotMgr::ProcessCraftOrders()
             }
 
             itr->second.awaitingCastResult = false;
-            uint32 producedThisCast = crafter->GetItemCount(itemEntry, false) - itr->second.itemCountBeforeCast;
+            uint32 const nowCount = crafter->GetItemCount(itemEntry, false);
+            uint32 producedThisCast = nowCount > itr->second.itemCountBeforeCast ? nowCount - itr->second.itemCountBeforeCast : 0;
+            if (producedThisCast)
+                itr->second.failedCasts = 0;
             if (!producedThisCast)
             {
                 LOG_INFO("module.coa-playerbots", "BotMgr: craft order cast for bot '{}' (spell {}) finished but produced nothing -- will retry.",
                     crafter->GetName(), itr->second.spellId);
-                ++itr;
+                if (!NoteCraftFailure(crafter, itr->second, "the cast finished without making anything"))
+                    itr = _craftOrders.erase(itr);
+                else
+                    ++itr;
                 continue;
             }
 
@@ -3246,13 +3318,21 @@ void BotMgr::ProcessCraftOrders()
                 continue;
             }
 
+            if (int32(GameTime::GetGameTimeMS().count() - itr->second.nextCastAtMs) < 0)
+            {
+                ++itr;
+                continue;
+            }
             itr->second.itemCountBeforeCast = crafter->GetItemCount(itemEntry, false);
             SpellCastResult result = crafter->CastSpell(crafter, itr->second.spellId, false);
             if (result != SPELL_CAST_OK)
             {
                 LOG_INFO("module.coa-playerbots", "BotMgr: craft order cast failed for bot '{}' (spell {}, result {}) -- will retry.",
                     crafter->GetName(), itr->second.spellId, uint32(result));
-                ++itr;
+                if (!NoteCraftFailure(crafter, itr->second, CraftCastFailureText(result)))
+                    itr = _craftOrders.erase(itr);
+                else
+                    ++itr;
                 continue;
             }
 

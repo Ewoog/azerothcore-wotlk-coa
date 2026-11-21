@@ -89,7 +89,12 @@ CoA Companions provides dedicated AI combat profiles for all **21 Conquest of Az
   - Guild gold orders and guild bank stock limits from the addon's task board.
   - Crafting orders fetch their reagents from the guild bank, vendors and the auction house, take reagents the
     requester mails them, tell the requester what is missing and give up after a timeout.
-  - `.botcmd economy status | plan <guid> | shop <guid> | journal` show what bots planned, sold and bought.
+  - Crafters can turn their own materials into goods and list them when that pays (`CraftForMarket`).
+  - An hourly spending cap for all bots together and a price ceiling against the vendor price protect the market.
+  - CoABotUI's Economy tab shows the guild and group bots' gold, their last day's trade and the latest trades;
+    crafting orders show progress, missing reagents and a Cancel button on the task board.
+  - `.botcmd economy status | plan <guid> | shop <guid> | crafts <guid> | journal` show what bots planned, sold and
+    bought. `tests/economy_policy_tests.cpp` covers the keep, price and give-up rules.
 
 ---
 
