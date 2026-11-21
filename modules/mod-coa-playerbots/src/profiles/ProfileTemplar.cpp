@@ -1,0 +1,814 @@
+/*
+ * mod-coa-playerbots
+ *
+ * Data-Driven Combat AI Framework: Templar Profiles implementation
+ * Supports:
+ *   - Spec 22: Oathkeeper (Holy Protection Shield Tank)
+ *   - Spec 23: Zealot (Holy Melee Burst / Single-Target DPS)
+ *   - Spec 24: Crusader (Holy Melee AoE / Tempest / Cleave DPS)
+ */
+
+#include "profiles/ProfileTemplar.h"
+#include "profiles/ProfileRegistry.h"
+#include "engine/CombatContext.h"
+#include "engine/SpecStrategyRegistry.h"
+#include "Player.h"
+
+namespace BotAI
+{
+    void RegisterTemplarProfiles()
+    {
+        // -------------------------------------------------------------
+        // Profile 1: Templar - Spec 22: Oathkeeper (HOLY SHIELD TANK)
+        // -------------------------------------------------------------
+        {
+            CombatProfile p;
+            p.classId = 19;
+            p.specId = 22; // Oathkeeper
+            p.role = BotRole::Tank;
+            p.profileName = "Templar_Oathkeeper_Tank";
+
+            // 1. Primary Taunt
+            // Real taunt: Spell.dbc effect ATTACK_ME + MOD_TAUNT, 8 s native cooldown. The generic
+            // Taunt355 root is not a learned spell for Ascension classes ("not known/resolvable" in
+            // every I17 tank decision) and passive ids cannot be cast.
+            {
+                AbilityDescriptor d;
+                d.name = "Beckon (Taunt)";
+                d.rootSpellId = 804914;
+                d.tags = AbilityTag::Taunt;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 455.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Taunt";
+                d.rootSpellId = 355;
+                d.tags = AbilityTag::Taunt;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 8000;
+                d.baseScore = 450.0f;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float {
+                    if (!ctx.victimTargetingNonTank)
+                        return -1.0f;
+                    return 0.0f;
+                };
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Courage (Templar Taunt)";
+                d.rootSpellId = 707754;
+                d.tags = AbilityTag::Taunt;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 8000;
+                d.baseScore = 440.0f;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float {
+                    if (!ctx.victimTargetingNonTank)
+                        return -1.0f;
+                    return 0.0f;
+                };
+                p.abilities.push_back(d);
+            }
+
+            // 2. Emergency Survival: Final Prayer (< 30% HP)
+            {
+                AbilityDescriptor d;
+                d.name = "Final Prayer (Last Stand)";
+                d.rootSpellId = 705268;
+                d.tags = AbilityTag::DefensiveCD | AbilityTag::DirectHeal;
+                d.targetType = TargetType::Self;
+                d.maxSelfHpPct = 30.0f;
+                d.internalThrottleMs = 30000;
+                d.baseScore = 380.0f;
+                p.abilities.push_back(d);
+            }
+
+            // 3. Active Mitigation: Tyr's Guard (< 55% HP)
+            {
+                AbilityDescriptor d;
+                d.name = "Tyr's Guard";
+                d.rootSpellId = 560649;
+                d.tags = AbilityTag::DefensiveCD | AbilityTag::Shield;
+                d.targetType = TargetType::Self;
+                d.maxSelfHpPct = 55.0f;
+                d.missingAuraOnCaster = 560649;
+                d.internalThrottleMs = 15000;
+                d.baseScore = 320.0f;
+                p.abilities.push_back(d);
+            }
+
+            // 4. Defensive CD: Martyr (< 45% HP)
+            {
+                AbilityDescriptor d;
+                d.name = "Martyr";
+                d.rootSpellId = 300530;
+                d.tags = AbilityTag::DefensiveCD;
+                d.targetType = TargetType::Self;
+                d.maxSelfHpPct = 45.0f;
+                d.missingAuraOnCaster = 300530;
+                d.internalThrottleMs = 20000;
+                d.baseScore = 300.0f;
+                p.abilities.push_back(d);
+            }
+
+            // 5. Stance / Aura Buffs
+            {
+                AbilityDescriptor d;
+                d.name = "Tenacious Defender";
+                d.rootSpellId = 707385;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 707385;
+                d.internalThrottleMs = 20000;
+                d.baseScore = 210.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Libram of Tenacity";
+                d.rootSpellId = 801461;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 801461;
+                d.internalThrottleMs = 20000;
+                d.baseScore = 205.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Gift of Fervor";
+                d.rootSpellId = 572629;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 572629;
+                d.internalThrottleMs = 20000;
+                d.baseScore = 200.0f;
+                p.abilities.push_back(d);
+            }
+
+            // 6. Interrupt: Interdict
+            {
+                AbilityDescriptor d;
+                d.name = "Interdict";
+                d.rootSpellId = 560116;
+                d.tags = AbilityTag::CrowdControl | AbilityTag::Interrupt;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 10000;
+                d.baseScore = 350.0f;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float
+                {
+                    return ctx.victimIsCastingInterruptible ? 200.0f : -1.0f;
+                };
+                p.abilities.push_back(d);
+            }
+
+            // 7. Gap Closer: Divine Charge (> 8 yards)
+            {
+                AbilityDescriptor d;
+                d.name = "Divine Charge";
+                d.rootSpellId = 527023;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 12000;
+                d.baseScore = 240.0f;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float
+                {
+                    if (!ctx.victim) return -1.0f;
+                    float dist = ctx.bot->GetDistance(ctx.victim);
+                    return (dist >= 8.0f && dist <= 25.0f) ? 100.0f : -1.0f;
+                };
+                p.abilities.push_back(d);
+            }
+
+            // 8. Breakers / Spenders (Oath spenders)
+            {
+                AbilityDescriptor d;
+                d.name = "Chastise (Stun & Threat)";
+                d.rootSpellId = 803157;
+                d.tags = AbilityTag::MeleeAttack | AbilityTag::CrowdControl;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 6000;
+                d.baseScore = 230.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Righteous Tempest (AoE Threat Spender)";
+                d.rootSpellId = 805409;
+                d.tags = AbilityTag::AoEDamage;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 6000;
+                d.baseScore = 220.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Blade of Faith (Holy Spender)";
+                d.rootSpellId = 803872;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 4000;
+                d.baseScore = 210.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // Confirmed live (2026-09-26, `.spellinfo targets 801448`): spell 801448's own
+                // implicit target is TARGET_UNIT_TARGET_ALLY (a self/ally heal), not the hostile
+                // combat target -- tagging it MeleeAttack/CurrentTarget made every attempt fail
+                // SPELL_FAILED_BAD_TARGETS against the enemy, every time (Finding 2 in
+                // docs/research/bot-fleet-combat-findings.md).
+                d.name = "Benediction (Holy Burst)";
+                d.rootSpellId = 801448;
+                d.tags = AbilityTag::DirectHeal;
+                d.targetType = TargetType::Self;
+                d.internalThrottleMs = 4000;
+                d.baseScore = 200.0f;
+                p.abilities.push_back(d);
+            }
+
+            // 9. Debuff: Crusader's Brand
+            {
+                AbilityDescriptor d;
+                d.name = "Crusader's Brand";
+                d.rootSpellId = 300513;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.requireAuraMissingOnTarget = true;
+                d.internalThrottleMs = 4000;
+                d.baseScore = 190.0f;
+                p.abilities.push_back(d);
+            }
+
+            // 10. Threat Builders
+            {
+                AbilityDescriptor d;
+                d.name = "Holy Cleave (Sweeping Kick)";
+                d.rootSpellId = 801445;
+                d.tags = AbilityTag::AoEDamage;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 4000;
+                d.baseScore = 180.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Righteous Lunge (Builder Strike)";
+                d.rootSpellId = 801443;
+                d.tags = AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 170.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Condemn (Judgment Builder)";
+                d.rootSpellId = 804906;
+                d.tags = AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 160.0f;
+                p.abilities.push_back(d);
+            }
+
+            ProfileRegistry::RegisterProfile(std::move(p));
+
+            // SpecStrategy for Oathkeeper
+            SpecStrategy s;
+            s.classId = 19;
+            s.specId = 22;
+            s.role = BotRole::Tank;
+            s.strategyName = "Templar_Oathkeeper_Tank_Strategy";
+            s.requiredState = RequiredCombatState{ 707385, 707385, {} };
+
+            s.phaseModifiers[CombatPhase::Opener] = {
+                { AbilityTag::Taunt,       2.0f, 80.0f },
+                { AbilityTag::MeleeAttack, 1.5f, 40.0f }
+            };
+            s.phaseModifiers[CombatPhase::Burst] = {
+                { AbilityTag::MeleeAttack, 1.5f, 40.0f }
+            };
+            s.phaseModifiers[CombatPhase::AoE] = {
+                { AbilityTag::AoEDamage, 2.0f, 60.0f }
+            };
+
+            // ResourcePolicy for Oath chain
+            ResourcePolicy pol;
+            pol.key = CombatResourceKey{ CombatResourceKind::AuraStack, 0, 704576 };
+            pol.minToEngage = 0;
+            pol.defensiveReserve = 2; // Keep at least 2 Oath stacks for active mitigation / defense
+            pol.reserveForDefensive = true;
+            pol.allowDumpDuringBurst = true;
+            s.resourcePolicies.push_back(pol);
+
+            s.isReadyToPull = [](Player* bot, CombatContext const&) -> bool
+            {
+                return bot->GetHealthPct() >= 65.0f;
+            };
+
+            SpecStrategyRegistry::RegisterStrategy(std::move(s));
+        }
+
+        // -------------------------------------------------------------
+        // Profile 2: Templar - Spec 23: Zealot (HOLY MELEE BURST DPS)
+        // -------------------------------------------------------------
+        {
+            CombatProfile p;
+            p.classId = 19;
+            p.specId = 23; // Zealot
+            p.role = BotRole::Dps;
+            p.profileName = "Templar_Zealot_Dps";
+
+            // 1. Emergency Defense: Final Prayer (< 25% HP)
+            {
+                AbilityDescriptor d;
+                d.name = "Final Prayer";
+                d.rootSpellId = 705268;
+                d.tags = AbilityTag::DefensiveCD | AbilityTag::DirectHeal;
+                d.targetType = TargetType::Self;
+                d.maxSelfHpPct = 25.0f;
+                d.internalThrottleMs = 30000;
+                d.baseScore = 380.0f;
+                p.abilities.push_back(d);
+            }
+
+            // 2. Interrupt: Interdict
+            {
+                AbilityDescriptor d;
+                d.name = "Interdict";
+                d.rootSpellId = 560116;
+                d.tags = AbilityTag::CrowdControl | AbilityTag::Interrupt;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 10000;
+                d.baseScore = 350.0f;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float
+                {
+                    return ctx.victimIsCastingInterruptible ? 200.0f : -1.0f;
+                };
+                p.abilities.push_back(d);
+            }
+
+            // 3. Stance / Buffs
+            {
+                AbilityDescriptor d;
+                d.name = "Gift of Zeal";
+                d.rootSpellId = 706634;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 706634;
+                d.internalThrottleMs = 20000;
+                d.baseScore = 220.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Libram of Fervor";
+                d.rootSpellId = 805423;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 805423;
+                d.internalThrottleMs = 20000;
+                d.baseScore = 210.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Zealotry (92108) is a native passive off-hand proc, not an
+            // activated offensive cooldown. Its aura and native triggers remain
+            // responsible for casting the derived attack (801450).
+
+            // 5. Gap Closer: Divine Charge (> 8 yards)
+            {
+                AbilityDescriptor d;
+                d.name = "Divine Charge";
+                d.rootSpellId = 527023;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 12000;
+                d.baseScore = 240.0f;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float
+                {
+                    if (!ctx.victim) return -1.0f;
+                    float dist = ctx.bot->GetDistance(ctx.victim);
+                    return (dist >= 8.0f && dist <= 25.0f) ? 100.0f : -1.0f;
+                };
+                p.abilities.push_back(d);
+            }
+
+            // 6. Heavy Burst: Titanstrike & Divine Force
+            {
+                AbilityDescriptor d;
+                d.name = "Titanstrike (2H Holy Weapon Strike)";
+                d.rootSpellId = 806521;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                
+                d.baseScore = 250.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Divine Force (Holy Force Burst)";
+                d.rootSpellId = 806153;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 10000;
+                d.baseScore = 240.0f;
+                p.abilities.push_back(d);
+            }
+
+            // 7. Primary Spenders / Breakers: Blade of Faith
+            {
+                AbilityDescriptor d;
+                d.name = "Blade of Faith (Primary Single-Target Spender)";
+                d.rootSpellId = 803872;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 4000;
+                d.baseScore = 230.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Chastise (Holy Stun Strike)";
+                d.rootSpellId = 803157;
+                d.tags = AbilityTag::MeleeAttack | AbilityTag::CrowdControl;
+                d.targetType = TargetType::CurrentTarget;
+                // about 4,600 damage per cast, no native cooldown: cast whenever it is ready
+                d.baseScore = 255.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // Confirmed live (2026-09-26, `.spellinfo targets 801448`): spell 801448's own
+                // implicit target is TARGET_UNIT_TARGET_ALLY (a self/ally heal), not the hostile
+                // combat target -- tagging it MeleeAttack/CurrentTarget made every attempt fail
+                // SPELL_FAILED_BAD_TARGETS against the enemy, every time (Finding 2 in
+                // docs/research/bot-fleet-combat-findings.md).
+                d.name = "Benediction";
+                d.rootSpellId = 801448;
+                d.tags = AbilityTag::DirectHeal;
+                d.targetType = TargetType::Self;
+                d.internalThrottleMs = 4000;
+                d.baseScore = 210.0f;
+                p.abilities.push_back(d);
+            }
+
+            // 8. Target Debuff
+            {
+                AbilityDescriptor d;
+                d.name = "Crusader's Brand";
+                d.rootSpellId = 300513;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.requireAuraMissingOnTarget = true;
+                d.internalThrottleMs = 4000;
+                d.baseScore = 195.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Mark of Aggramar";
+                d.rootSpellId = 804928;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.requireAuraMissingOnTarget = true;
+                d.internalThrottleMs = 4000;
+                d.baseScore = 190.0f;
+                p.abilities.push_back(d);
+            }
+
+            // 9. Builders (Generate Oaths)
+            {
+                AbilityDescriptor d;
+                d.name = "Righteous Lunge";
+                d.rootSpellId = 801443;
+                d.tags = AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 240.0f; // the real main spender: 41% of casts
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Condemn";
+                d.rootSpellId = 804906;
+                d.tags = AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 170.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Holy Cleave";
+                d.rootSpellId = 801445;
+                d.tags = AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 225.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Vindication";
+                d.rootSpellId = 801446;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 215.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Righteous Upheaval";
+                d.rootSpellId = 501562;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 20000;
+                d.baseScore = 215.0f;
+                p.abilities.push_back(d);
+            }
+
+            ProfileRegistry::RegisterProfile(std::move(p));
+
+            // SpecStrategy for Zealot
+            SpecStrategy s;
+            s.classId = 19;
+            s.specId = 23;
+            s.role = BotRole::Dps;
+            s.strategyName = "Templar_Zealot_Dps_Strategy";
+            s.requiredState = RequiredCombatState{ 706634, 706634, {} };
+
+            s.phaseModifiers[CombatPhase::Opener] = {
+                { AbilityTag::MeleeAttack, 1.5f, 40.0f }
+            };
+            s.phaseModifiers[CombatPhase::Burst] = {
+                { AbilityTag::OffensiveCD, 1.8f, 50.0f },
+                { AbilityTag::MeleeAttack, 1.4f, 30.0f }
+            };
+            s.phaseModifiers[CombatPhase::AoE] = {
+                { AbilityTag::AoEDamage,   1.8f, 50.0f },
+                { AbilityTag::MeleeAttack, 1.2f, 20.0f }
+            };
+
+            s.isReadyToPull = [](Player* bot, CombatContext const&) -> bool
+            {
+                return (bot->GetPower(POWER_MANA) * 100 / std::max(1u, bot->GetMaxPower(POWER_MANA)) >= 25) &&
+                       (bot->GetHealthPct() >= 50.0f);
+            };
+
+            SpecStrategyRegistry::RegisterStrategy(std::move(s));
+        }
+
+        // -------------------------------------------------------------
+        // Profile 3: Templar - Spec 24: Crusader (HOLY MELEE AOE / TEMPEST DPS)
+        // -------------------------------------------------------------
+        {
+            CombatProfile p;
+            p.classId = 19;
+            p.specId = 24; // Crusader
+            p.role = BotRole::Dps;
+            p.profileName = "Templar_Crusader_Dps";
+
+            // 1. Emergency Defense: Final Prayer (< 25% HP)
+            {
+                AbilityDescriptor d;
+                d.name = "Final Prayer";
+                d.rootSpellId = 705268;
+                d.tags = AbilityTag::DefensiveCD | AbilityTag::DirectHeal;
+                d.targetType = TargetType::Self;
+                d.maxSelfHpPct = 25.0f;
+                d.internalThrottleMs = 30000;
+                d.baseScore = 380.0f;
+                p.abilities.push_back(d);
+            }
+
+            // 2. Interrupt: Interdict
+            {
+                AbilityDescriptor d;
+                d.name = "Interdict";
+                d.rootSpellId = 560116;
+                d.tags = AbilityTag::CrowdControl | AbilityTag::Interrupt;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 10000;
+                d.baseScore = 350.0f;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float
+                {
+                    return ctx.victimIsCastingInterruptible ? 200.0f : -1.0f;
+                };
+                p.abilities.push_back(d);
+            }
+
+            // 3. Stance / Auras
+            {
+                AbilityDescriptor d;
+                d.name = "Gift of Fervor";
+                d.rootSpellId = 572629;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 572629;
+                d.internalThrottleMs = 20000;
+                d.baseScore = 220.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Scourgebane";
+                d.rootSpellId = 92111;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 92111;
+                d.internalThrottleMs = 20000;
+                d.baseScore = 210.0f;
+                p.abilities.push_back(d);
+            }
+
+            // 4. Ground AoE: Libram of Consecration (melee distance)
+            {
+                AbilityDescriptor d;
+                d.name = "Libram of Consecration";
+                d.rootSpellId = 801441;
+                d.tags = AbilityTag::AoEDamage;
+                d.targetType = TargetType::Self;
+                d.internalThrottleMs = 15000;
+                d.baseScore = 240.0f;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float
+                {
+                    if (!ctx.victim) return -1.0f;
+                    return (ctx.bot->GetDistance(ctx.victim) <= 8.0f) ? 50.0f : -1.0f;
+                };
+                p.abilities.push_back(d);
+            }
+
+            // 5. Gap Closer: Divine Charge (> 8 yards)
+            {
+                AbilityDescriptor d;
+                d.name = "Divine Charge";
+                d.rootSpellId = 527023;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 12000;
+                d.baseScore = 230.0f;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float
+                {
+                    if (!ctx.victim) return -1.0f;
+                    float dist = ctx.bot->GetDistance(ctx.victim);
+                    return (dist >= 8.0f && dist <= 25.0f) ? 100.0f : -1.0f;
+                };
+                p.abilities.push_back(d);
+            }
+
+            // 6. Heavy Cooldown: Titanstrike & Divine Force
+            {
+                AbilityDescriptor d;
+                d.name = "Titanstrike";
+                d.rootSpellId = 806521;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                
+                d.baseScore = 250.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Divine Force";
+                d.rootSpellId = 806153;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 10000;
+                d.baseScore = 240.0f;
+                p.abilities.push_back(d);
+            }
+
+            // 7. Core AoE Spender: Righteous Tempest
+            {
+                AbilityDescriptor d;
+                d.name = "Righteous Tempest (Whirlwind Spender)";
+                d.rootSpellId = 805409;
+                d.tags = AbilityTag::AoEDamage;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 5000;
+                d.baseScore = 235.0f;
+                p.abilities.push_back(d);
+            }
+
+            // 8. Secondary Spenders
+            {
+                AbilityDescriptor d;
+                d.name = "Blade of Faith";
+                d.rootSpellId = 803872;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 4000;
+                d.baseScore = 220.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // Confirmed live (2026-09-26, `.spellinfo targets 801448`): spell 801448's own
+                // implicit target is TARGET_UNIT_TARGET_ALLY (a self/ally heal), not the hostile
+                // combat target -- tagging it MeleeAttack/CurrentTarget made every attempt fail
+                // SPELL_FAILED_BAD_TARGETS against the enemy, every time (Finding 2 in
+                // docs/research/bot-fleet-combat-findings.md).
+                d.name = "Benediction";
+                d.rootSpellId = 801448;
+                d.tags = AbilityTag::DirectHeal;
+                d.targetType = TargetType::Self;
+                d.internalThrottleMs = 4000;
+                d.baseScore = 210.0f;
+                p.abilities.push_back(d);
+            }
+
+            // 9. Debuff: Crusader's Brand
+            {
+                AbilityDescriptor d;
+                d.name = "Crusader's Brand";
+                d.rootSpellId = 300513;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.requireAuraMissingOnTarget = true;
+                d.internalThrottleMs = 4000;
+                d.baseScore = 195.0f;
+                p.abilities.push_back(d);
+            }
+
+            // 10. Cleave / Builders
+            {
+                AbilityDescriptor d;
+                d.name = "Holy Cleave (Sweeping Kick)";
+                d.rootSpellId = 801445;
+                d.tags = AbilityTag::AoEDamage;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 4000;
+                d.minAoETargets = 1;
+                d.baseScore = 220.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Righteous Lunge";
+                d.rootSpellId = 801443;
+                d.tags = AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 175.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Condemn";
+                d.rootSpellId = 804906;
+                d.tags = AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 225.0f; // damage over time strike, 13% of real casts
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // 5 s cooldown weapon strike, 26% of real casts
+                d.name = "Argent Blade";
+                d.rootSpellId = 804929;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 245.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // 25 energy; 13 casts in the baseline
+                d.name = "Chastise";
+                d.rootSpellId = 803157;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 220.0f;
+                p.abilities.push_back(d);
+            }
+
+            ProfileRegistry::RegisterProfile(std::move(p));
+
+            // SpecStrategy for Crusader
+            SpecStrategy s;
+            s.classId = 19;
+            s.specId = 24;
+            s.role = BotRole::Dps;
+            s.strategyName = "Templar_Crusader_Dps_Strategy";
+            s.requiredState = RequiredCombatState{ 572629, 572629, {} };
+
+            s.phaseModifiers[CombatPhase::Opener] = {
+                { AbilityTag::MeleeAttack, 1.5f, 40.0f }
+            };
+            s.phaseModifiers[CombatPhase::Burst] = {
+                { AbilityTag::OffensiveCD, 1.8f, 50.0f },
+                { AbilityTag::MeleeAttack, 1.4f, 30.0f }
+            };
+            s.phaseModifiers[CombatPhase::AoE] = {
+                { AbilityTag::AoEDamage,   2.0f, 60.0f },
+                { AbilityTag::MeleeAttack, 1.2f, 20.0f }
+            };
+
+            s.isReadyToPull = [](Player* bot, CombatContext const&) -> bool
+            {
+                return (bot->GetPower(POWER_MANA) * 100 / std::max(1u, bot->GetMaxPower(POWER_MANA)) >= 25) &&
+                       (bot->GetHealthPct() >= 50.0f);
+            };
+
+            SpecStrategyRegistry::RegisterStrategy(std::move(s));
+        }
+    }
+}

@@ -1,0 +1,645 @@
+#
+# mod-coa-playerbots
+#
+
+[worldserver]
+
+# Allow bots to open corpses and take items and money while in a party or raid.
+# Disabled by default so grouped players can loot themselves. Solo bots still loot.
+# Does not change Need/Greed rolls or gathering and fishing loot.
+CoaBots.Loot.AutoLootInGroup = 0
+
+#
+#    CoaBots.Enable
+#        Description: The master switch of the companions. 0 = no bot is ever logged in (no spawn commands, no login at
+#                     start, no group / battleground / dungeon fill). The Manager's Modules page switches this setting.
+#                     Bots that are already online stay until the world server restarts.
+#        Default:     1 - (Enabled)
+#
+
+CoaBots.Enable = 1
+
+#
+#    CoaBots.CustomRaces.Enable
+#        Description: Allow companion bots to use custom races only when both
+#                     CoACustomRaces.Enable and CoACustomRaces.BotsEnable are enabled.
+#                     Set to 0 to restrict companions to stock races independently.
+#                     Both AiPlayerbot.ExcludedBotRaces and CoaBots.ExcludedBotRaces apply.
+#        Default:     1 - (Follows the custom races module permissions)
+#
+
+CoaBots.CustomRaces.Enable = 1
+
+
+
+# Number of bots '.botcmd spawnrandom' creates when no count is given on the command line.
+CoaBots.RandomSpawn.DefaultCount = 10
+
+# Safety cap: a single '.botcmd spawnrandom <count>' invocation never creates more than this
+# many bots at once, regardless of what's requested. Each bot is a synchronous DB clone of an
+# existing level-80 test character, so a very large batch will cause a visible tick hitch --
+# raise this only on a dev/test realm with nobody else online.
+CoaBots.RandomSpawn.MaxCount = 1000
+
+# If enabled, each newly created bot is immediately logged in (queued through the same
+# null-socket login path '.botcmd spawnbot' uses) instead of only existing in the database
+# until spawned by guid later.
+CoaBots.RandomSpawn.AutoLogin = 1
+
+# How many bots '.botcmd spawnrandom'/'.botcmd spawnleveled' create per batch, and how many
+# milliseconds to wait between batches. Confirmed live: creating ~1000 bots synchronously
+# crashed the worldserver outright (no crash dump -- consistent with an OS-level kill under a
+# resource spike). The defaults (5 bots every 500ms = 10/sec) survived a live 1000-1500 bot
+# batch with no crash; lower BatchSize or raise BatchIntervalMs further on weaker hardware.
+CoaBots.RandomSpawn.BatchSize = 5
+CoaBots.RandomSpawn.BatchIntervalMs = 500
+
+# Username prefix for the accounts random bots are spread across (auto-created as needed, one
+# new account whenever the current one hits CharactersPerAccount). Never account 1 (the human
+# player's own account) or account 2 if it's the hand-made test-character account -- new
+# accounts are always created fresh under this prefix.
+CoaBots.RandomSpawn.AccountPrefix = "CoaBotHost"
+
+# If enabled, every bot character that already exists (any account matching
+CoaBots.AutoLoginOnStartup = 0
+CoaBots.AutoLogin.MaxCount = 800
+
+# Batch size / interval for CoaBots.AutoLoginOnStartup's gradual login. Login is much lighter
+# than character creation (just an async DB query per bot), so this can safely run faster than
+# CoaBots.RandomSpawn's batch pace -- default is 10 bots every 500ms (20/sec).
+CoaBots.AutoLogin.BatchSize = 10
+CoaBots.AutoLogin.BatchIntervalMs = 500
+
+# Human-like solo behavior: a bot has a persistent profile and keeps one intent instead of
+# retrying a fixed quest/gather/fish/grind sequence on every idle tick. Values are milliseconds.
+CoaBots.Profile.IntentMinMs = 900000
+CoaBots.Profile.IntentMaxMs = 2100000
+
+# When enabled, the moment anyone (real player or bot) joins a normal (non-arena, non-rated)
+# Battleground queue, both factions' queues for that bracket are automatically topped off with
+# bots so the match is always full and pops immediately.
+CoaBots.BGFill.Enable = 1
+
+# How many bots per team to top a queue off to. 0 = use the battleground's own real
+# max-players-per-team (a genuinely full match); lower it to test with a smaller population.
+CoaBots.BGFill.TargetPlayersPerTeam = 0
+
+# When enabled, a solo player queuing for a dungeon (not raid) via the Dungeon Finder is
+# automatically joined by bots for whichever of Tank/Healer/3x Damage their own role selection
+# doesn't already cover, so a full 5-man is ready immediately. Group joins and raids are out of
+# scope -- see BotLfgFill.cpp's header comment.
+CoaBots.LfgFill.Enable = 1
+
+# When enabled, an idle Tank-role bot with no group occasionally self-queues for a random
+# level-appropriate dungeon via the real Dungeon Finder (LFGMgr) -- CoaBots.LfgFill.Enable's
+# existing fill logic then rounds out Healer + 3x Damage automatically, same as it does for a
+# real player's solo queue. New and unproven: heavily logged under "AutoQueueDungeon:" (entry
+# check, legitimate-clear check via the same real encounter-completion tracking AutoDungeon mode
+# itself uses, exit, and auto-disband once every member is confirmed to be a bot) so behaviour
+# can be audited from Server.log before trusting it unattended. Off by default.
+CoaBots.AutoQueueDungeon.Enable = 0
+
+# Path to the community talent-build data (see reference/ascensionsidekick-level-builds.json in
+# the module's own repo, sourced from ascensionsidekick.com) that bots use to spend real talent
+# points as they level. Leave blank to use the built-in search (checks this path relative to the
+# working directory, one level up, two levels up, and a hardcoded dev-machine path as a last
+# resort) -- only set this if the file lives somewhere none of those find it.
+CoaBots.TalentBuildsPath = ""
+
+# Bots below level 10 have no specialization yet. Once a bot hits level 10 without one, it's
+# assigned a spec from the community build data, weighted toward whichever role (Tank/Healer)
+# the current online bot population is short of relative to these target percentages; DPS is
+# always the fallback. Raise TankTargetPct/HealerTargetPct if dungeon/raid groups keep running
+# short on tanks or healers.
+CoaBots.SpecBalance.TankTargetPct = 20
+CoaBots.SpecBalance.HealerTargetPct = 20
+
+# How low a heal target's health can drop (percent) before a healer bot breaks formation /
+# stops following to cast a heal, even with nothing else going on (no active group fight). Below
+# this, the heal always happens; above it, a healer keeps following the group and only heals
+# incidentally while doing so. Raise this if healers feel too passive about topping people off;
+# lower it if they break formation too often for trivial chip damage.
+CoaBots.Healer.CriticalHealPct = 50
+
+# How far (yards) a solo/ungrouped bot with nothing else to do will scan for a hostile to grind
+# on, and how many levels above its own level a target can be before it's skipped as too
+# dangerous. Lower SearchRadius if idle bots are grinding mobs uncomfortably far from where you'd
+# expect to find them; lower MaxLevelAbove if they're picking fights they shouldn't win.
+CoaBots.Grind.SearchRadius = 30
+CoaBots.Grind.MaxLevelAbove = 3
+
+# Ambient world behavior (src/world/BotWorldBehavior.cpp): gives an idle, ungrouped bot a concrete
+# errand -- town services, a trip to a gathering or grinding area, or a short wander -- once its own
+# quest/gather/fish/grind scans have found nothing nearby. Never runs for grouped bots, under Stay,
+# in battlegrounds or dungeons, or during combat.
+CoaBots.World.Enable = 1
+
+# How often each bot re-evaluates its errand. Bots are staggered across this interval so a large
+# population never thinks on the same tick.
+CoaBots.World.ThinkIntervalMs = 2000
+
+# Outside cities, how long the solo scans must keep coming up empty before an errand starts.
+CoaBots.World.IdleBeforeErrandMs = 10000
+
+# Search radius (yards) for service NPCs and mailboxes, and for gathering/grinding destinations.
+CoaBots.World.ServiceRadius = 200
+CoaBots.World.AreaRadius = 350
+
+# Log every errand transition (chose / arrived / completed / expired / resumed) to the
+# module.coa-playerbots.world log category. Useful while tuning, noisy with thousands of bots.
+CoaBots.World.VerboseLog = 1
+
+# Level distribution for `.botcmd spawnleveled`: comma-separated "low-high:weight" brackets.
+# The default gives many levelling bots and few at the cap: 40% 1-20, 33% 21-60, 20% 61-79, 7% 80.
+CoaBots.LeveledSpawn.Brackets = "1-20:40,21-60:33,61-79:20,80-80:7"
+
+###################################################################################################
+# Open-world brain (src/world/WorldBrain.h): quests, travel and activity choice for ungrouped bots.
+#
+# The brain owns an idle, ungrouped bot: it plans a task by utility (quest objectives, turn-ins,
+# new quests from nearby givers, a new quest hub), executes it phase by phase (travel, live-target
+# search, approach, act, loot, verify) and hands fights to the combat engine. Gathering, fishing,
+# grinding and ambient errands only run when the brain chooses them.
+#
+# Debugging: `.botcmd brain <guid>` (one bot), `.botcmd worldstats` (population). Transition logs
+# (TaskSelected, PhaseChanged, TargetSelected, ObjectiveProgress, QuestTurnedIn, TaskFailed,
+# navigation stalls) are DEBUG-level on these categories -- enable them in worldserver.conf with e.g.
+#   Logger.module.coa-playerbots.world=5,Console Server
+#   Logger.module.coa-playerbots.quest=5,Console Server
+#   Logger.module.coa-playerbots.navigation=5,Console Server
+###################################################################################################
+
+# Master switch. Disabled, bots only gather/fish/grind/wander (no quests at all).
+CoaBots.WorldBrain.Enable = 1
+
+# Planner cadence window (ms). Each bot draws its own interval inside it; a planner pass that finds
+# nothing backs off exponentially (up to 3 minutes) while the bot does something else.
+CoaBots.WorldBrain.PlannerMinMs = 2000
+CoaBots.WorldBrain.PlannerMaxMs = 8000
+
+# Live target scan cadence while searching an objective area (ms), and the scan radius (yards).
+CoaBots.WorldBrain.ScanMinMs = 500
+CoaBots.WorldBrain.ScanMaxMs = 1500
+CoaBots.WorldBrain.SearchRadius = 50
+
+# Distance (yards) at which a bot engages a claimed quest mob; the combat engine then positions.
+CoaBots.WorldBrain.EngageRange = 28
+
+# Phase budgets (ms): searching an area with nothing alive before trying another area, walking up to
+# a claimed target, the whole trip to an area.
+CoaBots.WorldBrain.SearchTimeoutMs = 35000
+CoaBots.WorldBrain.ApproachTimeoutMs = 25000
+CoaBots.WorldBrain.TravelTimeoutMs = 360000
+
+# Quest log policy: at most this many quests at once; quests whose objectives are farther than this
+# (yards) are not taken; quest givers are looked for within this radius (yards).
+CoaBots.WorldBrain.MaxActiveQuests = 15
+CoaBots.WorldBrain.MaxObjectiveDistance = 3000
+CoaBots.WorldBrain.GiverSearchRadius = 500
+
+# Quest level window around the bot's level, and how far above its level a quest mob may be.
+CoaBots.WorldBrain.QuestLevelBelow = 6
+CoaBots.WorldBrain.QuestLevelAbove = 3
+CoaBots.WorldBrain.MaxMobLevelAbove = 3
+
+# Solo bots leave elite quests alone unless this is enabled.
+CoaBots.WorldBrain.AcceptEliteQuests = 0
+
+# Objective areas given up per objective before the quest is set aside, and for how long (ms).
+# A quest that keeps failing for transient reasons (no targets, paths, deaths) is set aside for
+# QuestSuspendMs, doubling each time in a row up to QuestSuspendMaxMs, and retried -- never
+# abandoned. Only quests that can never be finished (no handler for an open objective, player
+# kills, reputation, no ender, failed) are abandoned, and only when the log is full.
+CoaBots.WorldBrain.MaxBadAreasPerObjective = 3
+CoaBots.WorldBrain.QuestSuspendMs = 600000
+CoaBots.WorldBrain.QuestSuspendMaxMs = 7200000
+
+# Mounting for travel: each bot mounts beyond its own threshold drawn from this range (yards).
+# Trips longer than TaxiMinDistance (yards) use a flight path when the bot knows a route.
+CoaBots.WorldBrain.MountDistanceMin = 60
+CoaBots.WorldBrain.MountDistanceMax = 95
+CoaBots.WorldBrain.TaxiMinDistance = 900
+
+# Human rhythm: stretches of questing (20-45 minutes, scaled by patience) followed by a few minutes
+# of town life; herbalists/miners stepping off the path for a node next to it.
+CoaBots.WorldBrain.SessionBreaks = 1
+CoaBots.WorldBrain.GatherDetours = 1
+
+# Cooperation: a bot passing by steps into a fight a friendly player (bot or real) is losing --
+# only against a mob that player has tagged, so loot, credit and experience stay theirs -- and
+# resurrects friendly corpses if it knows a resurrection spell. Sociability decides how often.
+CoaBots.WorldBrain.HelpOthers = 1
+CoaBots.WorldBrain.HelpRadius = 30
+CoaBots.WorldBrain.HelpHealthPct = 40
+CoaBots.WorldBrain.ResurrectOthers = 1
+
+# Temporary bot-only parties: sociable bots of about the same level with the same kill quest open
+# team up for one objective area or PartyMinMinutes-PartyMaxMinutes, then go their own ways.
+# Off by default until watched on a live server. Never used in cluster mode.
+CoaBots.WorldBrain.TemporaryParties = 0
+CoaBots.WorldBrain.PartyMaxSize = 3
+CoaBots.WorldBrain.PartyRadius = 60
+CoaBots.WorldBrain.PartyMinMinutes = 5
+CoaBots.WorldBrain.PartyMaxMinutes = 20
+
+# Utility weights (see src/world/WorldUtility.h for all of them and what they mean).
+CoaBots.WorldBrain.Weight.TravelPer100Yards = 7
+CoaBots.WorldBrain.Weight.CrowdPerBot = 6
+CoaBots.WorldBrain.Weight.Overlap = 35
+CoaBots.WorldBrain.Weight.TurnIn = 120
+CoaBots.WorldBrain.Weight.Accept = 55
+CoaBots.WorldBrain.Weight.AreaOccupancy = 12
+CoaBots.WorldBrain.Weight.TargetReserved = 200
+CoaBots.WorldBrain.Weight.ActiveQuestHysteresis = 18
+CoaBots.WorldBrain.Weight.CurrentAreaHysteresis = 15
+
+#
+#    CoaBots.AI.CombatIntervalMs
+#        Description: How often (ms) a bot that is fighting, in a group or in a battleground makes a decision.
+#                     Lower is more responsive and costs more world-thread time.
+#        Default:     100
+#
+#    CoaBots.AI.IdleIntervalMs
+#        Description: How often (ms) a bot that is on its own and not fighting makes a decision. With hundreds of
+#                     bots this is what keeps the world loop fast. 0 = every tick.
+#        Default:     250
+#
+
+CoaBots.AI.CombatIntervalMs = 100
+CoaBots.AI.IdleIntervalMs = 250
+
+#
+#    CoaBots.Trade.Enable
+#        Description: Bots take part in trades. Open a trade window with a bot, put items or gold in it and accept;
+#                     the bot accepts too and keeps what you gave it (it equips anything better than its own gear).
+#                     A bot never offers anything of its own. A window nobody confirms is closed after two minutes.
+#        Default:     1
+#
+
+CoaBots.Trade.Enable = 1
+
+#
+#    CoaBots.MarkSessionsAsBots
+#        Description: Mark companion sessions as bots, so the server skips per-client work they have no client for
+#                     (login queries, view refreshes, reward trackers) and bots are left out of /who (see
+#                     WhoList.ShowBots). Turn off only to compare behaviour.
+#        Default:     1
+#
+
+CoaBots.MarkSessionsAsBots = 1
+
+###################################################################################################
+# ECONOMY
+###################################################################################################
+#
+#    CoaBots.Economy.Enable
+#        Description: Bots look into their bags and write down what they would sell and what it would
+#                     fetch (see `.botcmd economy status`, `plan <bot guid>`, `journal`). Nothing is
+#                     sold while CoaBots.Economy.DryRun = 1, so the rules can be checked before bots trade.
+#        Default:     0
+#
+#    CoaBots.Economy.MinTripCopper
+#        Description: A bot is only noted down when what it could sell is worth at least this much.
+#        Default:     50000 - (5 gold)
+#
+#    CoaBots.Economy.KeepConsumables
+#        Description: How many potions / food items of its own level range a bot keeps of each kind.
+#        Default:     10
+#
+#    CoaBots.Economy.OutdatedBelowLevels
+#        Description: A potion or food this many levels below the bot counts as outdated and is
+#                     planned for sale in full.
+#        Default:     15
+#
+#    CoaBots.Economy.MinAuctionQuality
+#        Description: Items of this quality (2 = uncommon) and better are planned for the auction when
+#                     they can be listed, everything else for a vendor.
+#        Default:     2
+#
+#    CoaBots.Economy.UndercutPercent
+#        Description: How far below the lowest current buyout the plan prices an item.
+#        Default:     5
+#
+#    CoaBots.Economy.ScanIntervalSec / BotsPerTick / JournalDays
+#        Description: How often one bot is looked at, how many bots per world tick, and how long
+#                     journal rows are kept.
+#        Default:     600 / 2 / 14
+#
+
+#
+#    CoaBots.Economy.DryRun
+#        Description: 1 = bots only plan and journal. 0 = bots really go to a city with an auction house (on
+#                     foot, by flight path, mounted), list what the plan says for the auction, sell the rest
+#                     to a vendor price, collect what earlier auctions earned, and pay the guild its share.
+#        Default:     1
+#
+#    CoaBots.Economy.MaxTrips
+#        Description: How many bots may be on their way to town at the same moment.
+#        Default:     5
+#
+#    CoaBots.Economy.TripCooldownMin
+#        Description: Minutes before the same bot is sent to town again.
+#        Default:     30
+#
+#    CoaBots.Economy.GuildSharePercent
+#        Description: Percent of what a trip earns that goes into the bot's guild bank.
+#        Default:     10
+#
+#    CoaBots.Economy.MoneyReserveCopper
+#        Description: A bot keeps at least this much money for its own needs when it pays the guild.
+#        Default:     50000 - (5 gold)
+#
+#    CoaBots.Economy.MaxListings
+#        Description: How many auctions one bot may have running.
+#        Default:     20
+#
+#    CoaBots.Economy.ConsumeSupplies
+#        Description: 1 = eating and drinking cost something. A bot that sits down to eat or drink uses up one food or
+#                     drink item of its level range; with none it rests the slow way and wants a trip to town, where
+#                     it buys more with its own money (the best food and drink it may use, up to SupplyTarget of each,
+#                     within DailyBudgetCopper a day and keeping MoneyReserveCopper). Needs CoaBots.Economy.Enable = 1.
+#                     0 = bots rest with the instant food and drink effect and no items, as before.
+#        Default:     0
+#
+#    CoaBots.Economy.SupplyTarget / DailyBudgetCopper
+#        Description: How many food and how many drink items a bot likes to carry; what one bot may spend on them in
+#                     a day.
+#        Default:     20 / 20000 - (2 gold)
+#
+#    Stock limits (no setting)
+#        Description: The guild master and officers set limits from the addon's Stock tab ("keep N of this resource").
+#                     Once a minute a free bot of the guild takes a surplus (above the limit and at least 10, or a tenth
+#                     of the limit) out of the guild bank, carries it to a city with an auction house and sells it. One
+#                     surplus run per guild at a time. Needs CoaBots.Economy.Enable = 1 and DryRun = 0.
+#
+#    CoaBots.Economy.MinListingCopper / ListingMinutes
+#        Description: A listing worth less than this is not worth its deposit and goes to a vendor instead; how
+#                     long a listing runs (12 hours = 720, 24 hours = 1440, 48 hours = 2880).
+#        Default:     5000 (50 silver) / 1440
+#
+#    CoaBots.Economy.PriceSpreadMinPercent / PriceSpreadMaxPercent
+#        Description: Listing prices differ from the plan's price by a random 5 to 10 percent, up or down,
+#                     so the market looks alive.
+#        Default:     5 / 10
+#
+
+CoaBots.Economy.Enable = 0
+CoaBots.Economy.MinTripCopper = 50000
+CoaBots.Economy.KeepConsumables = 10
+CoaBots.Economy.OutdatedBelowLevels = 15
+CoaBots.Economy.MinAuctionQuality = 2
+CoaBots.Economy.UndercutPercent = 5
+CoaBots.Economy.ScanIntervalSec = 600
+CoaBots.Economy.BotsPerTick = 2
+CoaBots.Economy.JournalDays = 14
+CoaBots.Economy.DryRun = 1
+CoaBots.Economy.MaxTrips = 5
+CoaBots.Economy.TripCooldownMin = 30
+CoaBots.Economy.GuildSharePercent = 10
+CoaBots.Economy.MoneyReserveCopper = 50000
+CoaBots.Economy.MaxListings = 20
+CoaBots.Economy.ConsumeSupplies = 0
+CoaBots.Economy.SupplyTarget = 20
+CoaBots.Economy.DailyBudgetCopper = 20000
+CoaBots.Economy.MinListingCopper = 5000
+CoaBots.Economy.ListingMinutes = 1440
+CoaBots.Economy.PriceSpreadMinPercent = 5
+CoaBots.Economy.PriceSpreadMaxPercent = 10
+
+###################################################################################################
+# COMBAT INTELLIGENCE
+###################################################################################################
+#
+#    CoaBots.Combat.BurstPrediction
+#        Description: A damaging cast aimed at a bot (a tankbuster on its cast bar) makes the bot spend
+#                     a defensive cooldown, and its healers pre-heal, before the hit lands. The damage
+#                     counted is what reaches health after the shields that are still up when it lands.
+#        Default:     1
+#
+#    CoaBots.Combat.BurstPctThreshold
+#        Description: A predicted hit of at least this share of the bot's maximum health counts as a burst.
+#        Default:     25
+#
+#    CoaBots.Combat.GroupInterruptDirector
+#        Description: EXPERIMENTAL. Grouped bots interrupt what the group assigns them (one primary and one backup
+#                     per enemy cast, backup takes over at once when the primary cannot act). 0 keeps the rule where
+#                     every bot kicks the cast of its own target. Off because in the INTERRUPT_MULTI test it applied
+#                     about half as many interrupts as the own-target rule (its reaction delay is long for 1.5 s casts),
+#                     see docs/combat-intelligence/POST_REVIEW_HARDENING.md.
+#        Default:     0
+#
+
+CoaBots.Combat.BurstPrediction = 1
+CoaBots.Combat.BurstPctThreshold = 25
+CoaBots.Combat.GroupInterruptDirector = 0
+
+CoaBots.Training.Enable = 0
+CoaBots.Training.OutputDir = training/results
+CoaBots.Training.DefaultLevel = 60
+CoaBots.Training.DefaultDurationSec = 180
+CoaBots.Training.Deterministic = 1
+CoaBots.Training.LogDecisionTrace = 1
+CoaBots.Training.BossEntry = 31144
+
+#
+#    CoaBots.Training.TargetIsBoss
+#        Description: Training only. Treat the training dummy as a boss for the "worth an offensive
+#                     cooldown" decision (the dummy is a rank-0 creature, so cooldowns are otherwise
+#                     scored x0.15). Changes measurements: do not compare runs across the setting.
+#        Default:     0
+#
+
+CoaBots.Training.TargetIsBoss = 0
+
+CoaBots.Training.HazardSpellId = 5740
+CoaBots.Training.InterruptCastSpellId = 133
+
+#    CoaBots.Training.RealisticDamage
+#        Description: Training only. A scripted hit (tankbuster, ramp hit) goes through the same steps as a spell hit
+#                     (immunity, armor for physical schools, damage-taken modifiers, resistance, absorbs) for the school of
+#                     RealisticDamageSpellId. It never misses, never crits and has no procs or threat. Changes
+#                     measurements: do not compare runs across the setting.
+#        Default:     0
+#
+CoaBots.Training.RealisticDamage = 0
+CoaBots.Training.RealisticDamageSpellId = 686
+
+#    CoaBots.Training.RealisticDamageLegacyPath
+#        Description: Training only. 1 selects the first approximation of RealisticDamage (damage-taken modifiers and absorbs,
+#                     then plain DealDamage) instead of the spell-hit steps. Only for runs that must stay comparable with earlier ones.
+#        Default:     0
+#
+CoaBots.Training.RealisticDamageLegacyPath = 0
+
+# Reserved training phases: bits 30..27; configure only on isolated servers.
+CoaBots.Training.MaxParallelArenas = 1
+
+# Outland (map 530) and Northrend (map 571) for bots. 2 = automatic: closed when MaxPlayerLevel is 60 or lower and the
+# content scaling that brings those expansions down to that range is off (CoAContentScaling.Enable, with CoATBC.Enable
+# for Outland and CoAWotLK.Enable for Northrend). 1 = always closed, 0 = always open. A closed map means: no
+# spawns, no hubs, no quests, no flights there, and bots found there are moved out. The starting areas of the
+# Blood Elves (Eversong, Ghostlands, Silvermoon) and the Draenei (Azuremyst, Bloodmyst, the Exodar) stay open.
+CoaBots.RestrictExpansionZones = 2
+
+###################################################################################################
+# DYNAMIC BOT ENCOUNTERS (WorldEncounterDirector)
+#
+#    BotAI.DynamicEncounters.Enable
+#        Description: Master toggle for open-world dynamic bot encounters (WorldEncounterDirector).
+#                     Encounters temporarily borrow existing open-world playerbots to stage rare
+#                     ambient, PvP, or atmospheric events, returning bots to WorldBrain afterward.
+#        Default:     1
+#
+#    BotAI.DynamicEncounters.<Type>.Enable
+#        Description: Per-encounter enable flags for all 13 encounter types.
+#        Default:     1
+#
+#    BotAI.DynamicEncounters.MaxGlobalActive / MaxActivePerMap / MaxActiveNearPlayer
+#        Description: Global, per-map, and per-real-player active encounter caps.
+#        Default:     12 / 4 / 1
+#
+#    BotAI.DynamicEncounters.ThinkIntervalMs / RareScanIntervalMs
+#        Description: Staggered evaluation cadence for the director and rare creature scans.
+#        Default:     5000 / 20000
+#
+#    BotAI.DynamicEncounters.PlayerCooldownSec / PlayerHostileCooldownSec / BotCooldownSec
+#        Description: Cooldowns (seconds) preventing a real player or bot from being repeatedly
+#                     selected for encounters.
+#        Default:     900 / 1500 / 600
+#
+#    BotAI.DynamicEncounters.Narrator.Enable / PlayerCooldownSec / BotCooldownSec
+#        Description: Optional atmospheric messages and contextual bot lines (/say, /yell, /emote).
+#        Default:     1 / 120 / 45
+#
+###################################################################################################
+
+BotAI.DynamicEncounters.Enable = 1
+BotAI.DynamicEncounters.ThinkIntervalMs = 5000
+BotAI.DynamicEncounters.RareScanIntervalMs = 20000
+
+BotAI.DynamicEncounters.AssassinContract.Enable = 1
+BotAI.DynamicEncounters.TheWatcher.Enable = 1
+BotAI.DynamicEncounters.FactionSkirmish.Enable = 1
+BotAI.DynamicEncounters.PatrolAmbush.Enable = 1
+BotAI.DynamicEncounters.BountyHunter.Enable = 1
+BotAI.DynamicEncounters.Nemesis.Enable = 1
+BotAI.DynamicEncounters.RoadDuel.Enable = 1
+BotAI.DynamicEncounters.Caravan.Enable = 1
+BotAI.DynamicEncounters.Deserter.Enable = 1
+BotAI.DynamicEncounters.HunterAndPrey.Enable = 1
+BotAI.DynamicEncounters.RivalAdventuringParty.Enable = 1
+BotAI.DynamicEncounters.RareHunter.Enable = 1
+BotAI.DynamicEncounters.MysteryEncounter.Enable = 1
+
+BotAI.DynamicEncounters.MaxGlobalActive = 12
+BotAI.DynamicEncounters.MaxActivePerMap = 4
+BotAI.DynamicEncounters.MaxActiveNearPlayer = 1
+
+BotAI.DynamicEncounters.PlayerCooldownSec = 900
+BotAI.DynamicEncounters.PlayerHostileCooldownSec = 1500
+BotAI.DynamicEncounters.BotCooldownSec = 600
+BotAI.DynamicEncounters.TypeCooldownSec = 300
+
+BotAI.DynamicEncounters.MaxLevelDiffHostile = 4
+BotAI.DynamicEncounters.MaxLevelDiffAmbient = 8
+BotAI.DynamicEncounters.MaxPlayerPartySizeForSoloHostile = 2
+BotAI.DynamicEncounters.SearchRadiusYards = 220
+BotAI.DynamicEncounters.MaxChaseDistanceYards = 280
+BotAI.DynamicEncounters.MinDistanceFromCapitalYards = 180
+
+BotAI.DynamicEncounters.PrepareTimeoutSec = 90
+BotAI.DynamicEncounters.ActiveTimeoutSec = 180
+BotAI.DynamicEncounters.ResolveTimeoutSec = 20
+
+BotAI.DynamicEncounters.Narrator.Enable = 1
+BotAI.DynamicEncounters.Narrator.PlayerCooldownSec = 120
+BotAI.DynamicEncounters.Narrator.BotCooldownSec = 45
+BotAI.DynamicEncounters.Narrator.MaxRangeYards = 45
+
+BotAI.DynamicEncounters.Bounty.KillThreshold = 3
+BotAI.DynamicEncounters.Bounty.WindowSec = 1200
+BotAI.DynamicEncounters.Bounty.CooldownSec = 1800
+
+BotAI.DynamicEncounters.Nemesis.MemoryTtlSec = 3600
+BotAI.DynamicEncounters.Nemesis.MaxTrackedPairs = 256
+BotAI.DynamicEncounters.Nemesis.MinKillsForTrigger = 1
+
+BotAI.DynamicEncounters.Caravan.MinMembers = 2
+BotAI.DynamicEncounters.Caravan.MaxMembers = 5
+BotAI.DynamicEncounters.Skirmish.MinPerSide = 2
+BotAI.DynamicEncounters.Skirmish.MaxPerSide = 4
+BotAI.DynamicEncounters.RivalParty.MinMembers = 3
+BotAI.DynamicEncounters.RivalParty.MaxMembers = 5
+BotAI.DynamicEncounters.RareHunter.MaxBots = 3
+
+BotAI.DynamicEncounters.Mystery.ChancePermil = 15
+BotAI.DynamicEncounters.Mystery.MorphDisplayId = 0
+BotAI.DynamicEncounters.Mystery.RuneGameObjectEntry = 0
+BotAI.DynamicEncounters.Mystery.SpellVisualId = 0
+
+###################################################################################################
+# Bot strength scaling (dungeons and raids)
+#
+#    Bots play with the gear and the rotation of a bot, which is weaker than a person at the same character. Instead of weakening
+#    the creatures, the bots get a configurable help while they are in dungeons and raids. Pets, totems and guardians of a bot count
+#    as the bot. The multipliers stack on top of the group scaling of the content scaling module. Scripted lethal mechanics
+#    (instant kills, percentage damage, huge scripted hits) are not scaled.
+#
+#    CoaBots.Scaling.Enable        Switch for everything below. Default 1.
+#    CoaBots.Scaling.Dungeons      Apply in 5-player dungeons. Default 1.
+#    CoaBots.Scaling.Raids         Apply in raids. Default 1.
+#    CoaBots.Scaling.Battlegrounds Apply in battlegrounds and arenas. Default 0.
+#    CoaBots.Scaling.World         Apply in the open world. Default 0.
+#    CoaBots.Scaling.DamageDone    Damage a bot deals to creatures (1 = unchanged). Default 1, range 0.1 to 10.
+#    CoaBots.Scaling.HealingDone   Healing a bot casts (1 = unchanged). Default 1, range 0.1 to 10.
+#    CoaBots.Scaling.DamageTaken   Damage creatures deal to a bot (below 1 = bots take less). Default 1, range 0.1 to 10.
+#    CoaBots.Scaling.TankThreat    Threat a bot tank generates (1 = unchanged). Default 1, range 1 to 10.
+#    CoaBots.Scaling.BossTuning    Extra multipliers for a few Wrath bosses that level 60 bots could not beat otherwise (Loken, Drakkari
+#                                  Elemental, Colossus and Gal'darah). Default 0.
+#
+#    Reloadable with .reload config (takes effect within a few seconds).
+###################################################################################################
+
+CoaBots.Scaling.Enable = 1
+CoaBots.Scaling.Dungeons = 1
+CoaBots.Scaling.Raids = 1
+CoaBots.Scaling.Battlegrounds = 0
+CoaBots.Scaling.World = 0
+CoaBots.Scaling.DamageDone = 1
+CoaBots.Scaling.HealingDone = 1
+CoaBots.Scaling.DamageTaken = 1
+CoaBots.Scaling.TankThreat = 1
+CoaBots.Scaling.BossTuning = 0
+
+
+###################################################################################################
+# Experimental population scheduling. All optimization switches stay off until runtime qualification.
+# Metrics include pooled histogram bins in microseconds; scopes are inclusive, not additive.
+CoaBots.Perf.Enable = 0
+CoaBots.Perf.Detailed = 1
+CoaBots.Perf.ProfileCombat = 0
+World.Performance.EntitySampleRate = 0
+World.Performance.DirectRankLookup = 0
+World.Performance.InterleaveWorldObjects = 0
+World.Performance.FilterSpellCandidates = 0
+CoaBots.Perf.OutputDir = "bot-performance"
+
+CoaBots.Spells.OptimizeRankLookup = 0
+CoaBots.Spells.LazyCleanseScan = 0
+CoaBots.Spells.CacheLearnedRanks = 0
+CoaBots.Scheduling.Enable = 0
+CoaBots.Scheduling.Adaptive = 0
+CoaBots.Scheduling.IdleIntervalMs = 200
+CoaBots.Scheduling.SoloIntervalMs = 500
+CoaBots.Scheduling.FarIdleIntervalMs = 0
+CoaBots.Scheduling.DamageWake = 1
+
+# Admission budgets for background work, in microseconds per world update.
+# Combat and avoidance are never deferred. A single operation may exceed its budget.
+CoaBots.Budgets.Enable = 0
+CoaBots.Budgets.PlannerUs = 3000
+CoaBots.Budgets.ScanUs = 2000
+CoaBots.Budgets.NavigationUs = 4000
+
+
+CoaBots.Navigation.ReuseValidatedPath = 0

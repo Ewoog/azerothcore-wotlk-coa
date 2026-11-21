@@ -1,0 +1,836 @@
+/*
+ * mod-coa-playerbots
+ *
+ * Data-Driven Combat AI Framework: SpellPredicates implementation
+ *
+ * Moved out of BotAI.cpp's anonymous namespace verbatim (behavior unchanged) so
+ * engine/CombatUtility.cpp can reuse it -- see this file's header comment.
+ */
+
+#include "engine/SpellPredicates.h"
+#include "BotClassRotations.h"
+#include "CellImpl.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
+#include "Item.h"
+#include "Player.h"
+#include "SharedDefines.h"
+#include "Spell.h"
+#include "SpellAuras.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
+#include "Timer.h"
+#include "Unit.h"
+#include "engine/SpellResolver.h"
+#include "profiles/ProfileRegistry.h"
+#include <algorithm>
+#include <vector>
+
+namespace BotAI
+{
+    // Same shape as IsUsableOffensiveSpell below: NeedsExplicitUnitTarget() excludes self-buffs,
+    // ground-targeted effects, and target-less passives; !IsPositive() rules out a buff/heal;
+    // !IsPassive()/CanBeUsedInCombat() excludes passives and out-of-combat-only spells; the final
+    // effect check is the actual "is this offensive" signal.
+    bool IsUsableOffensiveSpell(SpellInfo const* spellInfo)
+    {
+        if (!spellInfo || spellInfo->IsPassive() || spellInfo->IsPositive())
+            return false;
+        if (!spellInfo->NeedsExplicitUnitTarget() || !spellInfo->CanBeUsedInCombat())
+            return false;
+        // Charm/possession changes enemy allegiance. Its periodic damage is not
+        // a generic damage filler; deliberate crowd-control policies own it.
+        if (spellInfo->HasAura(SPELL_AURA_MOD_CHARM) || spellInfo->HasAura(SPELL_AURA_MOD_POSSESS) ||
+            spellInfo->HasAura(SPELL_AURA_MOD_POSSESS_PET))
+            return false;
+        if (spellInfo->IsAutoRepeatRangedSpell())
+            return false;
+
+        // Confirmed live (21-bot class-fleet exercise, 2026-09-25/26): every character silently
+        // knows the baseline ranged-weapon spells (75/Shoot-family, 3018 "Shoot", 2764 "Throw", and
+        // several custom Ascension equivalents like 804179 "Darkslayer") regardless of class or
+        // spec, and they pass every check above -- real weapon-damage effects, needs a unit target,
+        // usable in combat. Without this exclusion this generic "any offensive spell in the
+        // spellbook" search hands them to melee specs as a filler exactly as often as any real
+        // ability, and since a ranged-weapon-slot spell requires actual ranged distance (the core
+        // enforces a real minimum -- see docs/research/bot-fleet-combat-findings.md Finding 1), a
+        // melee bot standing at its normal engage distance fails it every single time:
+        // SPELL_FAILED_TOO_CLOSE, forever, on repeat. This was the fleet's single largest source of
+        // stalled combat (spell 3018 alone: 15 of 21 bots, thousands of failed casts). A genuinely
+        // ranged spec never reaches this fallback for its real rotation -- that goes through its own
+        // CombatProfile/useRangedAutoRepeat path entirely separately -- so excluding ranged-weapon
+        // spells here costs it nothing.
+        if (spellInfo->HasAttribute(SPELL_ATTR0_USES_RANGED_SLOT))
+            return false;
+
+        // A spell whose only unit targets are allies (Spirit Charge: charge + heal + damage on TARGET_UNIT_TARGET_ALLY) is not
+        // an enemy filler even though one effect deals damage; at a hostile target the core answers SPELL_FAILED_BAD_TARGETS.
+        bool allyOnly = false, enemyReachable = false;
+        for (SpellEffectInfo const& effect : spellInfo->Effects)
+        {
+            if (!effect.IsEffect())
+                continue;
+            for (Targets target : { effect.TargetA.GetTarget(), effect.TargetB.GetTarget() })
+            {
+                if (target == TARGET_UNIT_TARGET_ALLY || target == TARGET_UNIT_TARGET_PARTY)
+                    allyOnly = true;
+                else if (target == TARGET_UNIT_TARGET_ENEMY || target == TARGET_UNIT_TARGET_ANY)
+                    enemyReachable = true;
+            }
+        }
+        if (allyOnly && !enemyReachable)
+            return false;
+
+        return spellInfo->HasEffect(SPELL_EFFECT_SCHOOL_DAMAGE) ||
+            spellInfo->HasEffect(SPELL_EFFECT_WEAPON_DAMAGE) ||
+            spellInfo->HasEffect(SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL) ||
+            spellInfo->HasEffect(SPELL_EFFECT_WEAPON_PERCENT_DAMAGE) ||
+            spellInfo->HasAura(SPELL_AURA_PERIODIC_DAMAGE) ||
+            spellInfo->HasAura(SPELL_AURA_PERIODIC_DAMAGE_PERCENT);
+    }
+
+    // The two real WotLK taunt shapes: a direct SPELL_EFFECT_ATTACK_ME (e.g. Warrior Taunt) or a
+    // SPELL_AURA_MOD_TAUNT aura (e.g. Growl-style pet taunts).
+    bool IsUsableTauntSpell(SpellInfo const* spellInfo)
+    {
+        if (!spellInfo || spellInfo->IsPassive())
+            return false;
+        if (!spellInfo->NeedsExplicitUnitTarget() || !spellInfo->CanBeUsedInCombat())
+            return false;
+
+        return spellInfo->HasEffect(SPELL_EFFECT_ATTACK_ME) || spellInfo->HasAura(SPELL_AURA_MOD_TAUNT);
+    }
+
+    // A positive spell with a direct SPELL_EFFECT_HEAL/HEAL_PCT or a SPELL_AURA_PERIODIC_HEAL (HoT).
+    bool IsUsableHealSpell(SpellInfo const* spellInfo)
+    {
+        if (!spellInfo || spellInfo->IsPassive() || !spellInfo->IsPositive())
+            return false;
+        if (!spellInfo->NeedsExplicitUnitTarget() || !spellInfo->CanBeUsedInCombat())
+            return false;
+
+        return spellInfo->HasEffect(SPELL_EFFECT_HEAL) || spellInfo->HasEffect(SPELL_EFFECT_HEAL_PCT) ||
+            spellInfo->HasAura(SPELL_AURA_PERIODIC_HEAL);
+    }
+
+    // "A buff that reaches the whole party/raid" -- the three AREA_AURA effect types are the real
+    // WotLK mechanism real party/raid buffs use (cast on self, the engine propagates the aura to
+    // nearby party/raid/friendly members automatically), deliberately not matching single-target
+    // heals or ordinary self-buffs (neither need Support's own special handling).
+    bool IsUsableBuffSpell(SpellInfo const* spellInfo)
+    {
+        if (!spellInfo || spellInfo->IsPassive() || !spellInfo->IsPositive())
+            return false;
+
+        return spellInfo->HasEffect(SPELL_EFFECT_APPLY_AREA_AURA_PARTY) ||
+            spellInfo->HasEffect(SPELL_EFFECT_APPLY_AREA_AURA_RAID) ||
+            spellInfo->HasEffect(SPELL_EFFECT_APPLY_AREA_AURA_FRIEND);
+    }
+
+    bool IsUsableInterruptSpell(SpellInfo const* spellInfo)
+    {
+        if (!spellInfo || spellInfo->IsPassive() || spellInfo->IsPositive())
+            return false;
+        if (!spellInfo->CanBeUsedInCombat())
+            return false;
+
+        return spellInfo->HasEffect(SPELL_EFFECT_INTERRUPT_CAST) ||
+            spellInfo->HasAura(SPELL_AURA_MOD_SILENCE);
+    }
+
+    bool IsUsableDispelSpell(SpellInfo const* spellInfo)
+    {
+        if (!spellInfo || spellInfo->IsPassive() || !spellInfo->IsPositive())
+            return false;
+        if (!spellInfo->CanBeUsedInCombat())
+            return false;
+
+        if (!spellInfo->NeedsExplicitUnitTarget())
+        {
+            bool casterGroupDispel = false;
+            for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+            {
+                auto const& effect = spellInfo->Effects[i];
+                if (effect.Effect != SPELL_EFFECT_DISPEL) continue;
+                for (auto target : {effect.TargetA.GetTarget(), effect.TargetB.GetTarget()})
+                    if (target == TARGET_UNIT_CASTER_AREA_PARTY || target == TARGET_UNIT_CASTER_AREA_RAID)
+                        casterGroupDispel = true;
+            }
+            if (!casterGroupDispel) return false;
+        }
+
+        // The real WotLK dispel shape (Dispel Magic/Cleanse/Remove Curse/Purify all use this) --
+        // this fork's SharedDefines.h/SpellAuraDefines.h has no periodic-dispel aura type to also
+        // match (that's a later-TrinityCore addition), so SPELL_EFFECT_DISPEL alone is the check.
+        return spellInfo->HasEffect(SPELL_EFFECT_DISPEL);
+    }
+
+    bool IsDispelCompatible(SpellInfo const* cleanseSpell, SpellInfo const* debuffSpell)
+    {
+        if (!cleanseSpell || !debuffSpell)
+            return false;
+        if (debuffSpell->Dispel == DISPEL_NONE)
+            return false;
+
+        uint32 debuffMask = SpellInfo::GetDispelMask(DispelType(debuffSpell->Dispel));
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        {
+            if (cleanseSpell->Effects[i].Effect != SPELL_EFFECT_DISPEL)
+                continue;
+            uint32 cleanseMask = SpellInfo::GetDispelMask(DispelType(cleanseSpell->Effects[i].MiscValue));
+            if (cleanseMask & debuffMask)
+                return true;
+        }
+        return false;
+    }
+
+    bool IsTargetCastingInterruptibleSpell(Unit const* target, uint32& outSpellId, uint32& outFinishTimeMs)
+    {
+        outSpellId = 0;
+        outFinishTimeMs = 0;
+
+        if (!target || !target->IsAlive())
+            return false;
+
+        for (uint32 i = CURRENT_FIRST_NON_MELEE_SPELL; i < CURRENT_AUTOREPEAT_SPELL; ++i)
+        {
+            if (Spell* spell = target->GetCurrentSpell(CurrentSpellTypes(i)))
+            {
+                SpellInfo const* curSpellInfo = spell->m_spellInfo;
+                if (!curSpellInfo)
+                    continue;
+                if ((spell->getState() == SPELL_STATE_CASTING || (spell->getState() == SPELL_STATE_PREPARING && spell->GetCastTime() > 0.0f))
+                        && spell->IsInterruptable()
+                        && ((i == CURRENT_GENERIC_SPELL && (curSpellInfo->InterruptFlags & SPELL_INTERRUPT_FLAG_INTERRUPT))
+                            || (i == CURRENT_CHANNELED_SPELL && (curSpellInfo->ChannelInterruptFlags & CHANNEL_INTERRUPT_FLAG_INTERRUPT))))
+                {
+                    outSpellId = curSpellInfo->Id;
+                    outFinishTimeMs = getMSTime() + uint32(std::max(0, spell->GetCastTimeRemaining()));
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool IsEatingOrDrinking(Unit const* unit)
+    {
+        if (!unit)
+            return false;
+        if (unit->HasAuraWithMechanic(1 << MECHANIC_BANDAGE))
+            return true;
+        for (auto const& pair : unit->GetAppliedAuras())
+        {
+            AuraApplication const* app = pair.second;
+            if (!app || !app->IsPositive())
+                continue;
+            SpellInfo const* info = app->GetBase() ? app->GetBase()->GetSpellInfo() : nullptr;
+            if (info && (info->AuraInterruptFlags & AURA_INTERRUPT_FLAG_NOT_SEATED))
+                return true;
+        }
+        return false;
+    }
+
+    bool IsInterruptWorthwhile(SpellInfo const* spellInfo)
+    {
+        if (!spellInfo)
+            return false;
+        // Aimed at us (negative) - damage, crowd control, debuffs.
+        if (!spellInfo->IsPositive())
+            return true;
+        // A positive cast still matters when it heals or revives other enemies or brings in more of them.
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        {
+            switch (spellInfo->Effects[i].Effect)
+            {
+                case SPELL_EFFECT_HEAL:
+                case SPELL_EFFECT_HEAL_PCT:
+                case SPELL_EFFECT_HEAL_MAX_HEALTH:
+                case SPELL_EFFECT_SUMMON:
+                case SPELL_EFFECT_SUMMON_PET:
+                case SPELL_EFFECT_RESURRECT:
+                case SPELL_EFFECT_RESURRECT_NEW:
+                    return true;
+                default:
+                    break;
+            }
+            if (spellInfo->Effects[i].ApplyAuraName == SPELL_AURA_PERIODIC_HEAL)
+                return true;
+        }
+        return false;
+    }
+
+    bool GetDamagingCastOn(Unit* enemy, Unit* target, float& outDamage, uint32& outRemainingMs, uint32* outSchoolMask)
+    {
+        outDamage = 0.0f;
+        outRemainingMs = 0;
+        if (outSchoolMask)
+            *outSchoolMask = 0;
+        if (!enemy || !target || !enemy->IsAlive())
+            return false;
+        for (uint32 i = CURRENT_GENERIC_SPELL; i <= CURRENT_CHANNELED_SPELL; ++i)
+        {
+            Spell* spell = enemy->GetCurrentSpell(CurrentSpellTypes(i));
+            if (!spell || !spell->m_spellInfo)
+                continue;
+            if (spell->getState() != SPELL_STATE_PREPARING && spell->getState() != SPELL_STATE_CASTING)
+                continue;
+            if (spell->m_targets.GetUnitTarget() != target)
+                continue;
+            SpellInfo const* info = spell->m_spellInfo;
+            float total = 0.0f;
+            for (uint8 e = 0; e < MAX_SPELL_EFFECTS; ++e)
+            {
+                SpellEffectInfo const& effect = info->Effects[e];
+                if (effect.Effect != SPELL_EFFECT_SCHOOL_DAMAGE && effect.Effect != SPELL_EFFECT_WEAPON_DAMAGE &&
+                    effect.Effect != SPELL_EFFECT_NORMALIZED_WEAPON_DMG && effect.Effect != SPELL_EFFECT_WEAPON_PERCENT_DAMAGE)
+                    continue;
+                int32 base = spell->CalculateSpellDamage(e, target);
+                if (base <= 0)
+                    continue;
+                uint32 amount = enemy->SpellDamageBonusDone(target, info, uint32(base), SPELL_DIRECT_DAMAGE, e);
+                total += float(target->SpellDamageBonusTaken(enemy, info, amount, SPELL_DIRECT_DAMAGE));
+            }
+            if (total <= 0.0f)
+                continue;
+            outDamage = total;
+            outRemainingMs = uint32(std::max(0, spell->GetCastTimeRemaining()));
+            if (outSchoolMask)
+                *outSchoolMask = uint32(info->GetSchoolMask());
+            return true;
+        }
+        return false;
+    }
+
+    bool IsTargetCastingInterruptibleSpell(Unit const* target)
+    {
+        uint32 unusedSpellId, unusedFinishTime;
+        return IsTargetCastingInterruptibleSpell(target, unusedSpellId, unusedFinishTime);
+    }
+
+    bool IsUsableAoeSpell(SpellInfo const* spellInfo)
+    {
+        if (!IsUsableOffensiveSpell(spellInfo))
+            return false;
+
+        if (spellInfo->IsAffectingArea() || spellInfo->IsTargetingArea())
+            return true;
+
+        if (spellInfo->MaxAffectedTargets > 1)
+            return true;
+
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        {
+            if (spellInfo->Effects[i].IsEffect() && spellInfo->Effects[i].ChainTarget > 1)
+                return true;
+        }
+
+        return false;
+    }
+
+    bool IsUsableSingleTargetOffensiveSpell(SpellInfo const* spellInfo)
+    {
+        return IsUsableOffensiveSpell(spellInfo) && !IsUsableAoeSpell(spellInfo);
+    }
+
+    bool IsBossOrEliteTarget(Unit const* target)
+    {
+        if (!target)
+            return false;
+
+        if (Creature const* creature = target->ToCreature())
+            return creature->isElite() || creature->isWorldBoss() || creature->IsDungeonBoss();
+
+        return false;
+    }
+
+    bool IsUsableBurstSpell(SpellInfo const* spellInfo)
+    {
+        if (!IsUsableOffensiveSpell(spellInfo))
+            return false;
+
+        uint32 cd = spellInfo->RecoveryTime > spellInfo->CategoryRecoveryTime ? spellInfo->RecoveryTime : spellInfo->CategoryRecoveryTime;
+        return cd >= BURST_SPELL_MIN_COOLDOWN_MS;
+    }
+
+    bool IsUnitUnderBreakableCrowdControl(Unit const* unit)
+    {
+        if (!unit)
+            return false;
+
+        constexpr uint64 BREAKS_ON_DAMAGE_CC_MASK =
+            (1ULL << MECHANIC_CHARM) |
+            (1ULL << MECHANIC_DISORIENTED) |
+            (1ULL << MECHANIC_FEAR) |
+            (1ULL << MECHANIC_SLEEP) |
+            (1ULL << MECHANIC_POLYMORPH) |
+            (1ULL << MECHANIC_BANISH) |
+            (1ULL << MECHANIC_SHACKLE) |
+            (1ULL << MECHANIC_HORROR) |
+            (1ULL << MECHANIC_SAPPED);
+
+        return unit->HasAuraWithMechanic(BREAKS_ON_DAMAGE_CC_MASK);
+    }
+
+    bool WouldAoEHitBreakableCrowdControl(Player* bot, Unit* target, SpellInfo const* spellInfo)
+    {
+        if (!bot || !target || !spellInfo)
+            return false;
+
+        float radius = 0.0f;
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        {
+            if (spellInfo->Effects[i].IsEffect())
+            {
+                float r = spellInfo->Effects[i].CalcRadius(bot);
+                if (r > radius)
+                    radius = r;
+            }
+        }
+        if (radius <= 0.0f)
+            return false; // not actually an area effect -- nothing to protect against
+
+        std::vector<Unit*> nearby;
+        GetNearbyEnemies(bot, target, radius, nearby);
+        for (Unit* unit : nearby)
+        {
+            if (IsUnitUnderBreakableCrowdControl(unit))
+                return true;
+        }
+        return false;
+    }
+
+    bool IsOffGlobalCooldown(Player* bot, SpellInfo const* spellInfo)
+    {
+        if (!bot || !spellInfo)
+            return false;
+        if (spellInfo->StartRecoveryTime == 0)
+            return true; // off-GCD ability -- never gated by the shared GCD category at all
+        return !bot->GetGlobalCooldownMgr().HasGlobalCooldown(spellInfo);
+    }
+
+    void FaceHostileTargetForCast(Player* bot, Unit* target)
+    {
+        if (!bot || !target || target == bot || !bot->IsHostileTo(target) || bot->HasInArc(float(M_PI), target))
+            return;
+        bot->SetInFront(target);
+        bot->SetFacingToObject(target);
+    }
+
+    namespace
+    {
+        // Share of maximum health a health-paid damage spell has to leave behind.
+        constexpr float HEALTH_COST_RESERVE_PCT = 30.0f;
+
+        bool IsHealthPaidDamageSpell(SpellInfo const* spellInfo)
+        {
+            return spellInfo->HasEffect(SPELL_EFFECT_SCHOOL_DAMAGE) || spellInfo->HasEffect(SPELL_EFFECT_WEAPON_DAMAGE) ||
+                spellInfo->HasEffect(SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL) || spellInfo->HasEffect(SPELL_EFFECT_WEAPON_PERCENT_DAMAGE) ||
+                spellInfo->HasEffect(SPELL_EFFECT_NORMALIZED_WEAPON_DMG) || spellInfo->HasAura(SPELL_AURA_PERIODIC_DAMAGE);
+        }
+    }
+
+    char const* NativeCastPrerequisiteFailure(Player* bot, SpellInfo const* spellInfo)
+    {
+        if (!bot || !spellInfo)
+            return nullptr;
+        // Bladestorm-like states (Righteous Tempest): the core answers every other cast with SPELL_FAILED_SPELL_IN_PROGRESS
+        // (Spell::CheckCast, PLAYER_ALLOW_ONLY_ABILITY), which cost Crusader24 about 20 failed casts per 30 s.
+        if (bot->HasPlayerFlag(PLAYER_ALLOW_ONLY_ABILITY) && !spellInfo->HasAttribute(SPELL_ATTR0_ON_NEXT_SWING_NO_DAMAGE))
+            return "only abilities allowed while a Tempest-like state is active";
+        if (spellInfo->CasterAuraStateNot && bot->HasAuraState(AuraStateType(spellInfo->CasterAuraStateNot), spellInfo, bot))
+            return "blocked by spell-defined caster aura state";
+        if (spellInfo->ExcludeCasterAuraSpell && bot->HasAura(spellInfo->ExcludeCasterAuraSpell))
+            return "blocked by spell-defined caster aura";
+        if (!bot->HasItemFitToSpellRequirements(spellInfo))
+            return "equipped item requirement";
+        if (spellInfo->EquippedItemClass >= 0)
+        {
+            if (spellInfo->HasAttribute(SPELL_ATTR3_REQUIRES_MAIN_HAND_WEAPON))
+            {
+                Item* weapon = bot->GetWeaponForAttack(BASE_ATTACK);
+                if (!weapon || weapon->IsBroken() || !weapon->IsFitToSpellRequirements(spellInfo))
+                    return "main-hand weapon requirement";
+            }
+            if (spellInfo->HasAttribute(SPELL_ATTR3_REQUIRES_OFF_HAND_WEAPON))
+            {
+                Item* weapon = bot->GetWeaponForAttack(OFF_ATTACK);
+                if (!weapon || weapon->IsBroken() || !weapon->IsFitToSpellRequirements(spellInfo))
+                    return "off-hand weapon requirement";
+            }
+        }
+        // A damage spell that is paid for with health must not take the caster below the reserve: Sanguine bled itself to 0% with
+        // no incoming damage (the profile gate did not cover the generic fallback). Self-sustain spells that cost health
+        // (Blood Tap, Liquify, ...) deal no damage and keep their own profile gates.
+        if (spellInfo->PowerType == POWER_HEALTH && IsHealthPaidDamageSpell(spellInfo))
+        {
+            int32 cost = spellInfo->CalcPowerCost(bot, spellInfo->GetSchoolMask());
+            if (cost > 0 && bot->GetMaxHealth() > 0 &&
+                float(int64(bot->GetHealth()) - cost) * 100.0f / float(bot->GetMaxHealth()) < HEALTH_COST_RESERVE_PCT)
+                return "health reserve for health-cost damage spell";
+        }
+        for (uint32 totem : spellInfo->Totem)
+            if (totem && !bot->HasItemCount(totem))
+                return "missing totem item";
+        for (uint32 category : spellInfo->TotemCategory)
+            if (category && !bot->HasItemTotemCategory(category))
+                return "missing totem category item";
+        return nullptr;
+    }
+
+    bool IsKnownSpellCastable(Player* bot, uint32 spellId, Unit* target, bool positiveRange)
+    {
+        if (!bot || !spellId || !target)
+            return false;
+
+        PlayerSpellMap const& spellMap = bot->GetSpellMap();
+        auto spellItr = spellMap.find(spellId);
+        if (spellItr == spellMap.end() || !spellItr->second || spellItr->second->State == PLAYERSPELL_REMOVED || !spellItr->second->Active)
+            return false;
+
+        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+        if (!spellInfo)
+            return false;
+
+        // This boundary receives the effective cast ID. Native passive auras
+        // and proc execution are not manually activated by bot decisions.
+        if (spellInfo->IsPassive())
+            return false;
+
+        // Confirmed live (21-bot fleet, 2026-09-25/26): a genuinely stunned bot kept getting a
+        // spell selected here anyway, tried to cast it, and failed SPELL_FAILED_STUNNED every
+        // single tick until the stun wore off (Finding 3 in
+        // docs/research/bot-fleet-combat-findings.md) -- wasted attempts, not a real problem with
+        // any specific spell. A stunned unit cannot cast anything (barring a handful of trinket-like
+        // exceptions this AI doesn't have), so just don't offer a candidate at all while stunned.
+        if (bot->HasUnitState(UNIT_STATE_STUNNED))
+            return false;
+        if (bot->HasSpellCooldown(spellId))
+            return false;
+        if (!IsOffGlobalCooldown(bot, spellInfo))
+            return false;
+        if (NativeCastPrerequisiteFailure(bot, spellInfo))
+            return false;
+        if (spellInfo->CasterAuraState && !bot->HasAuraState(AuraStateType(spellInfo->CasterAuraState), spellInfo, bot))
+            return false;
+        if (target && spellInfo->TargetAuraState && !target->HasAuraState(AuraStateType(spellInfo->TargetAuraState), spellInfo, bot))
+            return false;
+        if (target && spellInfo->TargetAuraStateNot && target->HasAuraState(AuraStateType(spellInfo->TargetAuraStateNot), spellInfo, bot))
+            return false;
+        if (spellInfo->CasterAuraSpell && !bot->HasAura(spellInfo->CasterAuraSpell))
+            return false;
+        if (target && spellInfo->TargetAuraSpell && !target->HasAura(spellInfo->TargetAuraSpell))
+            return false;
+
+        if (BotAI::IsSpellInFailureCooldown(bot->GetGUID(), spellId))
+            return false;
+
+        // Both bounds matter for a ranged spell -- see SelectKnownSpell's header comment.
+        float dist = bot->GetDistance(target);
+        float maxRange = spellInfo->GetMaxRange(positiveRange, bot);
+        if (maxRange > 0.0f)
+        {
+            if (dist > maxRange)
+                return false;
+        }
+        else if (spellInfo->IsAffectingArea())
+        {
+            float maxRadius = 0.0f;
+            for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+            {
+                if (spellInfo->Effects[i].IsEffect())
+                {
+                    float r = spellInfo->Effects[i].CalcRadius(bot);
+                    if (r > maxRadius)
+                        maxRadius = r;
+                }
+            }
+            if (maxRadius > 0.0f && dist > maxRadius)
+                return false;
+        }
+        float minRange = spellInfo->GetMinRange(positiveRange);
+        if (minRange > 0.0f && bot->IsWithinRange(target, minRange + bot->GetMeleeRange(target)))
+            return false;
+
+        if (spellInfo->PowerType == POWER_HEALTH)
+        {
+            int32 cost = spellInfo->CalcPowerCost(bot, spellInfo->GetSchoolMask());
+            if (cost > 0 && bot->GetHealth() <= (uint32)cost)
+                return false;
+        }
+        else
+        {
+            int32 cost = spellInfo->CalcPowerCost(bot, spellInfo->GetSchoolMask());
+            if (cost > 0 && bot->GetPower(Powers(spellInfo->PowerType)) < cost)
+                return false;
+        }
+
+        return true;
+    }
+
+    uint32 SelectKnownSpell(Player* bot, Unit* target, bool positiveRange, bool (*predicate)(SpellInfo const*))
+    {
+        for (auto const& [spellId, playerSpell] : bot->GetSpellMap())
+        {
+            if (!playerSpell || playerSpell->State == PLAYERSPELL_REMOVED || !playerSpell->Active)
+                continue;
+
+            uint32 first = sSpellMgr->GetFirstSpellInChain(spellId);
+            uint32 highest = SpellResolver::ResolveSpell(bot, first ? first : spellId);
+            if (highest != spellId)
+                continue;
+            uint32 effective = SpellResolver::EffectiveSpell(bot, highest);
+            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(effective);
+            if (!predicate(spellInfo))
+                continue;
+
+            if (IsKnownSpellCastable(bot, effective, target, positiveRange))
+                return effective;
+        }
+        return 0;
+    }
+
+    uint32 SelectSpell(Player* bot, Unit* target) { return SelectKnownSpell(bot, target, false, IsUsableOffensiveSpell); }
+    uint32 SelectTauntSpell(Player* bot, Unit* target) { return SelectKnownSpell(bot, target, false, IsUsableTauntSpell); }
+    uint32 SelectHealSpell(Player* bot, Unit* target) { return SelectKnownSpell(bot, target, true, IsUsableHealSpell); }
+    uint32 SelectBuffSpell(Player* bot)
+    {
+        CombatProfile const* profile = nullptr;
+        uint32 activeSpec = bot->GetPlayerSetting("core.ascension_active_spec", 0).value;
+        profile = ProfileRegistry::FindProfile(bot->getClass(), activeSpec, BotRole::Support);
+        if (!profile)
+            profile = ProfileRegistry::FindProfile(bot->getClass(), activeSpec, BotRole::Dps);
+        if (!profile)
+            profile = ProfileRegistry::FindProfile(bot->getClass(), activeSpec, BotRole::Healer);
+        if (!profile)
+            profile = ProfileRegistry::FindProfile(bot->getClass(), activeSpec, BotRole::Tank);
+
+        for (auto const& [spellId, playerSpell] : bot->GetSpellMap())
+        {
+            if (!playerSpell || playerSpell->State == PLAYERSPELL_REMOVED || !playerSpell->Active)
+                continue;
+
+            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+            if (!IsUsableBuffSpell(spellInfo))
+                continue;
+
+            // Sun Cleric vows replace one another natively. Routine fallback
+            // must not undo the profile's selected vow by cycling all learned vows.
+            if (profile && bot->getClass() == 27)
+            {
+                auto isVow = [](uint32 id) {
+                    return id == 803489 || id == 803491 || id == 803719 ||
+                        id == 807435 || id == 807547 || id == 807749;
+                };
+                if (isVow(spellId))
+                {
+                    bool hasPreferred = false;
+                    bool isPreferred = false;
+                    for (auto const& ability : profile->abilities)
+                        if (HasTag(ability.tags, AbilityTag::Buff) && isVow(ability.rootSpellId))
+                        {
+                            hasPreferred = true;
+                            isPreferred = isPreferred || ability.rootSpellId == spellId;
+                        }
+                    if (hasPreferred && !isPreferred)
+                        continue;
+                }
+            }
+
+            // Never select cooldowns tagged as DefensiveCD or OffensiveCD for routine buff maintenance
+            if (profile)
+            {
+                bool isCooldown = false;
+                for (auto const& desc : profile->abilities)
+                {
+                    uint32 resolved = SpellResolver::ResolveSpell(bot, desc.rootSpellId);
+                    if (desc.rootSpellId == spellId || (resolved && resolved == spellId))
+                    {
+                        if (HasTag(desc.tags, AbilityTag::DefensiveCD) || HasTag(desc.tags, AbilityTag::OffensiveCD))
+                        {
+                            isCooldown = true;
+                            break;
+                        }
+                    }
+                }
+                if (isCooldown)
+                    continue;
+            }
+
+            if (IsKnownSpellCastable(bot, spellId, bot, true))
+                return spellId;
+        }
+        return 0;
+    }
+    uint32 SelectInterruptSpell(Player* bot, Unit* target) { return SelectKnownSpell(bot, target, false, IsUsableInterruptSpell); }
+    uint32 SelectAoeSpell(Player* bot, Unit* target) { return SelectKnownSpell(bot, target, false, IsUsableAoeSpell); }
+    uint32 SelectSingleTargetSpell(Player* bot, Unit* target) { return SelectKnownSpell(bot, target, false, IsUsableSingleTargetOffensiveSpell); }
+    uint32 SelectBurstSpell(Player* bot, Unit* target) { return SelectKnownSpell(bot, target, false, IsUsableBurstSpell); }
+    uint32 SelectDispelSpell(Player* bot, Unit* target) { return SelectKnownSpell(bot, target, true, IsUsableDispelSpell); }
+
+    class HostileEnemyCheck
+    {
+    public:
+        HostileEnemyCheck(Player const* bot, Unit const* center, float range)
+            : _bot(bot), _center(center), _range(range) { }
+
+        bool operator()(Unit* u) const
+        {
+            if (!u || !u->IsAlive() || u == _bot)
+                return false;
+            if (!_center->IsWithinDistInMap(u, _range))
+                return false;
+            if (!_bot->IsValidAttackTarget(u))
+                return false;
+            return true;
+        }
+
+    private:
+        Player const* _bot;
+        Unit const* _center;
+        float _range;
+    };
+
+    uint32 CountNearbyEnemies(Player const* bot, Unit const* center, float range)
+    {
+        if (!bot || !center)
+            return 0;
+
+        std::vector<Unit*> enemies;
+        HostileEnemyCheck check(bot, center, range);
+        Acore::UnitListSearcher<HostileEnemyCheck> searcher(center, enemies, check);
+        Cell::VisitObjects(center, searcher, range);
+        return static_cast<uint32>(enemies.size());
+    }
+
+    void GetNearbyEnemies(Player const* bot, Unit const* center, float range, std::vector<Unit*>& out)
+    {
+        if (!bot || !center)
+            return;
+
+        HostileEnemyCheck check(bot, center, range);
+        Acore::UnitListSearcher<HostileEnemyCheck> searcher(center, out, check);
+        Cell::VisitObjects(center, searcher, range);
+    }
+
+    // -----------------------------------------------------------------------
+    // FindCasterAuraForDescriptor (Round 3.2.2)
+    //
+    // Returns the first active Aura on `bot` that can be attributed to the
+    // ability described by `desc` + `resolvedSpellId`.  Resolution order is
+    // documented in SpellPredicates.h.  Every explicit aura-ID check also
+    // tries the rank-chain variant so that a profile entry that says
+    // casterAuraId=804018 (root rank) correctly matches a live 503322 aura
+    // (resolved rank for a high-level bot).
+    //
+    // Helper lambda: try `id`, then the resolved rank of `id`.
+    Aura const* FindCasterAuraForDescriptor(Player* bot, AbilityDescriptor const& desc, uint32 resolvedSpellId)
+    {
+        if (!bot)
+            return nullptr;
+
+        auto tryId = [&](uint32 id) -> Aura const*
+        {
+            if (!id)
+                return nullptr;
+            if (Aura const* a = bot->GetAura(id))
+                return a;
+            uint32 ranked = SpellResolver::ResolveSpell(bot, id);
+            if (ranked && ranked != id)
+                if (Aura const* a = bot->GetAura(ranked))
+                    return a;
+            return nullptr;
+        };
+
+        // 1. Explicit casterAuraId
+        if (Aura const* a = tryId(desc.casterAuraId))
+            return a;
+
+        // 2. missingAuraOnCaster
+        if (Aura const* a = tryId(desc.missingAuraOnCaster))
+            return a;
+
+        // 3. targetAuraId when self-targeting
+        if (desc.targetType == TargetType::Self)
+            if (Aura const* a = tryId(desc.targetAuraId))
+                return a;
+
+        // 4. resolvedSpellId directly
+        if (Aura const* a = bot->GetAura(resolvedSpellId))
+            return a;
+
+        // 5. Triggered auras from resolvedSpellId's spell effects
+        if (SpellInfo const* si = resolvedSpellId ? sSpellMgr->GetSpellInfo(resolvedSpellId) : nullptr)
+        {
+            for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+            {
+                if (uint32 trig = si->Effects[i].TriggerSpell)
+                {
+                    if (Aura const* a = bot->GetAura(trig))
+                        return a;
+                }
+            }
+        }
+
+        // 6. rootSpellId directly
+        if (desc.rootSpellId && desc.rootSpellId != resolvedSpellId)
+            if (Aura const* a = bot->GetAura(desc.rootSpellId))
+                return a;
+
+        return nullptr;
+    }
+
+    // -----------------------------------------------------------------------
+    // ShouldRefreshCasterAura (Round 3.2.2)
+    //
+    // Returns true when the bot SHOULD cast (i.e. the existing aura needs
+    // refreshing).  Returns false when the aura is good and the cast should
+    // be skipped.
+    //
+    // Policy evaluation:
+    //   hasStackPolicy = refreshCasterBelowStacks > 0
+    //   hasTimePolicy  = refreshCasterBelowMs > 0 (or refreshBelowMs if Self)
+    //
+    //   Neither policy → presence-only → NO CAST (return false)
+    //   Permanent aura:
+    //     - If stack policy exists and stacks < threshold → CAST (build stacks)
+    //     - Otherwise                                    → NO CAST
+    //   OR semantics: CAST if needsStackRefresh OR needsTimeRefresh
+    bool ShouldRefreshCasterAura(Aura const* aura, AbilityDescriptor const& desc)
+    {
+        if (!aura)
+            return false;   // caller should cast when aura is absent
+
+        uint8 stackThreshold = desc.refreshCasterBelowStacks;
+        if (stackThreshold == 0 && desc.targetType == TargetType::Self)
+            stackThreshold = desc.refreshBelowStacks;
+
+        uint32 refreshWindow = desc.refreshCasterBelowMs;
+        if (refreshWindow == 0 && desc.targetType == TargetType::Self)
+            refreshWindow = desc.refreshBelowMs;
+
+        bool hasStackPolicy = stackThreshold > 0;
+        bool hasTimePolicy  = refreshWindow > 0;
+
+        // No policy at all: presence-only semantics → don't recast
+        if (!hasStackPolicy && !hasTimePolicy)
+            return false;
+
+        bool permanent = aura->IsPermanent();
+
+        if (permanent)
+        {
+            // Permanent + stackable: only recast if still building stacks
+            if (hasStackPolicy && aura->GetStackAmount() < stackThreshold)
+                return true;
+            // Permanent without a missing-stacks condition: never recast
+            return false;
+        }
+
+        // Non-permanent: OR semantics
+        bool needsStackRefresh = hasStackPolicy && aura->GetStackAmount() < stackThreshold;
+        bool needsTimeRefresh  = hasTimePolicy  && aura->GetDuration() <= static_cast<int32>(refreshWindow);
+
+        return needsStackRefresh || needsTimeRefresh;
+    }
+}

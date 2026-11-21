@@ -1,0 +1,181 @@
+/*
+ * mod-coa-playerbots
+ *
+ * Data-Driven Combat AI Framework: SpellPredicates
+ *
+ * Class-agnostic "is this known spell shaped like an offensive/taunt/heal/interrupt/dispel
+ * ability" predicates, and the generic spellbook scanners built on top of them. Originally
+ * lived as an anonymous-namespace block inside BotAI.cpp (see docs/architecture.md's "Beyond
+ * parity" section for why this AI works off real SpellInfo shape instead of a per-class spell
+ * list); pulled out here so engine/CombatUtility.cpp can reuse the exact same logic instead of
+ * re-deriving its own copy of "what counts as a taunt" -- one definition, not two that can
+ * silently drift apart.
+ */
+
+#ifndef COA_PLAYERBOTS_SPELL_PREDICATES_H
+#define COA_PLAYERBOTS_SPELL_PREDICATES_H
+
+#include "Define.h"
+#include "engine/AbilityDescriptor.h"
+#include <vector>
+
+class Aura;
+class Player;
+class Unit;
+class SpellInfo;
+
+namespace BotAI
+{
+    // A rank-agnostic cooldown floor used to tell "this is a big cooldown-gated burst button"
+    // apart from an ordinary spammable ability -- see IsUsableBurstSpell.
+    constexpr uint32 BURST_SPELL_MIN_COOLDOWN_MS = 45000;
+
+    bool IsUsableOffensiveSpell(SpellInfo const* spellInfo);
+    bool IsUsableTauntSpell(SpellInfo const* spellInfo);
+    bool IsUsableHealSpell(SpellInfo const* spellInfo);
+    bool IsUsableBuffSpell(SpellInfo const* spellInfo);
+    bool IsUsableInterruptSpell(SpellInfo const* spellInfo);
+    bool IsUsableAoeSpell(SpellInfo const* spellInfo);
+    bool IsUsableSingleTargetOffensiveSpell(SpellInfo const* spellInfo);
+    bool IsUsableBurstSpell(SpellInfo const* spellInfo);
+
+    // A positive, explicitly-targeted spell that removes a harmful effect from an ally -- the
+    // real WotLK shape is a direct SPELL_EFFECT_DISPEL (Dispel Magic/Cleanse/Remove Curse/Purify
+    // all use this). Deliberately does not try to match the specific DispelType it removes
+    // against what's actually on the target --
+    // that needs per-spell dispel-type data this generic shape check can't see; the real cast
+    // validation inside Player::CastSpell rejects a genuine mismatch on its own (SPELL_FAILED_
+    // NOTHING_TO_DISPEL), so the cost of not pre-filtering is an occasional wasted GCD attempt,
+    // not a bad cast landing.
+    bool IsUsableDispelSpell(SpellInfo const* spellInfo);
+
+    // True when `cleanseSpell` can actually remove `debuffSpell` -- compares cleanseSpell's own
+    // SPELL_EFFECT_DISPEL effect(s) (MiscValue = the DispelType it removes, DISPEL_ALL meaning
+    // "any") against debuffSpell's own DispelType (SpellInfo::Dispel), using the same
+    // SpellInfo::GetDispelMask the real dispel effect handler uses -- see item 4 of the Phase 2
+    // fixup pass. A bot that only knows Remove Curse must not try it on a Magic debuff.
+    bool IsDispelCompatible(SpellInfo const* cleanseSpell, SpellInfo const* debuffSpell);
+
+    // True while `target` is mid-cast on something both interruptible and worth interrupting
+    // (matches the InterruptFlags/ChannelInterruptFlags the real client's own kick UI reacts to).
+    bool IsTargetCastingInterruptibleSpell(Unit const* target);
+
+    // Same check, but also reports which spell it is and the absolute getMSTime() it finishes at
+    // -- CombatContext::Build uses this to populate victimCastingSpellId/victimCastFinishTimeMs
+    // for interrupt-reservation priority (see engine/CombatReservations.h). Outputs are left
+    // untouched (0) when this returns false.
+    bool IsTargetCastingInterruptibleSpell(Unit const* target, uint32& outSpellId, uint32& outFinishTimeMs);
+
+    // Elite/world-boss/dungeon-boss check -- the floor for "does this target justify spending a
+    // long-cooldown burst/defensive button," see CombatContext's fight-value fields.
+    bool IsBossOrEliteTarget(Unit const* target);
+
+    // True while the unit sits eating, drinking or bandaging: any positive aura that breaks when the unit stands up (the real food and
+    // drink auras, whatever their spell id), or a bandage mechanic. Replaces three hand-written id lists that disagreed with each other
+    // (the drink aura bots actually use, 431, was missing from two of them).
+    bool IsEatingOrDrinking(Unit const* unit);
+
+    // Is a cast worth spending an interrupt on? A hostile spell (damage, control, debuff) or one that heals, summons or buffs another
+    // enemy. A cast whose only effect is a harmless self-buff is not: the kick is a cooldown the next real cast may need.
+    bool IsInterruptWorthwhile(SpellInfo const* spellInfo);
+
+    // A damaging cast of `enemy` aimed at `target` that has not finished yet: the damage it would do to `target` after the caster's
+    // damage bonuses and the target's damage-taken modifiers (not armor/resist/absorb rolls), and how long until it lands. Looks at
+    // the enemy's current generic and channeled spell only - what a player sees as a cast bar. False when there is none.
+    // `outSchoolMask` (optional) receives the school mask of the cast, for matching against school-limited absorbs.
+    bool GetDamagingCastOn(Unit* enemy, Unit* target, float& outDamage, uint32& outRemainingMs, uint32* outSchoolMask = nullptr);
+
+    // True when `unit` is under a hard-CC mechanic that breaks on damage (fear/polymorph/sleep/
+    // banish/shackle/sap/charm/horror/disorient) -- used to avoid a target-selection pass
+    // attacking straight through a groupmate's crowd control (item 1/#8's "CC target -> huge
+    // penalty" and item 17's "don't instantly break another group member's CC"). Deliberately
+    // narrower than the engine's own IMMUNE_TO_MOVEMENT_IMPAIRMENT_AND_LOSS_CONTROL_MASK, which
+    // also covers stun/root/snare/daze -- none of those break on damage, so attacking through
+    // them is normal and not penalized here.
+    bool IsUnitUnderBreakableCrowdControl(Unit const* unit);
+
+    // True when casting `spellInfo` at `target` would also catch a breakable-CC'd unit inside its
+    // own effect radius (review finding #1 on the Phase 2 fixup pass) -- the AoE eligibility floor
+    // alone only ever counted *how many* engaged enemies were nearby, never whether one of them
+    // was something a groupmate had gone to the trouble of sheeping/fearing/sapping. Scans around
+    // `target` (the resolved AoE cluster center), not `bot`; a non-area spell (radius 0) always
+    // returns false. Deliberately unit-target-anchored, same limitation as
+    // TargetEvaluator::FindBestAoECluster -- see AreaHostile's own known-limitation note.
+    bool WouldAoEHitBreakableCrowdControl(Player* bot, Unit* target, SpellInfo const* spellInfo);
+
+    // The per-spell eligibility core behind SelectKnownSpell (cooldown, GCD, item/aura
+    // requirements, failure backoff, range, power cost) for one already-chosen, already-known
+    // spellId -- exposed separately so a caller that needs to pick a *specific* spell (e.g.
+    // CombatUtility's dispel-type-compatible cleanse pairing, item 4) can reuse the exact same
+    // castability checks instead of scanning the whole spellbook with a predicate function.
+    // Mirrors the native Spell::CheckCast/CheckItems prerequisites a bot cannot satisfy by waiting (excluding auras, required
+    // weapons in slots, totem items). Returns the failing rule or nullptr. The core stays authoritative; this only avoids futile casts.
+    char const* NativeCastPrerequisiteFailure(Player* bot, SpellInfo const* spellInfo);
+
+    // Turns the bot towards a hostile target that is outside its 180 degree front arc before a cast: the core rejects
+    // facing-gated spells with SPELL_FAILED_UNIT_NOT_INFRONT otherwise (Invention51 Sticky Bomb, 5 failures per minute).
+    void FaceHostileTargetForCast(Player* bot, Unit* target);
+
+    bool IsKnownSpellCastable(Player* bot, uint32 spellId, Unit* target, bool positiveRange);
+
+    // Shared scan shape for all "pick a ready, affordable, in-range known spell matching this
+    // predicate" lookups -- only the predicate and whether beneficial-spell ranges apply differ.
+    uint32 SelectKnownSpell(Player* bot, Unit* target, bool positiveRange, bool (*predicate)(SpellInfo const*));
+
+    // First ready/affordable/in-range candidate wins -- see SelectKnownSpell's own comment on why
+    // that's fine (no per-class priority data exists for most of these 21 classes yet).
+    uint32 SelectSpell(Player* bot, Unit* target);
+    uint32 SelectTauntSpell(Player* bot, Unit* target);
+    uint32 SelectHealSpell(Player* bot, Unit* target);
+    uint32 SelectBuffSpell(Player* bot);
+    uint32 SelectInterruptSpell(Player* bot, Unit* target);
+    uint32 SelectAoeSpell(Player* bot, Unit* target);
+    uint32 SelectSingleTargetSpell(Player* bot, Unit* target);
+    uint32 SelectBurstSpell(Player* bot, Unit* target);
+    uint32 SelectDispelSpell(Player* bot, Unit* target);
+
+    // True once `bot` is clear of spellInfo's own GCD category (StartRecoveryCategory), using the
+    // engine's real per-player GlobalCooldownMgr rather than an approximated fixed delay -- see
+    // docs on why the old APPROXIMATE_GCD_MS constant existed and why it's gone now.
+    bool IsOffGlobalCooldown(Player* bot, SpellInfo const* spellInfo);
+
+    // Hostile units within `range` yards of `center`, valid attack targets for `bot`. Shared by
+    // CombatContext::Build (per-tick nearbyEnemyCount snapshot) and the legacy AoE-threshold
+    // fallback so both agree on what "nearby" means. (The predicate functor behind this scan is
+    // an implementation detail of the .cpp -- BotAI.cpp keeps its own small copy for
+    // FindAllyThreatenedTarget's list-returning scan rather than pulling Unit.h/Player.h's full
+    // definitions into this header just for a 10-line geometry check.)
+    uint32 CountNearbyEnemies(Player const* bot, Unit const* center, float range = 10.0f);
+
+    // Same scan, but returns the actual unit list -- used by TargetEvaluator/ThreatEvaluator
+    // (Phase 2) to score candidates instead of just counting them. Appends into `out` rather than
+    // returning by value so a caller can reuse one vector across a tight scan loop.
+    void GetNearbyEnemies(Player const* bot, Unit const* center, float range, std::vector<Unit*>& out);
+
+    // -----------------------------------------------------------------------
+    // Chain-aware caster-aura helpers (Round 3.2.2)
+    //
+    // Resolution order (first Aura* found wins):
+    //   1. desc.casterAuraId (+ resolved rank of that ID via SpellResolver)
+    //   2. desc.missingAuraOnCaster (+ resolved rank)
+    //   3. desc.targetAuraId when targetType == TargetType::Self (+ resolved rank)
+    //   4. resolvedSpellId directly
+    //   5. triggered auras from SpellInfo->Effects[i].TriggerSpell for resolvedSpellId
+    //   6. desc.rootSpellId directly
+    //
+    // Always returns nullptr when none of the above match.
+    Aura const* FindCasterAuraForDescriptor(Player* bot, AbilityDescriptor const& desc, uint32 resolvedSpellId);
+
+    // Returns true when `aura` should be refreshed according to descriptor refresh policies.
+    //
+    //   hasStackPolicy = refreshCasterBelowStacks > 0
+    //   hasTimePolicy  = refreshCasterBelowMs > 0  (or refreshBelowMs > 0 when targetType==Self)
+    //
+    //   - Neither policy → presence-only: NO REFRESH (aura active = skip cast)
+    //   - Permanent + no remaining stacks needed → NO REFRESH
+    //   - Permanent + stackable + stacks < threshold → REFRESH (build missing stacks)
+    //   - Otherwise: OR semantics — refresh if needsStackRefresh OR needsTimeRefresh
+    bool ShouldRefreshCasterAura(Aura const* aura, AbilityDescriptor const& desc);
+}
+
+#endif // COA_PLAYERBOTS_SPELL_PREDICATES_H

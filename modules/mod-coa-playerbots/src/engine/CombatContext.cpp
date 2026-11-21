@@ -1,0 +1,222 @@
+#include "BotPerformance.h"
+/*
+ * mod-coa-playerbots
+ *
+ * Data-Driven Combat AI Framework: CombatContext implementation
+ */
+
+#include "engine/CombatContext.h"
+#include "engine/CastGuard.h"
+#include "engine/DamageTracker.h"
+#include "engine/HealEvaluator.h"
+#include "engine/SpellPredicates.h"
+#include "engine/TargetEvaluator.h"
+#include "training/TrainingArenaManager.h"
+#include "Config.h"
+#include "Group.h"
+#include "Player.h"
+#include "Spell.h"
+#include "SpellInfo.h"
+#include "Timer.h"
+#include <algorithm>
+
+namespace BotAI
+{
+    namespace
+    {
+        // A cast that would take this share of the bot's maximum health counts as a burst worth a defensive button (default 25%,
+        // CoaBots.Combat.BurstPctThreshold)...
+        float BurstPctThreshold()
+        {
+            static float const value = sConfigMgr->GetOption<float>("CoaBots.Combat.BurstPctThreshold", 25.0f);
+            return value;
+        }
+        // ...from this long before it lands (a longer cast is not yet worth spending the cooldown on).
+        constexpr uint32 BURST_WINDOW_MS = 4500;
+    }
+
+    CombatContext CombatContext::Build(Player* bot, Unit* explicitVictim)
+    {
+        CoaBotPerf::Scope profile(CoaBotPerf::Metric::CombatContext, CoaBotPerf::CombatProfileEnabled());
+        CombatContext ctx;
+        if (!bot || !bot->IsInWorld())
+            return ctx;
+
+        ctx.bot = bot;
+        ctx.currentMSTime = getMSTime();
+        ctx.botHpPct = bot->GetHealthPct();
+
+        Powers powerType = bot->getPowerType();
+        uint32 maxPower = bot->GetMaxPower(powerType);
+        ctx.botPowerPct = (maxPower > 0) ? (static_cast<float>(bot->GetPower(powerType)) * 100.0f / maxPower) : 100.0f;
+        ctx.isCasting = CastGuard::IsCurrentlyCasting(bot);
+        ctx.resources = CombatResourceEvaluator::BuildSnapshot(bot);
+
+        ctx.classId = bot->getClass();
+        ctx.activeSpec = bot->GetPlayerSetting("core.ascension_active_spec", 0).value;
+        ctx.role = BotAI::GetRole(bot->GetGUID());
+
+        // Target / victim resolution
+        ctx.victim = explicitVictim ? explicitVictim : bot->GetVictim();
+
+        if (ctx.victim && ctx.victim->IsAlive())
+        {
+            ctx.victimIsCastingInterruptible = IsTargetCastingInterruptibleSpell(
+                ctx.victim, ctx.victimCastingSpellId, ctx.victimCastFinishTimeMs);
+
+            // Check if victim is attacking someone other than our tank
+            if (Unit const* victimTarget = ctx.victim->GetVictim())
+            {
+                if (victimTarget != bot)
+                {
+                    BotRole targetRole = BotAI::GetRole(victimTarget->GetGUID());
+                    if (targetRole != BotRole::Tank)
+                        ctx.victimTargetingNonTank = true;
+                }
+            }
+
+            // Fight value: does this target justify a long-cooldown burst/defensive button --
+            // see item 14/#9 of the combat-engine rework. A boss/elite, or a real pack, and not
+            // already about to die (don't blow a 2-minute CD to finish off a 10%-HP trash mob).
+            ctx.targetHpPct = ctx.victim->GetHealthPct();
+            ctx.targetIsBossOrElite = IsBossOrEliteTarget(ctx.victim);
+            // The training dummy is a rank-0 creature, so no OffensiveCD ability was ever worth using
+            // in a training run (score x0.15). Opt-in: a training session may stand the dummy in for a
+            // boss; off by default so earlier measurements stay comparable.
+            if (!ctx.targetIsBossOrElite && CoaTraining::Owns(bot->GetGUID()))
+            {
+                static bool const dummyIsBoss = sConfigMgr->GetOption<bool>("CoaBots.Training.TargetIsBoss", false);
+                static uint32 const bossEntry = sConfigMgr->GetOption<uint32>("CoaBots.Training.BossEntry", 31144);
+                if (dummyIsBoss && ctx.victim->GetEntry() == bossEntry)
+                    ctx.targetIsBossOrElite = true;
+            }
+            ctx.nearbyEnemyCount = static_cast<uint8>(std::min<uint32>(255,
+                CountNearbyEnemies(bot, ctx.victim, 10.0f)));
+            ctx.engagedEnemyCount = static_cast<uint8>(std::min<uint32>(255,
+                TargetEvaluator::CountEngaged(bot, ctx.victim, 10.0f)));
+            bool targetIsPvP = ctx.victim->GetTypeId() == TYPEID_PLAYER;
+            ctx.worthOffensiveCooldown = (ctx.targetIsBossOrElite || targetIsPvP || ctx.nearbyEnemyCount >= 3)
+                && ctx.targetHpPct > 15.0f;
+        }
+
+        // Defensive prediction (item 19, Phase 2): a rolling incoming-dps estimate for the bot
+        // itself, cheap (one hash-map lookup, see DamageTracker), plus a contextual "is this
+        // actually dangerous right now" flag instead of a flat HP-threshold. Emergency HP floor,
+        // a real incoming-damage trend implying death soon, or the current victim being both
+        // dangerous (boss/elite mid-cast) and actually targeting the bot all count.
+        ctx.botIncomingDps = DamageTracker::SampleIncomingDps(bot);
+        float timeToDieSec = Decisions::TimeToDieSec(bot->GetHealth(), HealEvaluator::UsableAbsorb(bot, 4000, 0), ctx.botIncomingDps);
+        bool dangerousBossOnBot = ctx.targetIsBossOrElite && ctx.victim && ctx.victim->GetVictim() == bot
+            && ctx.victimIsCastingInterruptible;
+        ctx.worthDefensiveCooldown = ctx.botHpPct < 25.0f
+            || timeToDieSec < 6.0f
+            || (ctx.botHpPct < 60.0f && dangerousBossOnBot);
+
+        // Burst prediction (see CombatContext.h): the largest damaging cast any attacker of the bot has aimed at it.
+        static bool const predictBurst = sConfigMgr->GetOption<bool>("CoaBots.Combat.BurstPrediction", true);
+        if (uint32 maxHealth = predictBurst ? bot->GetMaxHealth() : 0)
+        {
+            for (Unit* attacker : bot->getAttackers())
+            {
+                float damage = 0.0f;
+                uint32 remainingMs = 0;
+                uint32 schoolMask = 0;
+                if (!GetDamagingCastOn(attacker, bot, damage, remainingMs, &schoolMask))
+                    continue;
+                // Only what gets past the shields that are still up when the cast lands reaches health.
+                damage = std::max(0.0f, damage - float(HealEvaluator::UsableAbsorb(bot, std::max<uint32>(remainingMs, 1), schoolMask)));
+                float pct = damage * 100.0f / float(maxHealth);
+                if (pct > ctx.predictedBurstPct)
+                {
+                    ctx.predictedBurstPct = pct;
+                    ctx.burstRemainingMs = remainingMs;
+                }
+            }
+            ctx.burstIncoming = ctx.predictedBurstPct >= BurstPctThreshold() && ctx.burstRemainingMs <= BURST_WINDOW_MS;
+            if (ctx.burstIncoming)
+                ctx.worthDefensiveCooldown = true;
+        }
+
+        // Ally triage snapshot
+        Group const* group = bot->GetGroup();
+        if (group)
+        {
+            float bestUrgency = -1.0f;
+            Player* bestLowestAlly = nullptr;
+            float bestLowestAllyHp = 100.0f;
+            float bestTankScore = -1.0f;
+
+            for (GroupReference const* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* member = ref->GetSource();
+                if (!member || !member->IsAlive() || !member->IsInWorld() || !member->IsWithinDistInMap(bot, 40.0f))
+                    continue;
+
+                float hp = member->GetHealthPct();
+                if (hp < 80.0f)
+                    ++ctx.injuredAllyCount;
+                if (hp < 40.0f)
+                    ++ctx.criticalAllyCount;
+
+                // HealUrgencyScore (item 10/#4, Phase 2) instead of plain lowest-HP% -- a tank
+                // taking heavy incoming damage at 55% can matter more than a DPS at 30% nobody's
+                // still hitting. Feeds every profile ability that targets TargetType::
+                // LowestHealthAlly/AnyInjuredAlly, not just the legacy healer fallback.
+                float urgency = HealEvaluator::ScoreHealUrgency(bot, member);
+                if (urgency > bestUrgency)
+                {
+                    bestUrgency = urgency;
+                    bestLowestAlly = member;
+                    bestLowestAllyHp = hp;
+                }
+
+                // Multi-tank selection (item 16, Phase 2 fixup): the old code just kept
+                // overwriting ctx.tankAlly for every Tank-role member found, so with two tanks
+                // the "chosen" one was whichever happened to iterate last -- pure GroupReference
+                // order, not meaningful. Priority: holding a boss/elite's aggro outranks
+                // everything else; among ties (or no boss aggro at all), the tank under the most
+                // real pressure (incoming damage trend, low time-to-die) wins; the first tank
+                // seen is the fallback if nothing distinguishes them.
+                if (BotAI::GetRole(member->GetGUID()) == BotRole::Tank)
+                {
+                    float tankScore = 0.0f;
+                    if (ctx.victim && ctx.targetIsBossOrElite && ctx.victim->GetVictim() == member)
+                        tankScore += 1000.0f;
+
+                    float tankIncomingDps = DamageTracker::SampleIncomingDps(member);
+                    tankScore += tankIncomingDps;
+                    float tankTtd = (tankIncomingDps > 1.0f) ? (float(member->GetHealth()) / tankIncomingDps) : 999.0f;
+                    if (tankTtd < 10.0f)
+                        tankScore += (10.0f - tankTtd) * 50.0f;
+
+                    if (tankScore > bestTankScore)
+                    {
+                        bestTankScore = tankScore;
+                        ctx.tankAlly = member;
+                        ctx.tankAllyHpPct = hp;
+                    }
+                }
+            }
+
+            ctx.lowestAlly = bestLowestAlly ? bestLowestAlly : bot;
+            ctx.lowestAllyHpPct = bestLowestAlly ? bestLowestAllyHp : ctx.botHpPct;
+        }
+        else
+        {
+            ctx.lowestAlly = bot;
+            ctx.lowestAllyHpPct = ctx.botHpPct;
+            if (ctx.botHpPct < 80.0f)
+                ctx.injuredAllyCount = 1;
+            if (ctx.botHpPct < 40.0f)
+                ctx.criticalAllyCount = 1;
+        }
+
+        if (!ctx.tankAlly && ctx.role == BotRole::Tank)
+        {
+            ctx.tankAlly = bot;
+            ctx.tankAllyHpPct = ctx.botHpPct;
+        }
+
+        return ctx;
+    }
+}

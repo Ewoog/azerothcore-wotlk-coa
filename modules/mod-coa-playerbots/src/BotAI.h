@@ -1,0 +1,224 @@
+/*
+ * mod-coa-playerbots
+ *
+ * Generic, class-agnostic combat AI for a bot Player. See BotAI.cpp's header
+ * comment for why this doesn't hand-tune a rotation per class -- CoA has 21
+ * custom classes (mod-ascension-compat) and no rotation exists for any of them
+ * yet (docs/architecture.md's "Beyond parity" section).
+ */
+
+#ifndef COA_PLAYERBOTS_BOT_AI_H
+#define COA_PLAYERBOTS_BOT_AI_H
+
+#include "Define.h"
+#include "ObjectGuid.h"
+
+class ChatHandler;
+class Player;
+struct ItemTemplate;
+struct Loot;
+
+// Bot role (Dps/Tank/Healer) that changes which target-selection and spell-selection
+// path BotAI::Update() takes. By default, auto-detected from the bot's active Ascension
+// specialization (Player::GetPlayerSetting("core.ascension_active_spec", 0)) via ClassSpecRoles.
+// Can be manually overridden via BotMgr::SetRole / `.botcmd setrole`, or reset to auto with
+// `.botcmd setrole <guid> auto`.
+enum class BotRole
+{
+    Dps,
+    Tank,
+    Healer,
+    // Fights like Dps (same target-acquisition/engage/cast path) but additionally maintains
+    // a party/raid-wide buff on itself when one's known and ready -- see docs/roles.md's role
+    // taxonomy: real Ascension "Support" specs are DPS-hybrids with buffing layered on top
+    // (Bloodmage's Fleshweaver is the one pure-support exception), not a backline-only role.
+    Support,
+};
+
+// Manual movement/engagement override from the bot-control addon (see docs/addon-protocol.md
+// and BotAddonChat.cpp) -- orthogonal to BotRole: a Tank can be told to Stay just as easily
+// as a Dps. None/Follow both mean "behave normally" (acquire the leader's target or whatever's
+// attacking it, follow when idle); Follow only exists as an explicit verb to cancel a
+// previously-set Stay/Pull. Stay suppresses following the leader while idle (still
+// self-defends, same as always). Pull is one-shot: forces an immediate Attack() on a specific
+// target, then reverts to None so normal role logic takes over the resulting fight.
+enum class BotManualCommand
+{
+    None,
+    Follow,
+    Stay,
+    Pull,
+};
+
+namespace BotAI
+{
+    // One tick of role-aware AI for a single bot. Dps/Tank: acquires a target (its own
+    // combat victim, its group leader's if the leader is fighting, or whichever attacker
+    // is currently hitting the bot if neither -- see the attacker-retaliation fallback in
+    // BotAI.cpp), chases into melee range, auto-attacks, and casts any of its own known,
+    // ready, affordable, in-range offensive spells; Tank additionally prioritizes a taunt
+    // if it doesn't currently hold the target's aggro. Healer: finds the lowest-health
+    // group member (self included) and casts a real known heal on them instead, falling
+    // back to the Dps behavior when nobody needs healing. Falls back to following the group
+    // leader once there's no target/heal work. Called from BotMgr::Update() for every
+    // active bot session, every tick. While dead, runs death-handling instead (wait a grace
+    // period for a real resurrect, else release spirit and corpse-run; wait at the graveyard
+    // instead of corpse-running while in a battleground) -- see BotAI.cpp's
+    // UpdateDeathHandling for the full behavior.
+    void Update(Player* bot, uint32 diff);
+
+    // Loads the static loot classification bot gathering needs (which gameobject loot templates are
+    // quest-only). Called once from the module's OnStartup, after the world's loot store is loaded.
+    void LoadGatherLootData();
+
+    // Hooks for the ambient world-behavior layer (BotWorldBehavior.cpp), which lives in its own
+    // translation unit and can't see BotAI.cpp's internals. Each one reuses the logic BotAI itself
+    // already applies, so the two layers can never disagree about what a need is.
+    bool IsQuestOnlyGameObjectLoot(uint32 lootId);
+    bool NeedsRepair(Player* bot);
+    bool NeedsVendor(Player* bot);
+    void MaintainEquipmentNow(Player* bot);
+    bool IsInCity(Player const* bot);
+    void TryMountForTravel(Player* bot);
+
+    // Forces an immediate junk/obsolete-gear sweep (sell to a vendor standing right there, else
+    // destroy only if bags are truly out of room), skipping MaintainEquipmentNow's "only bother
+    // once nearly full" opportunistic gate. For a caller that needs bag space *now* rather than
+    // whenever the bot next happens to wander near a vendor -- BotMgr::GuildGather calls this
+    // before handing out a task, so the bot starts with room to actually carry the result.
+    void PrepareBagsForTask(Player* bot);
+
+    // Makes at least `wanted` bag slots free: junk first (PrepareBagsForTask), then, if the bags are still full of things
+    // that sell for something, the least valuable stacks that no open quest, bag, tool, consumable or epic needs. A finished
+    // quest cannot be handed in with full bags, and bots hoard trade goods without end. Returns the free slots afterwards.
+    uint32 FreeBagSlots(Player* bot, uint32 wanted);
+
+    // The bot's persistent personality preferences for gathering and fishing (0-100), used to
+    // shape its profession skills at creation the same way they shape its solo intent.
+    void GetProfessionLeans(Player* bot, uint8& gathering, uint8& fishing);
+
+    // Profession tools a bot must never part with -- not sold, destroyed, banked or deposited in a
+    // guild bank: anything with a TotemCategory (pick, knife, hammer, spanner, axe, inking set,
+    // enchanting rod, micro-adjustor), plus misc-class weapons and fishing poles.
+    bool IsProfessionTool(ItemTemplate const* proto);
+
+    // Moves an equipped profession tool out of `slot` into the bags instead of destroying it, for
+    // the gear-up paths that replace whatever is equipped. Returns false when there is no bag room,
+    // in which case the caller must leave the slot alone.
+    bool MoveEquippedToolToBags(Player* bot, uint8 slot);
+
+    // Drops any per-bot AI state (cast-gate timer, assigned role) held for this guid. Call
+    // when a bot despawns, so BotAI's internal state map doesn't grow unbounded across
+    // repeated spawn/despawn cycles.
+    void Forget(ObjectGuid botGuid);
+
+    // Manually assigns (or reassigns) a bot's role, overriding auto-detection.
+    void SetRole(ObjectGuid botGuid, BotRole role);
+
+    // Clears any manual role override for this bot, restoring automatic role detection
+    // from its active Ascension specialization.
+    void ClearRoleOverride(ObjectGuid botGuid);
+
+    // Returns the bot's effective role (manual override if set, else auto-detected).
+    BotRole GetRole(ObjectGuid botGuid);
+
+    // Evaluates and scores an item for a bot based on role and class stat affinity.
+    float ScoreItemForBot(Player* bot, ItemTemplate const* proto, BotRole role);
+
+    // The weapon part of ScoreItemForBot on its own: points for weapons (and an off-hand weapon where a
+    // learned spell needs one) that the bot's learned Ascension kit can use, minus points for weapons that
+    // would make learned spells uncastable (wrong subclass, two-hander with an off-hand-only spell).
+    float WeaponKitFit(Player* bot, ItemTemplate const* proto);
+
+    // True when the bot's learned Ascension kit needs a melee or ranged weapon subclass that nothing it has equipped
+    // provides (a Sentinel with a staff and a wand and no bow): its core spells then fail with "equipped item
+    // requirement" and it fights with white hits.
+    bool KitGearMismatch(Player* bot);
+
+    // Training A/B switch: true makes ScoreItemForBot use the old class-only stat guess instead of the spec stat model.
+    void SetLegacyGearScoring(bool legacy);
+
+    // Sets a manual movement/engagement command (see BotManualCommand above). pullTarget is
+    // only used for Pull -- the guid of whatever the commanding player currently has
+    // selected, resolved by the caller (BotAddonChat.cpp) so this API doesn't need to know
+    // anything about who issued the command.
+    void SetManualCommand(ObjectGuid botGuid, BotManualCommand command, ObjectGuid pullTarget = ObjectGuid::Empty);
+
+    // Immediately stops the bot's current attack and reverts any manual command to None
+    // (falls back to normal follow/idle behavior next tick).
+    void StopAttack(ObjectGuid botGuid);
+
+    // Fully disables BotAI::Update() for this guid while suspended -- for any other system
+    // that spawns a session through BotMgr (any spawned Player becomes a tracked bot session,
+    // subject to this file's own combat AI every tick) but needs sole control of that Player
+    // itself. Built for mod-ascension-compat's AscensionClassTester: it spawns test
+    // characters via .botcmd spawnbot for convenience, then manipulates them directly
+    // (repositioning, swapping gear, forcing casts) -- without this, BotAI's own combat loop
+    // was independently attacking the same test dummies at the same time, and the two
+    // systems' concurrent CombatStop()/item-swap/cast calls on the same Player crashed the
+    // server (confirmed live via a crash dump landing in Item::IsBroken mid-delayed-spell-
+    // effect). Suspension is per-guid and persists until explicitly cleared or the bot
+    // despawns (Forget() below already clears all per-guid state, suspension included).
+    void SetSuspended(ObjectGuid botGuid, bool suspended);
+
+    // Diagnostic: scans the bot's own known spellbook with the same three predicates
+    // SelectSpell/SelectTauntSpell/SelectHealSpell use (offensive/taunt/heal-shaped),
+    // reporting counts and a few example spell ids for each to `handler`. Doesn't check
+    // cooldown/range/cost (there's no target for those checks to run against) -- this is
+    // "what could this bot ever cast in principle," not "what can it cast right now."
+    // Built to empirically map a class's numeric Ascension specialization id to its real
+    // role (docs/roles.md only has spec *names*, nothing maps those back to the SpecId
+    // CoATalentEntry::SpecId actually uses) -- set a candidate spec id, relog the bot, run
+    // this, and see which predicate lights up.
+    void ReportSpellbookRoleSignals(Player* bot, ChatHandler* handler);
+
+    // Prints the persistent personality and current solo intent for one bot. This is both an
+    // operator-facing inspection tool and a deliberately small first UI for the human-behavior layer.
+    void ReportProfile(Player* bot, ChatHandler* handler);
+
+    // Prints this bot's full resource snapshot (native power bar(s) + every custom Ascension
+    // resource channel its class has) -- see engine/CombatResource.h. Live-testing/verification
+    // tool for the universal resource-management engine, e.g. `.botcmd resources <guid>`.
+    void ReportResources(Player* bot, ChatHandler* handler);
+
+    // Prints the full resource-requirement breakdown for one specific already-resolved spellId
+    // against this bot (need/have/consumption per requirement, whether each conditional
+    // requirement is currently active, and the final CanAfford verdict) -- the per-ability
+    // diagnostic form, e.g. `.botcmd resources <guid> <spellId>`.
+    void ReportSpellResources(Player* bot, uint32 resolvedSpellId, ChatHandler* handler);
+
+    // Prints the PvE strategic combat state for one bot (spec, role, phase, form status,
+    // pull readiness, tank/healer ready flags, and pull blockers), e.g. `.botcmd strategy <guid>`.
+    void ReportStrategy(Player* bot, ChatHandler* handler);
+
+    // Per-bot follow angle derived from this bot's position within its own group (stable across
+    // ticks, and collision-free for any group up to 8 real members) spread evenly around the
+    // leader instead of every bot using the engine's default Unit::GetFollowAngle() (a single
+    // fixed angle shared by everyone), which made multiple followers stack on top of each
+    // other and walk into one another. Shared here so every MoveFollow call site (BotAI.cpp's
+    // own resume-following, and BotMgr.cpp's post-teleport re-follow) spreads bots into the
+    // same slots.
+    float ComputeFollowAngle(Player* bot);
+
+    // Companion to ComputeFollowAngle -- a small, stable per-bot distance jitter around
+    // BOT_FOLLOW_DIST so the whole formation doesn't read as a perfect circle either. Shared
+    // for the same reason ComputeFollowAngle is (both MoveFollow call sites should agree).
+    float ComputeFollowDistance(Player* bot);
+
+    // Deliberately wider than the engine's own PET_FOLLOW_DIST (2.0yd, PetDefines.h) -- that
+    // constant is tuned for a single pet standing next to its owner, not several bots spread
+    // around a leader in a circle. At 2yd, adjacent 45-degree follow slots (see
+    // ComputeFollowAngle above) sit under 1.5yd apart center-to-center -- easily close enough
+    // for normal-to-large character models to visually overlap even once each bot has its own,
+    // genuinely distinct slot. Confirmed live as still looking "clustered" at 2yd.
+    constexpr float BOT_FOLLOW_DIST = 3.5f;
+
+    // Enqueues a killed creature into the bot's (and its bot groupmates') pending loot queue.
+    void EnqueuePendingLoot(Player* player, ObjectGuid creatureGuid);
+
+    // Takes everything in a loot window the bot has open -- regular items and this bot's
+    // quest-only drops -- through the same autostore handler a client's loot clicks reach.
+    void TakeAllLoot(Player* bot, Loot& loot);
+}
+
+#endif // COA_PLAYERBOTS_BOT_AI_H
