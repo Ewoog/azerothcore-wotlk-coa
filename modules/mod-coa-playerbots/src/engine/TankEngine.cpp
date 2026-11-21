@@ -1,0 +1,107 @@
+#include "training/TrainingArenaManager.h"
+/*
+ * mod-coa-playerbots
+ *
+ * Data-Driven Combat AI Framework: TankEngine implementation
+ */
+
+#include "engine/BotDebugLog.h"
+#include "engine/TankEngine.h"
+#include "engine/ActionEvaluator.h"
+#include "engine/CastGuard.h"
+#include "engine/SpellPredicates.h"
+#include "engine/CombatContext.h"
+#include "engine/CombatMovement.h"
+#include "engine/SpecStrategyRegistry.h"
+#include "profiles/ProfileRegistry.h"
+#include "BotClassRotations.h"
+#include "Log.h"
+#include "Player.h"
+#include "SpellMgr.h"
+#include "Timer.h"
+#include <unordered_map>
+
+namespace BotAI
+{
+    namespace
+    {
+        constexpr uint32 RETRY_GATE_MS = 500;
+        constexpr uint32 AI_REACTION_GATE_MS = 150;
+
+        // See DpsEngine.cpp's own comment on this pattern (item 1, Phase 2 fixup).
+        std::unordered_map<ObjectGuid, uint32> s_noActionRetryAt;
+    }
+
+    CombatResult TankEngine::Execute(Player* bot, CombatContext const& ctx, BotRole profileRole, uint32 diff, uint32& nextCastAllowedMs)
+    {
+        if (!bot || !bot->IsInWorld() || !bot->IsAlive() || !ctx.victim || !ctx.victim->IsAlive())
+            return CombatResult::NoAction;
+
+        uint32 activeSpec = bot->GetPlayerSetting("core.ascension_active_spec", 0).value;
+        CombatProfile const* profile = ProfileRegistry::FindProfile(bot->getClass(), activeSpec, profileRole);
+        if (!profile)
+            return CombatResult::NoAction;
+
+        if (nextCastAllowedMs > diff)
+        {
+            nextCastAllowedMs -= diff;
+            return CombatResult::Busy;
+        }
+        nextCastAllowedMs = 0;
+
+        if (CastGuard::IsCurrentlyCasting(bot))
+            return CombatResult::Busy;
+
+        ObjectGuid botGuid = bot->GetGUID();
+        uint32 now = getMSTime();
+        auto retryItr = s_noActionRetryAt.find(botGuid);
+        if (retryItr != s_noActionRetryAt.end() && now < retryItr->second)
+            return CombatResult::NoAction;
+
+        BotAction action = ActionEvaluator::EvaluateBestAction(ctx, profile->abilities);
+        if (!action.IsValid())
+        {
+            s_noActionRetryAt[botGuid] = now + RETRY_GATE_MS;
+            return CombatResult::NoAction;
+        }
+        s_noActionRetryAt.erase(botGuid);
+
+        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(action.spellId);
+        if (!CombatMovement::ReadyToCast(bot, spellInfo))
+        {
+            nextCastAllowedMs = RETRY_GATE_MS;
+            return CombatResult::Busy;
+        }
+
+        FaceHostileTargetForCast(bot, action.target);
+        SpellCastResult result = bot->CastSpell(action.target, action.spellId, false);
+        CoaTraining::CastResult(bot, action.spellId, uint32(result), action.target);
+        if (HasTag(action.tags, AbilityTag::Interrupt))
+            CoaTraining::InterruptKick(bot, action.spellId, action.target, uint32(result), "profile interrupt");
+        SpecStrategyRegistry::OnActionCastResult(bot, action, result == SPELL_CAST_OK);
+        if (result == SPELL_CAST_OK)
+        {
+            if (HasTag(action.tags, AbilityTag::DefensiveCD))
+                ActionEvaluator::NoteDefensiveCast(bot->GetGUID());
+            if (action.internalThrottleMs > 0 && action.rootSpellId != 0)
+                ActionEvaluator::SetThrottle(bot->GetGUID(), action.rootSpellId, action.internalThrottleMs);
+
+            nextCastAllowedMs = AI_REACTION_GATE_MS;
+            LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "DataDrivenAI [Tank]: bot '{}' cast '{}' (spell {}) on '{}' [score {:.1f}].",
+                bot->GetName(), action.name, action.spellId, action.target->GetName(), action.score);
+            return CombatResult::Cast;
+        }
+
+        BotAI::HandleSpellCastFailure(bot, action.target, action.spellId, result);
+        nextCastAllowedMs = RETRY_GATE_MS;
+        LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "DataDrivenAI [Tank]: bot '{}' failed '{}' (spell {}) on '{}': result {}.",
+            bot->GetName(), action.name, action.spellId, action.target->GetName(), static_cast<uint32>(result));
+        return CombatResult::Busy;
+    }
+
+    void TankEngine::ForgetBot(ObjectGuid botGuid)
+    {
+        s_noActionRetryAt.erase(botGuid);
+        SpecStrategyRegistry::ForgetBot(botGuid);
+    }
+}

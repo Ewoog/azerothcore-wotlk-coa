@@ -1,0 +1,1633 @@
+/*
+ * mod-coa-playerbots
+ *
+ * Class-specific combat rotations for custom Ascension classes.
+ */
+
+#include "BotClassRotations.h"
+#include "BotMovement.h"
+#include "profiles/ProfileGuardian.h"
+#include "engine/SpellPredicates.h"
+#include "engine/SpellResolver.h"
+#include "engine/BotDebugLog.h"
+#include "CellImpl.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
+#include "Group.h"
+#include "Log.h"
+#include "Player.h"
+#include "SpellInfo.h"
+#include "SpellAuras.h"
+#include "SpellMgr.h"
+#include "Timer.h"
+#include <algorithm>
+#include <unordered_map>
+
+namespace BotAI
+{
+namespace
+{
+// Per-bot temporary failure backoff map: [botGuid][spellId] -> expiryMSTime
+// Prevents an ability that failed to cast (e.g. invalid target, LOS, etc.) from being retried every tick.
+std::unordered_map<ObjectGuid, std::unordered_map<uint32, uint32>> failureCooldowns;
+constexpr uint32 FAILURE_COOLDOWN_MS = 2000;
+constexpr uint32 AURA_STATE_FAILURE_COOLDOWN_MS = 5000;
+
+// Per-bot rotation ability throttle map: [botGuid][rootSpellId] -> expiryMSTime
+// Used for abilities without native DBC cooldowns (e.g. totems, summons, edicts).
+std::unordered_map<ObjectGuid, std::unordered_map<uint32, uint32>> abilityThrottleCooldowns;
+} // anonymous namespace
+
+bool IsSpellInFailureCooldown(ObjectGuid botGuid, uint32 spellId)
+{
+    auto botItr = failureCooldowns.find(botGuid);
+    if (botItr == failureCooldowns.end())
+        return false;
+
+    auto spellItr = botItr->second.find(spellId);
+    if (spellItr == botItr->second.end())
+        return false;
+
+    uint32 now = getMSTime();
+    if (now < spellItr->second)
+        return true;
+
+    botItr->second.erase(spellItr);
+    return false;
+}
+
+namespace
+{
+bool IsAbilityThrottled(ObjectGuid botGuid, uint32 rootSpellId)
+{
+    auto botItr = abilityThrottleCooldowns.find(botGuid);
+    if (botItr == abilityThrottleCooldowns.end())
+        return false;
+
+    auto spellItr = botItr->second.find(rootSpellId);
+    if (spellItr == botItr->second.end())
+        return false;
+
+    uint32 now = getMSTime();
+    if (now < spellItr->second)
+        return true;
+
+    botItr->second.erase(spellItr);
+    return false;
+}
+
+void SetAbilityThrottle(ObjectGuid botGuid, uint32 rootSpellId, uint32 durationMs)
+{
+    abilityThrottleCooldowns[botGuid][rootSpellId] = getMSTime() + durationMs;
+}
+
+// Finds the highest rank of the spell that this bot currently knows.
+// Traverses backwards from the last spell in the chain.
+uint32 GetHighestLearnedRank(Player* bot, uint32 rootSpellId)
+{
+    if (!rootSpellId)
+        return 0;
+
+    PlayerSpellMap const& spellMap = bot->GetSpellMap();
+
+    uint32 lastInChain = sSpellMgr->GetLastSpellInChain(rootSpellId);
+    uint32 current = lastInChain ? lastInChain : rootSpellId;
+
+    while (current)
+    {
+        auto itr = spellMap.find(current);
+        if (itr != spellMap.end() && itr->second && itr->second->Active && itr->second->State != PLAYERSPELL_REMOVED)
+            return current;
+
+        uint32 prev = sSpellMgr->GetPrevSpellInChain(current);
+        if (!prev || prev == current)
+            break;
+        current = prev;
+    }
+
+    if (bot->HasSpell(rootSpellId))
+    {
+        auto itr = spellMap.find(rootSpellId);
+        if (itr != spellMap.end() && itr->second && itr->second->Active && itr->second->State != PLAYERSPELL_REMOVED)
+            return rootSpellId;
+    }
+
+    return 0;
+}
+
+bool CanCastSpell(Player* bot, Unit* target, uint32 spellId, bool positiveRange = false)
+{
+    if (!spellId)
+        return false;
+
+    PlayerSpellMap const& spellMap = bot->GetSpellMap();
+    auto itr = spellMap.find(spellId);
+    if (itr == spellMap.end() || !itr->second || !itr->second->Active || itr->second->State == PLAYERSPELL_REMOVED)
+        return false;
+
+    if (bot->HasSpellCooldown(spellId))
+        return false;
+
+    if (IsSpellInFailureCooldown(bot->GetGUID(), spellId))
+        return false;
+
+    SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    if (!spellInfo || spellInfo->IsPassive())
+        return false;
+
+    // Item/weapon check: prevents SPELL_FAILED_EQUIPPED_ITEM_CLASS (code 29). The shared native-prerequisite check also
+    // covers off-hand/main-hand weapon slots, totem items and the spell's excluding caster auras.
+    if (NativeCastPrerequisiteFailure(bot, spellInfo))
+        return false;
+
+    // Aura state checks
+    if (spellInfo->CasterAuraState && !bot->HasAuraState(AuraStateType(spellInfo->CasterAuraState)))
+        return false;
+    if (target && spellInfo->TargetAuraState && !target->HasAuraState(AuraStateType(spellInfo->TargetAuraState)))
+        return false;
+
+    // Specific caster / target aura requirements (SpellInfo::CasterAuraSpell / TargetAuraSpell)
+    if (spellInfo->CasterAuraSpell && !bot->HasAura(spellInfo->CasterAuraSpell))
+        return false;
+    if (target && spellInfo->TargetAuraSpell && !target->HasAura(spellInfo->TargetAuraSpell))
+        return false;
+
+    // Power cost check
+    if (spellInfo->PowerType == POWER_HEALTH)
+    {
+        int32 cost = spellInfo->CalcPowerCost(bot, spellInfo->GetSchoolMask());
+        if (cost > 0 && bot->GetHealth() <= (uint32)cost)
+            return false;
+    }
+    else
+    {
+        int32 cost = spellInfo->CalcPowerCost(bot, spellInfo->GetSchoolMask());
+        if (cost > 0 && bot->GetPower(Powers(spellInfo->PowerType)) < cost)
+            return false;
+    }
+
+    // Range check
+    if (target && target != bot)
+    {
+        float dist = bot->GetDistance(target);
+        float maxRange = spellInfo->GetMaxRange(positiveRange, bot);
+        if (maxRange > 0.0f && dist > maxRange)
+            return false;
+        float minRange = spellInfo->GetMinRange(positiveRange);
+        if (minRange > 0.0f && bot->IsWithinRange(target, minRange + bot->GetMeleeRange(target)))
+            return false;
+    }
+
+    return true;
+}
+
+// Attempts to find the highest learned rank of a spell and verifies it can be cast right now.
+uint32 TrySpell(Player* bot, Unit* target, uint32 rootSpellId, bool positiveRange = false)
+{
+    uint32 spellId = SpellResolver::EffectiveSpell(bot, GetHighestLearnedRank(bot, rootSpellId));
+    if (spellId && CanCastSpell(bot, target, spellId, positiveRange))
+        return spellId;
+    return 0;
+}
+
+// Attempts to cast a spell with an internal rotation cooldown/throttle.
+// Useful for abilities without native DBC cooldowns (e.g. totems, summons, buffs).
+uint32 TryThrottledSpell(Player* bot, Unit* target, uint32 rootSpellId, uint32 throttleMs, bool positiveRange = false)
+{
+    if (IsAbilityThrottled(bot->GetGUID(), rootSpellId))
+        return 0;
+
+    uint32 spellId = TrySpell(bot, target, rootSpellId, positiveRange);
+    if (spellId)
+    {
+        SetAbilityThrottle(bot->GetGUID(), rootSpellId, throttleMs);
+        return spellId;
+    }
+    return 0;
+}
+
+// Returns the group member (bot included) with the lowest health percentage below
+// thresholdPct, or nullptr if nobody needs healing right now.
+// Solo (no group): only ever considers the bot itself.
+// Mirrors BotAI.cpp FindHealTarget -- kept local to avoid touching the public BotAI.h API.
+Player* FindGroupHealTarget(Player* bot, float thresholdPct = 95.0f)
+{
+    Player* best = nullptr;
+    float bestPct = thresholdPct;
+
+    auto consider = [&](Player* candidate)
+    {
+        if (!candidate || !candidate->IsAlive() || !candidate->IsInWorld() || candidate->GetMap() != bot->GetMap())
+            return;
+        float pct = candidate->GetHealthPct();
+        if (pct < bestPct)
+        {
+            best = candidate;
+            bestPct = pct;
+        }
+    };
+
+    consider(bot);
+    if (Group* group = bot->GetGroup())
+        for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
+            consider(itr->GetSource());
+
+    return best;
+}
+
+// -------------------------------------------------------------------------
+// Class 12: Barbarian
+// -------------------------------------------------------------------------
+uint32 SelectBarbarianRotationSpell(Player* bot, Unit* target, uint32 /*activeSpec*/)
+{
+    float dist = bot->GetDistance(target);
+
+    // 1. Survival: A Grisly Meal (root 804765) if injured (< 60% HP)
+    if (bot->GetHealthPct() < 60.0f)
+    {
+        if (uint32 spell = TrySpell(bot, bot, 804765, true))
+            return spell;
+    }
+
+    // 2. Gap closer / Ranged opener
+    // Whirling Advance (root 500919) has a range of ~8-25 yards
+    if (dist > 8.0f && dist <= 25.0f)
+    {
+        if (uint32 spell = TrySpell(bot, target, 500919))
+            return spell;
+    }
+
+    // Axe Throwing (root 804136) for ranged damage / pulling
+    if (dist > 8.0f)
+    {
+        if (uint32 spell = TrySpell(bot, target, 804136))
+            return spell;
+    }
+
+    // Battle Rhythm800193 is a native passive, not an active rage generator.
+
+    // 4. Melee strikes priority (only if in melee range <= 6 yards)
+    if (dist <= 6.0f)
+    {
+        // Savagery (root 800943) - melee strike/buff
+        if (uint32 spell = TrySpell(bot, target, 800943))
+            return spell;
+
+        // Crushing Slam (root 500915)
+        if (uint32 spell = TrySpell(bot, target, 500915))
+            return spell;
+
+        // Whirlwind (root 500002)
+        if (uint32 spell = TrySpell(bot, target, 500002))
+            return spell;
+
+        // Keg Smash (root 705156)
+        if (uint32 spell = TrySpell(bot, target, 705156))
+            return spell;
+
+        // Maiming Spear (root 500918)
+        if (uint32 spell = TrySpell(bot, target, 500918))
+            return spell;
+
+        // Ancestral Strike (root 801576) - main strike builder/spender
+        if (uint32 spell = TrySpell(bot, target, 801576))
+            return spell;
+    }
+
+    return 0;
+}
+
+// -------------------------------------------------------------------------
+// Class 29: Venomancer
+// -------------------------------------------------------------------------
+uint32 SelectVenomancerRotationSpell(Player* bot, Unit* target, uint32 activeSpec)
+{
+    float dist = bot->GetDistance(target);
+
+    // 1. Maintain Envenom Weapons (root 803177) on self if learned
+    if (!bot->HasAura(803177))
+    {
+        if (uint32 spell = TrySpell(bot, bot, 803177, true))
+            return spell;
+    }
+
+    // 2. Form check:
+    // Spec 52 is Fortitude (Tank) -> prefer Scorpid Form (803183)
+    // Other specs -> prefer Stalker Form (800841)
+    if (activeSpec == 52)
+    {
+        if (!bot->HasAura(803183))
+            if (uint32 spell = TrySpell(bot, bot, 803183, true))
+                return spell;
+    }
+    else if (activeSpec == 101)
+    {
+        // Vizier (healer) keeps its caster form; Spider Form is the damage specs' form.
+        if (!bot->HasAura(800912))
+            if (uint32 spell = TrySpell(bot, bot, 800912, true))
+                return spell;
+    }
+    else
+    {
+        if (!bot->HasAura(800841) && !bot->HasAura(803183))
+            if (uint32 spell = TrySpell(bot, bot, 800841, true))
+                return spell;
+    }
+
+    // 3. Maintain Shadra's Vigil (root 800870) DoT on target
+    if (!target->HasAura(800870, bot->GetGUID()))
+    {
+        if (uint32 spell = TrySpell(bot, target, 800870))
+            return spell;
+    }
+
+    // 4. Brood Spenders / Big finishers:
+    // Brood Trap (root 503149)
+    if (uint32 spell = TrySpell(bot, target, 503149))
+        return spell;
+
+    // Molt / Sepsis (root 502896)
+    if (uint32 spell = TrySpell(bot, target, 502896))
+        return spell;
+
+    // 5. Summon pet if off cooldown: Spawn (root 805568)
+    if (!bot->GetGuardianPet())
+    {
+        if (uint32 spell = TrySpell(bot, target, 805568))
+            return spell;
+    }
+
+    // 6. In melee range:
+    if (dist <= 6.0f)
+    {
+        // Scorpid Claw (root 803198)
+        if (uint32 spell = TrySpell(bot, target, 803198))
+            return spell;
+
+        // Venom Fang (root 800880)
+        if (uint32 spell = TrySpell(bot, target, 800880))
+            return spell;
+    }
+
+    // 7. Ranged filler: Venom Bolt (root 800869)
+    if (uint32 spell = TrySpell(bot, target, 800869))
+        return spell;
+
+    return 0;
+}
+
+// -------------------------------------------------------------------------
+// Class 24: Pyromancer
+// -------------------------------------------------------------------------
+uint32 SelectPyromancerRotationSpell(Player* bot, Unit* target, uint32 /*activeSpec*/)
+{
+    float dist = bot->GetDistance(target);
+
+    // 1. Maintain Phoenix Blessing (root 800196) self-buff if known
+    if (!bot->HasAura(800196))
+    {
+        if (uint32 spell = TrySpell(bot, bot, 800196, true))
+            return spell;
+    }
+
+    // 2. Maintain Ignite (root 800791) DoT on target
+    if (!target->HasAura(800791, bot->GetGUID()))
+    {
+        if (uint32 spell = TrySpell(bot, target, 800791))
+            return spell;
+    }
+
+    // 3. Overheat (root 800408) - burst fire damage
+    if (uint32 spell = TrySpell(bot, target, 800408))
+        return spell;
+
+    // 4. Slagstone (root 803950) - heavy damage and stun
+    if (uint32 spell = TrySpell(bot, target, 803950))
+        return spell;
+
+    // 5. Destroyer's Maw (root 802107) - core Pyromancer attack
+    if (uint32 spell = TrySpell(bot, target, 802107))
+        return spell;
+
+    // 6. Fire Blast (root 800792) - instant burst
+    if (uint32 spell = TrySpell(bot, target, 800792))
+        return spell;
+
+    // 7. Close/Mid range frontal cone: Dragon's Breath / Flame Wave (root 801915)
+    if (dist <= 12.0f)
+    {
+        if (uint32 spell = TrySpell(bot, target, 801915))
+            return spell;
+    }
+
+    // 8. Ignite spender (root 805500)
+    if (uint32 spell = TrySpell(bot, target, 805500))
+        return spell;
+
+    // 9. Primary ranged filler: Scorching Ray (root 800790)
+    if (uint32 spell = TrySpell(bot, target, 800790))
+        return spell;
+
+    return 0;
+}
+
+// -------------------------------------------------------------------------
+// Class 21: Ranger
+// -------------------------------------------------------------------------
+uint32 SelectRangerRotationSpell(Player* bot, Unit* target, uint32 /*activeSpec*/)
+{
+    float dist = bot->GetDistance(target);
+
+    // 1. Instant proc / burst shot: Falconstrike (root 806345)
+    if (uint32 spell = TrySpell(bot, target, 806345))
+        return spell;
+
+    // 2. Melee range (<= 6.0f):
+    if (dist <= 6.0f)
+    {
+        // Maintain Rusty Shiv debuff if learned (561315)
+        if (!target->HasAura(561315, bot->GetGUID()))
+        {
+            if (uint32 spell = TrySpell(bot, target, 561315))
+                return spell;
+        }
+
+        // Flank (root 804940) - high damage positional strike
+        if (uint32 spell = TrySpell(bot, target, 804940))
+            return spell;
+
+        // Assault (root 803108) - main dagger weapon attack
+        if (uint32 spell = TrySpell(bot, target, 803108))
+            return spell;
+
+        // Wild Strike (root 800083) - primary melee builder/spender
+        if (uint32 spell = TrySpell(bot, target, 800083))
+            return spell;
+
+        // Talent strike (root 804027)
+        if (uint32 spell = TrySpell(bot, target, 804027))
+            return spell;
+    }
+
+    // 3. Ranged priority (checked by CanCastSpell for min/max range and ranged weapon fit):
+    // Skullpiercer Shot (root 802036) - heavy sniper shot
+    if (uint32 spell = TrySpell(bot, target, 802036))
+        return spell;
+
+    // Falcon's Focus (root 800266) - heavy ranged focus shot
+    if (uint32 spell = TrySpell(bot, target, 800266))
+        return spell;
+
+    // Burst shot (root 807237)
+    if (uint32 spell = TrySpell(bot, target, 807237))
+        return spell;
+
+    // Quick Shot (root 500074) - primary ranged builder / filler
+    if (uint32 spell = TrySpell(bot, target, 500074))
+        return spell;
+
+    // Close-range fallback if ranged shot was inside minRange
+    if (dist <= 6.0f)
+    {
+        if (uint32 spell = TrySpell(bot, target, 800083))
+            return spell;
+    }
+
+    return 0;
+}
+
+// -------------------------------------------------------------------------
+// Class 25: Cultist
+// -------------------------------------------------------------------------
+uint32 SelectCultistRotationSpell(Player* bot, Unit* target, uint32 /*activeSpec*/)
+{
+    // 1. Maintain Herald buff on self if known and missing:
+    if (!bot->HasAura(520326) && !bot->HasAura(805119) && !bot->HasAura(805120) && !bot->HasAura(805121))
+    {
+        if (uint32 spell = TrySpell(bot, bot, 805121, true))
+            return spell;
+        if (uint32 spell = TrySpell(bot, bot, 805120, true))
+            return spell;
+        if (uint32 spell = TrySpell(bot, bot, 805119, true))
+            return spell;
+    }
+
+    // 2. High-priority spenders / burst:
+    // Gaze of C'Thun (root 500110) - heavy channel/DoT
+    if (uint32 spell = TrySpell(bot, target, 500110))
+        return spell;
+
+    // Blade of the Empire (root 500720) - 3 charges, weapon strike
+    if (uint32 spell = TrySpell(bot, target, 500720))
+        return spell;
+
+    // Insanity Spender (root 805116) - requires 40 Insanity or Madness
+    if (uint32 spell = TrySpell(bot, target, 805116))
+        return spell;
+
+    // Eldritch Strike (root 801964)
+    if (uint32 spell = TrySpell(bot, target, 801964))
+        return spell;
+
+    // 500715 (Void Shield) and 500711 (Eldritch Mending) were listed here as "heavy spells" but both target an ally:
+    // casting them at the enemy failed with SPELL_FAILED_BAD_TARGETS on every retry. The profile engine owns them.
+
+    // 3. Primary fillers:
+    if (uint32 spell = TrySpell(bot, target, 500720))
+        return spell;
+
+    // At range / Caster: Horrorbolt (root 800416)
+    if (uint32 spell = TrySpell(bot, target, 800416))
+        return spell;
+
+    return 0;
+}
+
+// -------------------------------------------------------------------------
+// Class 28: Tinker
+// -------------------------------------------------------------------------
+uint32 SelectTinkerRotationSpell(Player* bot, Unit* target, uint32 /*activeSpec*/)
+{
+    float dist = bot->GetDistance(target);
+
+    // 1. Maintain Reload/ammo if known and missing: Reload (500237)
+    if (!bot->HasAura(500237))
+    {
+        if (uint32 spell = TrySpell(bot, bot, 500237, true))
+            return spell;
+    }
+
+    // 2. High-impact bombs and burst abilities:
+    // Sticky Bomb (root 500232) - heavy explosive bomb
+    if (uint32 spell = TrySpell(bot, target, 500232))
+        return spell;
+
+    // Gunsling (root 805351) - instant shot
+    if (uint32 spell = TrySpell(bot, target, 805351))
+        return spell;
+
+    // Scrap Shot (root 500549) - only outside min range
+    if (dist >= 8.0f)
+    {
+        if (uint32 spell = TrySpell(bot, target, 500549))
+            return spell;
+    }
+
+    // 3. Close range blast: Shotgun (root 801647) if within 10yd
+    if (dist <= 10.0f)
+    {
+        if (uint32 spell = TrySpell(bot, target, 801647))
+            return spell;
+    }
+
+    // 4. Primary ranged filler: Scrap Shot (root 500549) if at range
+    if (dist >= 8.0f)
+    {
+        if (uint32 spell = TrySpell(bot, target, 500549))
+            return spell;
+    }
+
+    return 0;
+}
+
+// -------------------------------------------------------------------------
+// Class 18: Guardian
+// -------------------------------------------------------------------------
+uint32 SelectGuardianRotationSpell(Player* bot, Unit* target, uint32 activeSpec)
+{
+    float dist = bot->GetDistance(target);
+
+    // 1. Maintain Stance / Formation
+    // Spec 21 is Vanguard (Tank) -> prefer Tower Formation (800317)
+    // Other specs / default -> prefer Line Formation (803130) or Assault Formation (803417)
+    if (activeSpec == 21)
+    {
+        // Same baseline as the Vanguard profile; casting the other formation here made the
+        // two alternate Tower/Line every ~1 s (I72: 11+10 casts in 30 s, energy drained).
+        uint32 const baseline = BotAI::VanguardBaselineFormation();
+        if (!bot->HasAura(baseline))
+            if (uint32 spell = TrySpell(bot, bot, baseline, true))
+                return spell;
+    }
+    else
+    {
+        if (!bot->HasAura(803130) && !bot->HasAura(803417) && !bot->HasAura(800317))
+        {
+            if (uint32 spell = TrySpell(bot, bot, 803130, true))
+                return spell;
+            if (uint32 spell = TrySpell(bot, bot, 803417, true))
+                return spell;
+            if (uint32 spell = TrySpell(bot, bot, 800317, true))
+                return spell;
+        }
+    }
+
+    // 2. Defensive: Raise Shield (root 500168) if injured (< 75% HP)
+    if (bot->GetHealthPct() < 75.0f)
+    {
+        if (uint32 spell = TrySpell(bot, bot, 500168, true))
+            return spell;
+    }
+
+    // 3. Gap closers if target is at range (> 8.0f)
+    if (dist > 8.0f)
+    {
+        // Ram (root 802284) - shield charge / ram
+        if (uint32 spell = TrySpell(bot, target, 802284))
+            return spell;
+
+        // Grand Entrance (root 802870)
+        if (uint32 spell = TrySpell(bot, target, 802870))
+            return spell;
+
+        // Battle Rush (root 802197) - requires Assault Formation
+        if (uint32 spell = TrySpell(bot, target, 802197))
+            return spell;
+    }
+
+    // 4. Place Standard / Banner if in combat and off cooldown
+    // Standard of Valiance (root 800319)
+    if (uint32 spell = TrySpell(bot, bot, 800319, true))
+        return spell;
+
+    // 5. Melee Priority Attacks:
+    if (dist <= 6.0f)
+    {
+        // Pulverize (root 800311) - heavy shield strike (requires shield)
+        if (uint32 spell = TrySpell(bot, target, 800311))
+            return spell;
+
+        // Reprisal (root 800316) - counter-attack shield strike
+        if (uint32 spell = TrySpell(bot, target, 800316))
+            return spell;
+
+        // Ram (root 802284) - shield ram
+        if (uint32 spell = TrySpell(bot, target, 802284))
+            return spell;
+
+        // Broad Sweep (root 805150) - sweeping melee strike
+        if (uint32 spell = TrySpell(bot, target, 805150))
+            return spell;
+
+        // Heavy Blow (root 803129) - core melee builder
+        if (uint32 spell = TrySpell(bot, target, 803129))
+            return spell;
+
+        // Hammer of the Law (704418) - mace strike
+        if (uint32 spell = TrySpell(bot, target, 704418))
+            return spell;
+
+        // Linebreaker (root 806220) - line formation strike
+        if (uint32 spell = TrySpell(bot, target, 806220))
+            return spell;
+
+        // Hold the Line (root 803830)
+        if (uint32 spell = TrySpell(bot, target, 803830))
+            return spell;
+
+        // Press the Attack (root 801219)
+        if (uint32 spell = TrySpell(bot, target, 801219))
+            return spell;
+    }
+
+    // 6. Secondary defensive in close combat if needed
+    if (bot->GetHealthPct() < 50.0f)
+    {
+        if (uint32 spell = TrySpell(bot, bot, 800313, true)) // Brace
+            return spell;
+    }
+
+    return 0;
+}
+
+// -------------------------------------------------------------------------
+// Class 19: Templar
+// -------------------------------------------------------------------------
+uint32 SelectTemplarRotationSpell(Player* bot, Unit* target, uint32 /*activeSpec*/)
+{
+    float dist = bot->GetDistance(target);
+
+    // 1. Maintain Gift buff on self: Gift of Zeal (root 706634) or Gift of Fervor (572629)
+    if (!bot->HasAura(706634) && !bot->HasAura(300916) && !bot->HasAura(300917) &&
+        !bot->HasAura(300918) && !bot->HasAura(300919) && !bot->HasAura(300923) &&
+        !bot->HasAura(572629) && !bot->HasAura(572630))
+    {
+        if (uint32 spell = TrySpell(bot, bot, 706634, true))
+            return spell;
+        if (uint32 spell = TrySpell(bot, bot, 572629, true))
+            return spell;
+    }
+
+    // 2. Gap closer if target is at distance (> 8.0f): Divine Charge (527023)
+    if (dist > 8.0f)
+    {
+        if (uint32 spell = TrySpell(bot, target, 527023))
+            return spell;
+    }
+
+    // 3. Breakers / Spenders: require Oath Chain (704576), automatically gated by CasterAuraSpell
+    // Blade of Faith (root 803872) - highest single-target holy spender
+    if (uint32 spell = TrySpell(bot, target, 803872))
+        return spell;
+
+    // Chastise (root 803157) - holy damage and stun
+    if (uint32 spell = TrySpell(bot, target, 803157))
+        return spell;
+
+    // Righteous Tempest (root 805409) - whirlwind holy spender
+    if (uint32 spell = TrySpell(bot, target, 805409))
+        return spell;
+
+    // Benediction (root 801448) - holy blessing / burst
+    if (uint32 spell = TrySpell(bot, target, 801448))
+        return spell;
+
+    // 4. Heavy Cooldowns:
+    // Titanstrike (root 806521) - 2H holy weapon strike
+    if (uint32 spell = TrySpell(bot, target, 806521))
+        return spell;
+
+    // Divine Force (root 806153) - holy force burst
+    if (uint32 spell = TrySpell(bot, target, 806153))
+        return spell;
+
+    // Libram of Consecration (root 801441)
+    if (dist <= 8.0f)
+    {
+        if (uint32 spell = TrySpell(bot, bot, 801441, true))
+            return spell;
+    }
+
+    // Crusader's Brand (root 300513)
+    if (uint32 spell = TrySpell(bot, target, 300513))
+        return spell;
+
+    // 5. Primary Builders (generate Oaths):
+    // Righteous Lunge (root 801443) - primary builder
+    if (uint32 spell = TrySpell(bot, target, 801443))
+        return spell;
+
+    // Condemn (root 804906) - primary judgment builder
+    if (uint32 spell = TrySpell(bot, target, 804906))
+        return spell;
+
+    // Holy Cleave (root 801445) - cleave builder
+    if (uint32 spell = TrySpell(bot, target, 801445))
+        return spell;
+
+    return 0;
+}
+
+// -------------------------------------------------------------------------
+// Class 26: Starcaller
+// -------------------------------------------------------------------------
+uint32 SelectStarcallerRotationSpell(Player* bot, Unit* target, uint32 activeSpec)
+{
+    float dist = bot->GetDistance(target);
+
+    // 1. Maintain Stance / Aspect on self:
+    // Spec 45: Warden (Melee) -> Aspect of the Warden (801128)
+    // Spec 43: Sentinel (Ranged) -> Aspect of the Huntress (805356)
+    // Spec 100: Moon Guard (Tank) / others -> Aspect of the Stars (root 800510)
+    bool hasAspect = bot->HasAura(800510) || bot->HasAura(803887) || bot->HasAura(803888) ||
+                     bot->HasAura(801128) || bot->HasAura(805356) || bot->HasAura(801123);
+    if (!hasAspect)
+    {
+        if (activeSpec == 45)
+        {
+            if (uint32 spell = TrySpell(bot, bot, 801128, true))
+                return spell;
+        }
+        else if (activeSpec == 43)
+        {
+            if (uint32 spell = TrySpell(bot, bot, 805356, true))
+                return spell;
+        }
+        else
+        {
+            if (uint32 spell = TrySpell(bot, bot, 800510, true))
+                return spell;
+            if (uint32 spell = TrySpell(bot, bot, 801128, true))
+                return spell;
+            if (uint32 spell = TrySpell(bot, bot, 801123, true))
+                return spell;
+        }
+    }
+
+    // 2. In Melee Range (dist <= 6.0f):
+    if (dist <= 6.0f)
+    {
+        // Celestial Strike (root 800496) - primary astral weapon strike, generates Stars (804378)
+        if (uint32 spell = TrySpell(bot, target, 800496))
+            return spell;
+
+        // Warden's Blade (root 805508) - multi-strike melee weapon attack
+        if (uint32 spell = TrySpell(bot, target, 805508))
+            return spell;
+
+        // Starsunder (root 801127) - sunder strike
+        if (uint32 spell = TrySpell(bot, target, 801127))
+            return spell;
+
+        // Celestial Cleave (root 801181) - cleaving astral strike
+        if (uint32 spell = TrySpell(bot, target, 801181))
+            return spell;
+
+        // Starsweep (root 805550) - melee sweep (requires Scattered Stars on target)
+        if (uint32 spell = TrySpell(bot, target, 805550))
+            return spell;
+
+        // Starshatter (root 801135)
+        if (uint32 spell = TrySpell(bot, target, 801135))
+            return spell;
+
+        // Shooting Star (root 800505) - astral builder, can be cast in melee
+        if (uint32 spell = TrySpell(bot, target, 800505))
+            return spell;
+    }
+
+    // 3. At Ranged Distance:
+    // Ranged weapon shots (if equipped, checked by CanCastSpell):
+    // Moon Arrow (root 801972)
+    if (uint32 spell = TrySpell(bot, target, 801972))
+        return spell;
+
+    // Huntress Shot (root 680220)
+    if (uint32 spell = TrySpell(bot, target, 680220))
+        return spell;
+
+    // Astral Spells:
+    // Lunar Lance (root 801132) - requires Scattered Stars (804378) on target (checked by TargetAuraSpell)
+    if (uint32 spell = TrySpell(bot, target, 801132))
+        return spell;
+
+    // Shooting Star (root 800505) - primary astral ranged builder, applies Stars
+    if (uint32 spell = TrySpell(bot, target, 800505))
+        return spell;
+
+    // Moonwell Splash (root 800370) - ranged AoE/damage
+    if (uint32 spell = TrySpell(bot, target, 800370))
+        return spell;
+
+    return 0;
+}
+
+// -------------------------------------------------------------------------
+// Class 13: Witch Doctor
+// -------------------------------------------------------------------------
+
+// Heal rotation for Witch Doctor specs roled as Healer (e.g. Brewing, spec 6).
+// Called from SelectClassHealRotationSpell; healTarget is the lowest-health group member.
+//
+// Spell roots confirmed in Thudoryalid's (GUID 2211) spellbook:
+//   801670 = Loa's Brew     (direct HEAL, has DBC cooldown — use TrySpell, not throttled)
+//   801696 = Spirit in a Bottle (direct HEAL, has DBC cooldown — use TrySpell)
+//   801796 = Reclaim Soul   (rez/soul-reclaim — confirmed known, unknown type — try as fill)
+//   500957 = Healing Ward   (totem/ward — no DBC CD, needs throttle to avoid constant re-cast)
+//   802703 = Chain Heal of Loa (AoE chain — try if known; skips silently if not)
+//
+// Priority:
+//   1. Emergency: < 40% HP — dump every available direct heal NOW
+//   2. Triage: < 70% HP — primary direct heal cycle (Brew → Bottle)
+//   3. AoE mode: ≥ 2 members below 80% — fire chain heal if available
+//   4. Maintenance: < 92% — sustain with Loa's Brew
+//   5. Ward filler: drop Healing Ward (throttled) if nobody critically injured
+uint32 SelectWitchDoctorHealRotationSpell(Player* bot, Player* healTarget, uint32 /*activeSpec*/)
+{
+    float targetHpPct = healTarget->GetHealthPct();
+
+    // 1. Emergency: target critically low — fire strongest heals regardless of throttle
+    if (targetHpPct < 40.0f)
+    {
+        // Loa's Brew (root 801670) — primary direct heal with DBC cooldown
+        if (uint32 spell = TrySpell(bot, healTarget, 801670, true))
+            return spell;
+
+        // Spirit in a Bottle (root 801696) — secondary direct heal with DBC cooldown
+        if (uint32 spell = TrySpell(bot, healTarget, 801696, true))
+            return spell;
+
+        // Reclaim Soul (root 801796) — confirmed in bot's spellbook; try as emergency fill
+        if (uint32 spell = TrySpell(bot, healTarget, 801796, true))
+            return spell;
+    }
+
+    // 2. Triage: below 70%, use the standard primary heal cycle
+    if (targetHpPct < 70.0f)
+    {
+        // Loa's Brew first (primary, higher throughput)
+        if (uint32 spell = TrySpell(bot, healTarget, 801670, true))
+            return spell;
+
+        // Spirit in a Bottle as second option
+        if (uint32 spell = TrySpell(bot, healTarget, 801696, true))
+            return spell;
+    }
+
+    // 3. AoE: if multiple members are hurt, fire a chain heal if known
+    {
+        uint32 lowMemberCount = 0;
+        if (Group const* group = bot->GetGroup())
+        {
+            for (GroupReference const* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                if (Player const* member = ref->GetSource())
+                    if (member->IsAlive() && member->GetHealthPct() < 80.0f)
+                        ++lowMemberCount;
+            }
+        }
+
+        if (lowMemberCount >= 2)
+        {
+            // Chain Heal of Loa (root 802703) — AoE chain heal; TrySpell returns 0 if not known
+            if (uint32 spell = TrySpell(bot, healTarget, 802703, true))
+                return spell;
+        }
+    }
+
+    // 4. Maintenance: top off anyone below 92%
+    if (targetHpPct < 92.0f)
+    {
+        if (uint32 spell = TrySpell(bot, healTarget, 801670, true))
+            return spell;
+
+        if (uint32 spell = TrySpell(bot, healTarget, 801696, true))
+            return spell;
+    }
+
+    // 5. Filler: Healing Ward totem (root 500957) — throttled to avoid instant re-drop
+    // after the totem naturally expires. The offensive path also places Serpent Ward (500960)
+    // using the same slot, but only when at >60% HP. Here we always prefer Healing Ward when
+    // acting as healer and the group doesn't urgently need anything else.
+    if (uint32 spell = TryThrottledSpell(bot, bot, 500957, 20000, true))
+        return spell;
+
+    return 0;
+}
+
+
+uint32 SelectWitchDoctorRotationSpell(Player* bot, Unit* target, uint32 /*activeSpec*/)
+{
+    // 1. Group Heal Priority: if any group member (or the bot itself) needs healing,
+    // use Loa's Brew / Spirit in a Bottle on the lowest-health target before attacking.
+    // Solo bots fall through to the self-only < 50% block below when nobody is low.
+    if (Player* healTarget = FindGroupHealTarget(bot))
+    {
+        // Prioritise a teammate over self (self will be caught by the block below too).
+        // Only spend the Brew/Bottle on a teammate if they're meaningfully hurt (< 80%).
+        bool isTeammate = (healTarget != bot);
+        if (isTeammate || bot->GetHealthPct() < 50.0f)
+        {
+            // Loa's Brew (root 801670) - healing brew
+            if (uint32 spell = TryThrottledSpell(bot, healTarget, 801670, 8000, true))
+                return spell;
+
+            // Spirit in a Bottle (root 801696) - protective spirit potion
+            if (uint32 spell = TryThrottledSpell(bot, healTarget, 801696, 12000, true))
+                return spell;
+        }
+    }
+
+    // 2. Self Buffs / Cooldowns:
+    // Shadow Avatar (root 705943) - dark power form
+    if (!bot->HasAura(705943))
+    {
+        if (uint32 spell = TrySpell(bot, bot, 705943, true))
+            return spell;
+    }
+
+    // 3. Situational Guardians, Wards, Effigies & Idols:
+    // Major guardians / temporary summons:
+    if (uint32 spell = TryThrottledSpell(bot, target, 802719, 45000)) // Big Voodoo (Bwonsamdi)
+        return spell;
+    if (uint32 spell = TryThrottledSpell(bot, target, 800330, 45000)) // War Golem
+        return spell;
+    if (uint32 spell = TryThrottledSpell(bot, target, 572899, 30000)) // Call Sseratus (snakes)
+        return spell;
+    if (uint32 spell = TryThrottledSpell(bot, target, 707162, 30000)) // Mimic
+        return spell;
+
+    // Wards (WardSlot - Healing Ward if injured, Serpent Ward if healthy):
+    if (bot->GetHealthPct() < 60.0f)
+    {
+        if (uint32 spell = TryThrottledSpell(bot, bot, 500957, 25000)) // Healing Ward
+            return spell;
+    }
+    else
+    {
+        if (uint32 spell = TryThrottledSpell(bot, target, 500960, 25000)) // Serpent Ward
+            return spell;
+    }
+
+    // Effigies (EffigySlot - Hexing / Shadow / Cursed):
+    if (uint32 spell = TryThrottledSpell(bot, target, 506634, 25000)) // Hexing Effigy
+        return spell;
+    if (uint32 spell = TryThrottledSpell(bot, target, 505339, 25000)) // Shadow Effigy
+        return spell;
+    if (uint32 spell = TryThrottledSpell(bot, target, 706542, 25000)) // Cursed Effigy
+        return spell;
+
+    // Native idols share one slot; offensive idols despawn the mana recovery idol.
+    bool const preserveManaIdol = bot->GetPlayerSetting("core.ascension_active_spec", 0).value == 4 &&
+        bot->GetMaxPower(POWER_MANA) > 0 &&
+        float(bot->GetPower(POWER_MANA)) / bot->GetMaxPower(POWER_MANA) < 0.70f;
+    if (!preserveManaIdol)
+    {
+        if (uint32 spell = TryThrottledSpell(bot, target, 507082, 25000)) // Dark Idol
+            return spell;
+        if (uint32 spell = TryThrottledSpell(bot, target, 804226, 25000)) // Swift Idol
+            return spell;
+        if (uint32 spell = TryThrottledSpell(bot, target, 500961, 25000)) // Spirit Idol
+            return spell;
+    }
+
+    // 4. Curses & Jinxes (Debuffs on target):
+    // Hex of Malice (root 801693) - core damage over time curse
+    uint32 hexMalice = GetHighestLearnedRank(bot, 801693);
+    if (hexMalice && !target->HasAura(hexMalice))
+    {
+        if (uint32 spell = TrySpell(bot, target, 801693))
+            return spell;
+    }
+
+    // Shrinking Jinx (root 806285) - weakening combat jinx
+    uint32 shrinkJinx = GetHighestLearnedRank(bot, 806285);
+    if (shrinkJinx && !target->HasAura(shrinkJinx))
+    {
+        if (uint32 spell = TrySpell(bot, target, 806285))
+            return spell;
+    }
+
+    // 5. High-Impact Offensive Nukes:
+    // Malefic Wrath (root 807037) - heavy shadow nuke
+    if (uint32 spell = TrySpell(bot, target, 807037))
+        return spell;
+
+    // Potion Toss (root 801661) - only usable with active brew aura (checked by CanCastSpell)
+    if (uint32 spell = TrySpell(bot, target, 801661))
+        return spell;
+
+    // Splash Potion (root 802710)
+    if (uint32 spell = TrySpell(bot, target, 802710))
+        return spell;
+
+    // Mojo Beam (root 500950) - channeled beam
+    if (uint32 spell = TrySpell(bot, target, 500950))
+        return spell;
+
+    // 6. Primary Ranged Spammer / Filler:
+    // Shadowflare (root 801669) - core dark projectile
+    if (uint32 spell = TrySpell(bot, target, 801669))
+        return spell;
+
+    return 0;
+}
+
+// -------------------------------------------------------------------------
+// Class 15: Witch Hunter
+// -------------------------------------------------------------------------
+uint32 SelectWitchHunterRotationSpell(Player* bot, Unit* target, uint32 /*activeSpec*/)
+{
+    float dist = bot->GetDistance(target);
+
+    // 1. Maintain a Tonic buff on self if known and missing:
+    if (!bot->HasAura(802278) && !bot->HasAura(802276) && !bot->HasAura(803535) &&
+        !bot->HasAura(802826) && !bot->HasAura(680491))
+    {
+        // Witchblood Tonic (root 802278)
+        if (uint32 spell = TrySpell(bot, bot, 802278, true))
+            return spell;
+        // Vampiric Tonic (root 802276)
+        if (uint32 spell = TrySpell(bot, bot, 802276, true))
+            return spell;
+        // Holy Water Tonic (root 802826)
+        if (uint32 spell = TrySpell(bot, bot, 802826, true))
+            return spell;
+        // Dark Tonic (root 680491)
+        if (uint32 spell = TrySpell(bot, bot, 680491, true))
+            return spell;
+    }
+
+    // 2. Maintain Stance/Aura:
+    // Dark Aura (root 680535)
+    uint32 darkAura = GetHighestLearnedRank(bot, 680535);
+    if (darkAura && !bot->HasAura(darkAura))
+    {
+        if (uint32 spell = TrySpell(bot, bot, 680535, true))
+            return spell;
+    }
+
+    // 3. Emergency Defense (< 50% health):
+    if (bot->GetHealthPct() < 50.0f)
+    {
+        // Night's Watch (root 807733)
+        if (uint32 spell = TrySpell(bot, bot, 807733, true))
+            return spell;
+        // Dark Regeneration (root 500094)
+        if (uint32 spell = TrySpell(bot, bot, 500094, true))
+            return spell;
+    }
+
+    // 4. Target Brand (Apply if target doesn't have an active Witch Hunter Brand):
+    // Checked by each brand family's own highest-LEARNED rank, not a hardcoded rank-1 id --
+    // a bot that actually knows and casts a higher rank applies an aura with a different
+    // spell id than the root, so a plain HasAura(rootId) check would miss it and keep trying
+    // to reapply/overwrite an already-active higher-rank brand from a sibling family.
+    uint32 brandDamned = GetHighestLearnedRank(bot, 807682);
+    uint32 brandCondemned = GetHighestLearnedRank(bot, 562573);
+    uint32 brandProfane = GetHighestLearnedRank(bot, 562390);
+    uint32 brandUnworthy = GetHighestLearnedRank(bot, 501380);
+    uint32 brandForsaken = GetHighestLearnedRank(bot, 680517); // no known "apply" spell in this rotation yet -- detection only
+    bool hasBrand = (brandDamned && target->HasAura(brandDamned)) ||
+                    (brandCondemned && target->HasAura(brandCondemned)) ||
+                    (brandProfane && target->HasAura(brandProfane)) ||
+                    (brandUnworthy && target->HasAura(brandUnworthy)) ||
+                    (brandForsaken && target->HasAura(brandForsaken));
+    if (!hasBrand)
+    {
+        // Brand of the Damned (root 807682)
+        if (uint32 spell = TrySpell(bot, target, 807682))
+            return spell;
+        // Brand of the Condemned (root 562573)
+        if (uint32 spell = TrySpell(bot, target, 562573))
+            return spell;
+        // Brand of the Profane (root 562390)
+        if (uint32 spell = TrySpell(bot, target, 562390))
+            return spell;
+        // Brand of the Unworthy (root 501380)
+        if (uint32 spell = TrySpell(bot, target, 501380))
+            return spell;
+    }
+
+    // 5. Witchblight / Edicts:
+    // Witchblight (root 680494) - debuff
+    if (!target->HasAura(680494))
+    {
+        if (uint32 spell = TrySpell(bot, target, 680494))
+            return spell;
+    }
+
+    // Witching Edict (root 707684) / Inquisitor's Edict (root 706741)
+    uint32 witchingEdict = GetHighestLearnedRank(bot, 707684);
+    if (witchingEdict && !bot->HasAura(witchingEdict))
+    {
+        if (uint32 spell = TryThrottledSpell(bot, target, 707684, 25000))
+            return spell;
+    }
+    uint32 inqEdict = GetHighestLearnedRank(bot, 706741);
+    if (inqEdict && !bot->HasAura(inqEdict))
+    {
+        if (uint32 spell = TryThrottledSpell(bot, target, 706741, 25000))
+            return spell;
+    }
+
+    // 6. In Melee Range (<= 5.0f):
+    if (dist <= 5.0f)
+    {
+        // Dawn Blade (root 802024) - primary holy melee blade strike
+        if (uint32 spell = TrySpell(bot, target, 802024))
+            return spell;
+
+        // Pommel Smash (root 680515) - physical strike
+        if (uint32 spell = TrySpell(bot, target, 680515))
+            return spell;
+
+        // Guard Strike (root 804432) - defensive strike
+        if (uint32 spell = TrySpell(bot, target, 804432))
+            return spell;
+
+        // Desecrate (root 680518) - ground AoE (if aura requirements met)
+        if (uint32 spell = TrySpell(bot, target, 680518))
+            return spell;
+    }
+
+    // 7. Ranged Attacks (Guns / Crossbows / Ranged Spells):
+    // Native Sixfold requires its passive and five Bolt stacks. A temporary
+    // learned grant can remain visible after consumption; do not offer it again
+    // merely because HasSpell succeeds. The core remains the final authority.
+    if (bot->HasAura(500567))
+        if (Aura const* stacks = bot->GetAura(500569))
+            if (stacks->GetStackAmount() >= 5)
+                if (uint32 spell = TrySpell(bot, target, 807364))
+                    return spell;
+
+    // Shadowblast (root 804191) - primary heavy shadow/ranged attack
+    if (uint32 spell = TrySpell(bot, target, 804191))
+        return spell;
+
+    // Bola Throw (root 500093) - ranged snare & damage
+    if (uint32 spell = TrySpell(bot, target, 500093))
+        return spell;
+
+    // Darkslayer (root 804179) - ranged execute / heavy finisher
+    if (uint32 spell = TrySpell(bot, target, 804179))
+        return spell;
+
+    // Burrow Bolt (root 802269) - special bolt attack
+    if (uint32 spell = TrySpell(bot, target, 802269))
+        return spell;
+
+    // Close-range fallback if ranged failed (e.g. minimum range):
+    if (dist <= 5.0f)
+    {
+        if (uint32 spell = TrySpell(bot, target, 802024))
+            return spell;
+        if (uint32 spell = TrySpell(bot, target, 680515))
+            return spell;
+    }
+
+    return 0;
+}
+
+// -------------------------------------------------------------------------
+// Class 27: Sun Cleric
+// -------------------------------------------------------------------------
+uint32 SelectSunClericRotationSpell(Player* bot, Unit* target, uint32 /*activeSpec*/)
+{
+    float dist = bot->GetDistance(target);
+
+    // 1. Maintain Consecrated Weapons (root 704395) self-buff if known
+    if (!bot->HasAura(704395))
+    {
+        if (uint32 spell = TrySpell(bot, bot, 704395, true))
+            return spell;
+    }
+
+    // 2. In Melee Range (<= 5.0f):
+    if (dist <= 5.0f)
+    {
+        // Gavel of Atonement (root 800611) - primary holy melee weapon strike
+        if (uint32 spell = TrySpell(bot, target, 800611))
+            return spell;
+    }
+
+    // 3. Ranged Offensive Attacks:
+    // Sunset (root 804584) - holy nuke / DoT
+    if (uint32 spell = TrySpell(bot, target, 804584))
+        return spell;
+
+    // Horusath Blast (root 500154) - heavy ranged holy nuke
+    if (uint32 spell = TrySpell(bot, target, 500154))
+        return spell;
+
+    // Sunflare (root 800231) - primary holy fire ranged builder / spammer
+    if (uint32 spell = TrySpell(bot, target, 800231))
+        return spell;
+
+    // Close-range fallback:
+    if (dist <= 5.0f)
+    {
+        if (uint32 spell = TrySpell(bot, target, 800611))
+            return spell;
+    }
+
+    return 0;
+}
+
+// -------------------------------------------------------------------------
+// Class 23: Necromancer
+// -------------------------------------------------------------------------
+uint32 SelectNecromancerRotationSpell(Player* bot, Unit* target, uint32 /*activeSpec*/)
+{
+    float botHp = bot->GetHealthPct();
+
+    // 1. Situational Stance Switching (Spell Group 1137):
+    // 500982: Undead: Assault (Offensive DPS: minion attack speed & crit)
+    // 500985: Undead: Protect (Tank / Defense: minion threat, player threat reduced)
+    // 500983: Undead: Pacify  (Critical Defense / Survival: minion passive, player -20% damage taken)
+    uint32 desiredStance = 500982; // Default to Assault
+    if (botHp < 35.0f)
+        desiredStance = 500983; // Pacify for critical survival
+    else if (botHp < 60.0f || (target->GetVictim() && target->GetVictim()->GetGUID() == bot->GetGUID()))
+        desiredStance = 500985; // Protect if taking damage or targeted
+
+    if (desiredStance && !bot->HasAura(desiredStance))
+    {
+        if (uint32 spell = TrySpell(bot, bot, desiredStance, true))
+            return spell;
+    }
+
+    // 2. Emergency Survival (< 35% HP):
+    // Sacrifice Undead (root 805027, highest rank e.g. 807941)
+    if (botHp < 35.0f)
+    {
+        if (uint32 sacrifice = GetHighestLearnedRank(bot, 805027))
+        {
+            if (uint32 spell = TrySpell(bot, bot, sacrifice, true))
+                return spell;
+        }
+    }
+
+    // 3. Situational Temporary / Cooldown Summons (0 Life Force cost):
+    // Animate: Plaguefather (root 805048) - elite plague minion, throttled 30s
+    if (uint32 spell = TryThrottledSpell(bot, bot, 805048, 30000, true))
+        return spell;
+
+    // Animate: Bone Wraith (root 805032) - shadow burst wraith, throttled 30s
+    if (uint32 spell = TryThrottledSpell(bot, bot, 805032, 30000, true))
+        return spell;
+
+    // Animate: Skeletal Archer (root 805040) - ranged physical minion, throttled 30s
+    if (uint32 spell = TryThrottledSpell(bot, bot, 805040, 30000, true))
+        return spell;
+
+    // Animate: Bone Construct (root 531130) - bone construct guardian, throttled 30s
+    if (uint32 spell = TryThrottledSpell(bot, bot, 531130, 30000, true))
+        return spell;
+
+    // 4. Permanent Minions (Life Force Summons, throttled 15s so once Life Force pool is filled, DoTs/Nukes are cast):
+    // Raise: Crypt Fiend (root 504859, cost 2 LF) - ranged poison/web minion
+    if (uint32 spell = TryThrottledSpell(bot, bot, 504859, 15000, true))
+        return spell;
+
+    // Raise: Greater Skeletal Warrior (root 504901, cost 1 LF) - durable melee tank/dps
+    if (uint32 spell = TryThrottledSpell(bot, bot, 504901, 15000, true))
+        return spell;
+
+    // Raise: Ghoul (root 500971, cost 1 LF) - aggressive melee ghoul
+    if (uint32 spell = TryThrottledSpell(bot, bot, 500971, 15000, true))
+        return spell;
+
+    // Raise: Skeletal Rogue (root 500969, cost 1 LF) - burst melee rogue
+    if (uint32 spell = TryThrottledSpell(bot, bot, 500969, 15000, true))
+        return spell;
+
+    // Raise: Abomination (root 500335, cost 3 LF) - giant melee brute
+    if (uint32 spell = TryThrottledSpell(bot, bot, 500335, 15000, true))
+        return spell;
+
+    // Raise: Brittle Skeleton (root 500970, cost 1 LF) - basic skeleton
+    if (uint32 spell = TryThrottledSpell(bot, bot, 500970, 15000, true))
+        return spell;
+
+    // 5. Afflictions & Curses (Maintain DoTs):
+    // Crypt Swarm (root 500965, highest rank e.g. 501888)
+    uint32 cryptSwarm = GetHighestLearnedRank(bot, 500965);
+    if (cryptSwarm && !target->HasAura(cryptSwarm) && !target->HasAura(500965))
+    {
+        if (uint32 spell = TrySpell(bot, target, cryptSwarm))
+            return spell;
+    }
+
+    // Harvest Plague (root 500968, highest rank e.g. 583256)
+    uint32 harvestPlague = GetHighestLearnedRank(bot, 500968);
+    if (harvestPlague && !target->HasAura(harvestPlague) && !target->HasAura(500968))
+    {
+        if (uint32 spell = TrySpell(bot, target, harvestPlague))
+            return spell;
+    }
+
+    // Greater Chill of the Tomb (root 572173) - frost snare / AoE
+    if (uint32 spell = TrySpell(bot, target, 572173))
+        return spell;
+
+    // 6. Direct Damage Fallback:
+    // Return 0 so BotAI::UpdateOffensive falls through to BotAI::SelectNecromancerRotationSpell(bot, target)
+    // which casts Lichfrost (501980 / etc.) or Ice Barrage!
+    return 0;
+}
+
+} // anonymous namespace
+
+uint32 SelectClassRotationSpell(Player* bot, Unit* target, uint8 classId, uint32 activeSpec)
+{
+    if (!bot || !target || !target->IsAlive())
+        return 0;
+
+    switch (classId)
+    {
+        case 12: // Barbarian
+            return SelectBarbarianRotationSpell(bot, target, activeSpec);
+
+        case 13: // Witch Doctor
+            return SelectWitchDoctorRotationSpell(bot, target, activeSpec);
+
+        case 15: // Witch Hunter
+            return SelectWitchHunterRotationSpell(bot, target, activeSpec);
+
+        case 18: // Guardian
+            return SelectGuardianRotationSpell(bot, target, activeSpec);
+
+        case 19: // Templar
+            return SelectTemplarRotationSpell(bot, target, activeSpec);
+
+        case 21: // Ranger
+            return SelectRangerRotationSpell(bot, target, activeSpec);
+
+        case 23: // Necromancer
+            return SelectNecromancerRotationSpell(bot, target, activeSpec);
+
+        case 24: // Pyromancer
+            return SelectPyromancerRotationSpell(bot, target, activeSpec);
+
+        case 25: // Cultist
+            return SelectCultistRotationSpell(bot, target, activeSpec);
+
+        case 26: // Starcaller
+            return SelectStarcallerRotationSpell(bot, target, activeSpec);
+
+        case 27: // Sun Cleric
+            return SelectSunClericRotationSpell(bot, target, activeSpec);
+
+        case 28: // Tinker
+            return SelectTinkerRotationSpell(bot, target, activeSpec);
+
+        case 29: // Venomancer
+            return SelectVenomancerRotationSpell(bot, target, activeSpec);
+
+        default:
+            return 0;
+    }
+}
+
+uint32 SelectClassHealRotationSpell(Player* bot, Player* healTarget, uint8 classId, uint32 activeSpec)
+{
+    if (!bot || !healTarget || !healTarget->IsAlive())
+        return 0;
+
+    switch (classId)
+    {
+        case 13: // Witch Doctor
+            return SelectWitchDoctorHealRotationSpell(bot, healTarget, activeSpec);
+
+        case 27: // Sun Cleric
+        {
+            // 1. Maintain Consecrated Weapons (root 704395) buff on self if known
+            if (!bot->HasAura(704395))
+            {
+                if (uint32 spell = TrySpell(bot, bot, 704395, true))
+                    return spell;
+            }
+
+            // 2. Emergency heal if target is below 50% HP: Illumination (root 500143)
+            if (healTarget->GetHealthPct() < 50.0f)
+            {
+                if (uint32 spell = TrySpell(bot, healTarget, 500143, true))
+                    return spell;
+            }
+
+            // 3. Maintain Revivify HoT (root 801790) on healTarget
+            if (!healTarget->HasAura(801790, bot->GetGUID()))
+            {
+                if (uint32 spell = TrySpell(bot, healTarget, 801790, true))
+                    return spell;
+            }
+
+            // 4. Primary direct heal: Illumination (root 500143) if below 85%
+            if (healTarget->GetHealthPct() < 85.0f)
+            {
+                if (uint32 spell = TrySpell(bot, healTarget, 500143, true))
+                    return spell;
+            }
+
+            return 0;
+        }
+
+        default:
+            return 0;
+    }
+}
+
+void RecordSpellCastFailure(ObjectGuid botGuid, uint32 spellId)
+{
+    if (!spellId)
+        return;
+    failureCooldowns[botGuid][spellId] = getMSTime() + FAILURE_COOLDOWN_MS;
+}
+
+namespace
+{
+    // A range/facing failure will never resolve itself by retrying the identical cast from the
+    // identical spot -- confirmed live (21-bot class-fleet debugging exercise, 2026-09-25): with
+    // only the default 2s failure cooldown, a bot whose highest-scored ability needs a min range
+    // it isn't at (SPELL_FAILED_TOO_CLOSE) or a facing it doesn't have (SPELL_FAILED_UNIT_NOT_INFRONT)
+    // just reselects the same doomed spell every ~2s forever -- one bot logged over 1100 nine-second
+    // stalls and made zero level progress in three hours. Long enough for HandleSpellCastFailure's
+    // own reposition (a few seconds of travel) to actually land before the same spell is eligible
+    // again, instead of racing it.
+    constexpr uint32 RANGE_FAILURE_COOLDOWN_MS = 6000;
+
+    bool IsRangeOrFacingFailure(SpellCastResult result)
+    {
+        return result == SPELL_FAILED_TOO_CLOSE || result == SPELL_FAILED_OUT_OF_RANGE ||
+            result == SPELL_FAILED_UNIT_NOT_INFRONT || result == SPELL_FAILED_LINE_OF_SIGHT;
+    }
+}
+
+void HandleSpellCastFailure(Player* bot, Unit* target, uint32 spellId, SpellCastResult result)
+{
+    if (!bot || !spellId)
+        return;
+
+    // NOT_READY: the core still holds a cooldown the engine's own check did not see (a category or shared cooldown). Retrying every two
+    // seconds wasted a decision each time (13 refused Zenith casts in 30 s); wait out the spell's own recovery time instead.
+    if (result == SPELL_FAILED_NOT_READY)
+    {
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+        uint32 wait = info ? std::max(info->RecoveryTime, info->CategoryRecoveryTime) : 0;
+        wait = std::min<uint32>(std::max<uint32>(wait, FAILURE_COOLDOWN_MS), 15000);
+        failureCooldowns[bot->GetGUID()][spellId] = getMSTime() + wait;
+        return;
+    }
+
+    // A scripted or aura-state requirement the engine cannot see (Rime's Glacial Impact needs a state the core's own scripts decide): retrying
+    // every two seconds only fills the log; give it a few seconds for the state to change.
+    if (result == SPELL_FAILED_TARGET_AURASTATE || result == SPELL_FAILED_CASTER_AURASTATE)
+    {
+        failureCooldowns[bot->GetGUID()][spellId] = getMSTime() + AURA_STATE_FAILURE_COOLDOWN_MS;
+        return;
+    }
+
+    if (!target || !IsRangeOrFacingFailure(result))
+    {
+        RecordSpellCastFailure(bot->GetGUID(), spellId);
+        return;
+    }
+
+    failureCooldowns[bot->GetGUID()][spellId] = getMSTime() + RANGE_FAILURE_COOLDOWN_MS;
+
+    if (result == SPELL_FAILED_TOO_CLOSE)
+    {
+        // Same min-range formula ActionEvaluator::CanCast already uses (engine/ActionEvaluator.cpp)
+        // -- reuse it rather than re-deriving a second, possibly-diverging one. +2yd so the bot
+        // lands clearly past the boundary instead of sitting exactly on it (path/position jitter
+        // would put it back in the dead zone next tick otherwise). Capped: a bug in an unusually
+        // large min-range value must not send the bot sprinting away from its own fight.
+        //
+        // Confirmed live (21-bot fleet, 2026-09-25 21:13) that SpellInfo::GetMinRange() reads 0 for
+        // at least some of the exact spells that still fail TOO_CLOSE server-side (3018, 2764) --
+        // the core's own SPELL_FAILED_TOO_CLOSE only fires when its internal min_range is genuinely
+        // > 0, so there IS a real minimum distance here that GetMinRange()/RangeEntry isn't
+        // surfacing correctly (still unidentified, see docs/research/bot-fleet-combat-findings.md).
+        // Rather than do nothing when minRange reads 0 -- which was silently turning this whole
+        // branch into a no-op for exactly the spells that needed it most -- fall back to a small,
+        // bounded default backoff so there is always a physical reaction, not just a longer cooldown.
+        constexpr float DEFAULT_BACKOFF_YD = 5.0f;
+        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+        float minRange = spellInfo ? spellInfo->GetMinRange(spellInfo->IsPositive()) : 0.0f;
+        float backoff = minRange > 0.0f
+            ? std::min(minRange + bot->GetMeleeRange(target) + 2.0f, 15.0f)
+            : DEFAULT_BACKOFF_YD;
+        BotMovement::MoveBackwards(bot, MoveOwner::Combat, target, backoff);
+        LOG_DEBUG(BotDebugLog::LoggerName(bot->GetGUID()),
+            "BotClassRotations: bot '{}' backing away {:.1f}yd from '{}' after spell {} failed TOO_CLOSE.",
+            bot->GetName(), backoff, target->GetName(), spellId);
+    }
+    else if (result == SPELL_FAILED_UNIT_NOT_INFRONT)
+    {
+        // Cheap and idempotent -- BotAI.cpp's engage loop already does this every tick, but doing
+        // it again right after the failure closes the gap between "we just found out we're not
+        // facing" and "the next tick's normal facing update" instead of waiting on it.
+        bot->SetInFront(target);
+        bot->SetFacingToObject(target);
+    }
+    else if (result == SPELL_FAILED_OUT_OF_RANGE)
+    {
+        // Confirmed live (21-bot fleet, Traeminotham/Runemaster, 2026-09-26): a genuinely
+        // melee-range ability (e.g. "Runeblade", 0-5yd, SPELL_DAMAGE_CLASS_MELEE) can still fail
+        // OUT_OF_RANGE while the bot sits at the generic MELEE_ENGAGE_RANGE chase band (4yd) --
+        // the core's own melee-range check (Spell.cpp's CheckRange) subtracts a leeway margin
+        // (up to 2x MIN_MELEE_REACH) from the spell's declared max range before comparing, so a
+        // nominally-5yd ability's real usable distance can be tighter than the generic chase band
+        // ever settles at. The passive MoveChase banding alone left this bot making zero level
+        // progress for 3+ hours. Actively close the last stretch for a genuine melee spell
+        // (never for a ranged-slot one -- that's Finding 1's territory and excluded from this
+        // legacy search entirely now, see SpellPredicates.cpp's IsUsableOffensiveSpell).
+        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+        if (spellInfo && spellInfo->DmgClass == SPELL_DAMAGE_CLASS_MELEE && !spellInfo->HasAttribute(SPELL_ATTR0_USES_RANGED_SLOT))
+        {
+            constexpr float TIGHT_MELEE_DISTANCE_YD = 2.0f;
+            BotMovement::MoveForwards(bot, MoveOwner::Combat, target, TIGHT_MELEE_DISTANCE_YD);
+            LOG_DEBUG(BotDebugLog::LoggerName(bot->GetGUID()),
+                "BotClassRotations: bot '{}' closing to {:.1f}yd from '{}' after spell {} failed OUT_OF_RANGE.",
+                bot->GetName(), TIGHT_MELEE_DISTANCE_YD, target->GetName(), spellId);
+        }
+        // A ranged-type OUT_OF_RANGE (too far for a legitimate ranged spec's own ability) is left
+        // to the existing MoveChase banding -- the longer cooldown above is what stops the
+        // immediate re-fail there.
+    }
+    else if (result == SPELL_FAILED_LINE_OF_SIGHT)
+    {
+        // Confirmed live (2026-09-27): a healer stuck behind instance geometry (a pillar/wall
+        // corner) re-picks the same heal on the same out-of-sight target every ~1s forever --
+        // STUCK-DETECTOR fires at unchanged HP while the ally being "healed" keeps taking damage.
+        // Unlike TOO_CLOSE/OUT_OF_RANGE there's no single correct direction to move (the obstacle
+        // could be on any side), so a bounded step toward the target's position is the cheapest
+        // real reaction: it either clears a corner directly or, failing that, changes the bot's
+        // position enough for the next failure's step to find a clear angle instead of never
+        // moving from the exact spot LOS first broke at.
+        constexpr float LOS_REPOSITION_STEP_YD = 8.0f;
+        BotMovement::MoveForwards(bot, MoveOwner::Combat, target, LOS_REPOSITION_STEP_YD);
+        LOG_DEBUG(BotDebugLog::LoggerName(bot->GetGUID()),
+            "BotClassRotations: bot '{}' repositioning {:.1f}yd toward '{}' after spell {} failed LINE_OF_SIGHT.",
+            bot->GetName(), LOS_REPOSITION_STEP_YD, target->GetName(), spellId);
+    }
+}
+
+void ForgetRotationState(ObjectGuid botGuid)
+{
+    failureCooldowns.erase(botGuid);
+    abilityThrottleCooldowns.erase(botGuid);
+}
+
+} // namespace BotAI

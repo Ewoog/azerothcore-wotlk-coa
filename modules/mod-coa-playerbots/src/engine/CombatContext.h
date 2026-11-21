@@ -1,0 +1,98 @@
+﻿/*
+ * mod-coa-playerbots
+ *
+ * Data-Driven Combat AI Framework: CombatContext (Per-tick snapshot)
+ */
+
+#ifndef COA_PLAYERBOTS_COMBAT_CONTEXT_H
+#define COA_PLAYERBOTS_COMBAT_CONTEXT_H
+
+#include "Define.h"
+#include "BotAI.h"
+#include "engine/CombatResource.h"
+
+class Player;
+class Unit;
+
+namespace BotAI
+{
+    struct CombatContext
+    {
+        Player* bot = nullptr;
+        Unit* victim = nullptr;
+
+        // Ally triage snapshot
+        Player* lowestAlly = nullptr;
+        float lowestAllyHpPct = 100.0f;
+        Player* tankAlly = nullptr;
+        float tankAllyHpPct = 100.0f;
+
+        uint8 injuredAllyCount = 0;   // Count of alive groupmates with HP < 80%
+        uint8 criticalAllyCount = 0;  // Count of alive groupmates with HP < 40%
+
+        // Self snapshot
+        float botHpPct = 100.0f;
+        float botPowerPct = 100.0f;  // native primary power bar only -- see `resources` below for
+                                      // the bot's full multi-channel picture (native + custom
+                                      // Ascension resources); kept as-is for back-compat, nothing
+                                      // in the engine or profiles should treat it as "the" resource.
+        bool isCasting = false;
+
+        // Universal resource-management snapshot (native power bars + custom Ascension aura-
+        // stack resources, all of them, built once per tick) -- see engine/CombatResource.h. Not
+        // used for any scoring/strategy decisions yet (that's Phase 3); ActionEvaluator::CanCast
+        // uses it purely as a correctness gate so the AI doesn't select an ability it can't
+        // actually pay for.
+        CombatResourceSnapshot resources;
+
+        // Threat & hostile environment
+        bool victimIsCastingInterruptible = false;
+        uint32 victimCastingSpellId = 0;    // spell id behind victimIsCastingInterruptible, 0 if none
+        uint32 victimCastFinishTimeMs = 0;  // absolute getMSTime() the cast above finishes at
+        bool victimTargetingNonTank = false;
+        uint8 nearbyEnemyCount = 0;   // Attackable hostile units within 10 yards of the victim,
+                                      // engaged or not -- only used for worthOffensiveCooldown's
+                                      // "is this actually a pack" check below, never for AoE
+                                      // eligibility (see engagedEnemyCount, Phase 2 fixup #1).
+        uint8 engagedEnemyCount = 0;  // Same 10-yard scan, but only hostiles already part of this
+                                      // fight (TargetEvaluator::IsEngagedCandidate) -- what
+                                      // ActionEvaluator's AoEDamage eligibility floor actually
+                                      // gates on, so an idle bystander pack standing near the
+                                      // fight can never satisfy minAoETargets on its own.
+
+        // Fight value -- see item 14/#9 of the combat-engine rework: whether this fight actually
+        // justifies spending a long-cooldown offensive/defensive button, not just "is one ready."
+        bool targetIsBossOrElite = false;
+        float targetHpPct = 100.0f;
+        // Boss/elite/PvP target, or a real pack (nearbyEnemyCount>=3), and not already about to
+        // die -- see ActionEvaluator::ScoreAbility's OffensiveCD gating.
+        bool worthOffensiveCooldown = false;
+
+        // Defensive prediction (item 19, Phase 2) -- a cheap rolling incoming-damage-per-second
+        // estimate for the bot itself (see DamageTracker), and whether the bot's actual
+        // situation right now (not just "HP below a fixed threshold") justifies a defensive
+        // cooldown: taking real incoming damage, or the victim is mid-cast on something
+        // dangerous while the bot is its target.
+        float botIncomingDps = 0.0f;
+        bool worthDefensiveCooldown = false;
+
+        // Burst prediction: an enemy that is attacking the bot is casting a damaging spell at it right now (a tankbuster with a cast
+        // bar). predictedBurstPct is that cast's damage as a share of the bot's maximum health, burstRemainingMs the time until it lands.
+        // burstIncoming means the hit is big enough (BURST_PCT_THRESHOLD of max health) and close enough for a defensive cooldown to
+        // matter - the case that a health-percent rule never catches, because the tank is at full health when the cast starts.
+        float predictedBurstPct = 0.0f;
+        uint32 burstRemainingMs = 0;
+        bool burstIncoming = false;
+
+        // Metadata
+        uint8 classId = 0;
+        uint32 activeSpec = 0;
+        BotRole role = BotRole::Dps;
+        uint32 currentMSTime = 0;
+
+        // Builds a fresh CombatContext snapshot for this AI tick
+        static CombatContext Build(Player* bot, Unit* explicitVictim = nullptr);
+    };
+}
+
+#endif // COA_PLAYERBOTS_COMBAT_CONTEXT_H

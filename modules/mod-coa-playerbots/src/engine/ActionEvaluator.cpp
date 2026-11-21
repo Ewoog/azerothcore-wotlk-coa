@@ -1,0 +1,1002 @@
+#include "BotPerformance.h"
+#include "training/TrainingArenaManager.h"
+/*
+ * mod-coa-playerbots
+ *
+ * Data-Driven Combat AI Framework: ActionEvaluator implementation
+ */
+
+#include "engine/ActionEvaluator.h"
+#include "engine/BotDebugLog.h"
+#include "engine/CombatResource.h"
+#include "engine/DamageTracker.h"
+#include "engine/HealEvaluator.h"
+#include "engine/SpellPredicates.h"
+#include "engine/SpellResolver.h"
+#include "engine/SpecStrategyRegistry.h"
+#include "engine/TargetEvaluator.h"
+#include "BotClassRotations.h"
+#include "Creature.h"
+#include "CellImpl.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
+#include "Group.h"
+#include "Item.h"
+#include "Log.h"
+#include "ObjectAccessor.h"
+#include "Pet.h"
+#include "Player.h"
+#include "Spell.h"
+#include "SpellAuraEffects.h"
+#include "SpellAuras.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
+#include "Timer.h"
+#include <algorithm>
+#include <unordered_map>
+#include <unordered_set>
+#include <list>
+
+namespace BotAI
+{
+    namespace
+    {
+        // [botGuid][rootSpellId] -> expiryMSTime
+        std::unordered_map<ObjectGuid, std::unordered_map<uint32, uint32>> s_internalThrottles;
+
+        bool IsNativeFormAllowed(Player* bot, SpellInfo const* info)
+        {
+            // Honor native shapeshift exemptions before rejecting stance-gated spells.
+            for (AuraEffect const* effect : bot->GetAuraEffectsByType(SPELL_AURA_MOD_IGNORE_SHAPESHIFT))
+                if (effect->IsAffectedOnSpell(info))
+                    return true;
+            return info->CheckShapeshift(bot->GetShapeshiftForm()) == SPELL_CAST_OK;
+        }
+
+        bool IsWithinNativeMaxRange(Player* bot, Unit* target, SpellInfo const* info)
+        {
+            float range = bot->GetSpellMaxRangeForTarget(target, info);
+            if (range <= 0.0f)
+                return true;
+            // Match Spell::CheckRange's combat reach and melee leeway. Raw distance
+            // rejects abilities which the native cast accepts against large targets.
+            if (info->RangeEntry && info->RangeEntry->Flags == SPELL_RANGE_MELEE)
+            {
+                range -= bot->GetLeewayBonusRange(target) > 0.0f ? MIN_MELEE_REACH : 2 * MIN_MELEE_REACH;
+                return bot->IsWithinMeleeRange(target, std::max(range, 0.0f));
+            }
+            return bot->IsWithinCombatRange(target, range);
+        }
+
+        bool IsOutsideNativeMinRange(Player* bot, Unit* target, SpellInfo const* info)
+        {
+            float range = bot->GetSpellMinRangeForTarget(target, info);
+            if (info->RangeEntry && info->RangeEntry->Flags == SPELL_RANGE_RANGED && !bot->IgnoresSpellMinRange(info))
+                return !bot->IsWithinRange(target, range + bot->GetMeleeRange(target));
+            return range <= 0.0f || !bot->IsWithinCombatRange(target, range);
+        }
+
+        bool IsHealTargetReachable(Player* bot, Unit* candidate, SpellInfo const* spellInfo)
+        {
+            if (!bot || !candidate || !spellInfo || !candidate->IsAlive() || !candidate->IsInWorld())
+                return false;
+            if (candidate->GetMap() != bot->GetMap())
+                return false;
+            if (candidate == bot)
+                return true;
+
+            float dist = bot->GetDistance(candidate);
+            float maxRange = spellInfo->GetMaxRange(true, bot);
+            if (maxRange > 0.0f && dist > maxRange)
+                return false;
+            return bot->IsWithinLOSInMap(candidate);
+        }
+
+        bool IsTargetAuraDue(Player* bot, Unit* target, AbilityDescriptor const& desc, uint32 resolvedSpellId)
+        {
+            if (!desc.requireAuraMissingOnTarget) return true;
+            uint32 auraId = desc.targetAuraId ? desc.targetAuraId : resolvedSpellId;
+            Aura* aura = target->GetAura(auraId, bot->GetGUID());
+            if (!aura) return true;
+            if (desc.refreshBelowMs > 0)
+                return aura->GetDuration() <= static_cast<int32>(desc.refreshBelowMs);
+            if (desc.refreshBelowStacks > 0)
+                return aura->GetStackAmount() < desc.refreshBelowStacks;
+            return false;
+        }
+
+        Player* SelectBestReachableAlly(CombatContext const& ctx, AbilityDescriptor const& desc, SpellInfo const* spellInfo, bool requireTankRole)
+        {
+            Player* best = nullptr;
+            float bestUrgency = -1.0f;
+            auto consider = [&](Player* candidate)
+            {
+                if (!candidate || !candidate->IsAlive() || !candidate->IsInWorld())
+                    return;
+                if (requireTankRole && BotAI::GetRole(candidate->GetGUID()) != BotRole::Tank)
+                    return;
+                if (candidate->GetHealthPct() > desc.maxTargetHpPct)
+                    return;
+                if (!IsTargetAuraDue(ctx.bot, candidate, desc, spellInfo ? spellInfo->Id :
+                    SpellResolver::ResolveCastSpell(ctx.bot, desc.rootSpellId)))
+                    return;
+                if (spellInfo && !IsHealTargetReachable(ctx.bot, candidate, spellInfo))
+                    return;
+
+                float urgency = HealEvaluator::ScoreHealUrgency(ctx.bot, candidate);
+                if (urgency > bestUrgency)
+                {
+                    bestUrgency = urgency;
+                    best = candidate;
+                }
+            };
+
+            if (Group const* group = ctx.bot->GetGroup())
+                for (GroupReference const* ref = group->GetFirstMember(); ref; ref = ref->next())
+                    consider(ref->GetSource());
+            consider(ctx.bot);
+
+            return best;
+        }
+    }
+
+    bool ActionEvaluator::IsThrottled(ObjectGuid botGuid, uint32 rootSpellId)
+    {
+        auto botItr = s_internalThrottles.find(botGuid);
+        if (botItr == s_internalThrottles.end())
+            return false;
+
+        auto spellItr = botItr->second.find(rootSpellId);
+        if (spellItr == botItr->second.end())
+            return false;
+
+        uint32 now = getMSTime();
+        if (now < spellItr->second)
+            return true;
+
+        botItr->second.erase(spellItr);
+        return false;
+    }
+
+    void ActionEvaluator::SetThrottle(ObjectGuid botGuid, uint32 rootSpellId, uint32 durationMs)
+    {
+        s_internalThrottles[botGuid][rootSpellId] = getMSTime() + durationMs;
+    }
+
+    namespace
+    {
+        std::unordered_map<ObjectGuid, uint32> s_lastDefensiveMs;
+    }
+
+    void ActionEvaluator::NoteDefensiveCast(ObjectGuid botGuid)
+    {
+        s_lastDefensiveMs[botGuid] = getMSTime();
+    }
+
+    void ActionEvaluator::ClearThrottles(ObjectGuid botGuid)
+    {
+        s_internalThrottles.erase(botGuid);
+        s_lastDefensiveMs.erase(botGuid);
+    }
+
+    Unit* ActionEvaluator::ResolveTarget(CombatContext const& ctx, TargetType targetType, AbilityDescriptor const& desc, uint32 resolvedSpellId)
+    {
+        switch (targetType)
+        {
+            case TargetType::Self:
+                return ctx.bot;
+
+            case TargetType::CurrentTarget:
+                return (ctx.victim && ctx.victim->IsAlive()) ? ctx.victim : nullptr;
+
+            case TargetType::AreaHostile:
+            {
+                if (!ctx.victim || !ctx.victim->IsAlive())
+                    return nullptr;
+                return TargetEvaluator::FindBestAoECluster(ctx.bot, ctx.victim);
+            }
+
+            case TargetType::LowestHealthAlly:
+            {
+                SpellInfo const* spellInfo = resolvedSpellId ? sSpellMgr->GetSpellInfo(resolvedSpellId) : nullptr;
+                return SelectBestReachableAlly(ctx, desc, spellInfo, false);
+            }
+
+            case TargetType::TankAlly:
+            {
+                SpellInfo const* spellInfo = resolvedSpellId ? sSpellMgr->GetSpellInfo(resolvedSpellId) : nullptr;
+                if (Player* tank = SelectBestReachableAlly(ctx, desc, spellInfo, true))
+                    return tank;
+                return SelectBestReachableAlly(ctx, desc, spellInfo, false);
+            }
+
+            case TargetType::AnyInjuredAlly:
+            {
+                SpellInfo const* spellInfo = resolvedSpellId ? sSpellMgr->GetSpellInfo(resolvedSpellId) : nullptr;
+                return SelectBestReachableAlly(ctx, desc, spellInfo, false);
+            }
+
+            case TargetType::PartyMissingBuff:
+            {
+                uint32 auraToCheck = desc.targetAuraId ? desc.targetAuraId : (desc.rootSpellId ? desc.rootSpellId : resolvedSpellId);
+                if (Group const* group = ctx.bot->GetGroup())
+                {
+                    for (GroupReference const* ref = group->GetFirstMember(); ref; ref = ref->next())
+                    {
+                        Player* member = ref->GetSource();
+                        if (member && member->IsAlive() && member->IsInWorld() && member->GetMap() == ctx.bot->GetMap())
+                        {
+                            if (!member->HasAura(auraToCheck))
+                                return member;
+                        }
+                    }
+                }
+                return ctx.bot->HasAura(auraToCheck) ? nullptr : ctx.bot;
+            }
+
+            default:
+                return nullptr;
+        }
+    }
+
+    char const* ActionEvaluator::ValidateActionReason(CombatContext const& ctx, BotAction const& action, AbilityDescriptor const* desc)
+    {
+        Player* bot = ctx.bot;
+        if (!bot || !action.target || !action.spellId)
+            return "no target/spell";
+
+        if (action.rootSpellId && IsThrottled(bot->GetGUID(), action.rootSpellId))
+            return "internal throttle";
+
+        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(action.spellId);
+        if (!spellInfo)
+            return "no spell info";
+
+        // GCD validation using native Core API
+        if (bot->GetGlobalCooldownMgr().HasGlobalCooldown(spellInfo))
+            return "global cooldown";
+
+        if (IsSpellInFailureCooldown(bot->GetGUID(), action.spellId))
+            return "recent cast failure";
+
+        if (bot->HasSpellCooldown(action.spellId))
+            return "spell cooldown";
+
+        if (WouldAoEHitBreakableCrowdControl(bot, action.target, spellInfo))
+            return "would break crowd control";
+
+        // Resource check through CombatResourceEvaluator
+        if (!IsNativeFormAllowed(bot, spellInfo))
+            return "native stance/form requirement";
+        // Same native-prerequisite and health-reserve rules as CanCast, for casts that reach the engines through the fallbacks.
+        if (char const* prerequisite = NativeCastPrerequisiteFailure(bot, spellInfo))
+            return prerequisite;
+        if (!CombatResourceEvaluator::CanAfford(ctx.resources, bot, action.spellId))
+            return "can't afford";
+
+        // Range check
+        if (action.target != bot)
+        {
+            if (!IsWithinNativeMaxRange(bot, action.target, spellInfo))
+                return "out of range";
+
+            if (!IsOutsideNativeMinRange(bot, action.target, spellInfo))
+                return "inside minimum range";
+        }
+
+        // If descriptor provided, run its specific checks
+        if (desc)
+        {
+            if (desc->stateRequirement == StateRequirement::EmergencyOnly)
+            {
+                if (ctx.botHpPct > 35.0f && (!ctx.lowestAlly || ctx.lowestAllyHpPct > 35.0f))
+                    return "emergency only";
+            }
+
+            if (desc->minPowerPct > 0.0f && ctx.botPowerPct < desc->minPowerPct)
+                return "below minimum power";
+        }
+
+        return nullptr;
+    }
+
+    bool ActionEvaluator::ValidateAction(CombatContext const& ctx, BotAction const& action, AbilityDescriptor const* desc)
+    {
+        return ValidateActionReason(ctx, action, desc) == nullptr;
+    }
+
+    bool ActionEvaluator::CanCast(CombatContext const& ctx, AbilityDescriptor const& desc, uint32 resolvedSpellId, Unit* target)
+    {
+        Player* bot = ctx.bot;
+        if (!bot || !target || !resolvedSpellId)
+            return false;
+
+        // Temporary diagnostic (2026-09-26, Runemaster/Traeminotham investigation -- see
+        // docs/research/bot-fleet-combat-findings.md): every rejection below logs which specific
+        // gate fired, so a bot with literally zero castable candidates for an extended period can
+        // be root-caused from the log instead of guessed at. Cheap (one string compare + an
+        // already-throttled-by-caller LOG_DEBUG) and useful long-term for any future "no usable
+        // action" mystery, so left in rather than ripped out once this investigation is done.
+        auto reject = [&](char const* reason) -> bool
+        {
+            LOG_DEBUG(BotDebugLog::LoggerName(bot->GetGUID()),
+                "ActionEvaluator: bot '{}' can't cast '{}' (spell {}) -- {}.",
+                bot->GetName(), desc.name, resolvedSpellId, reason);
+            CoaTraining::Candidate(bot->GetGUID(), resolvedSpellId, desc.name, false, 0, reason);
+            return false;
+        };
+
+        if (IsThrottled(bot->GetGUID(), desc.rootSpellId))
+            return reject("internal throttle");
+
+        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(resolvedSpellId);
+        if (!spellInfo)
+            return reject("no SpellInfo");
+        // The resolved spell can differ from the descriptor root through a
+        // native temporary replacement. Check the actual cast, not the root:
+        // passive auras are supplied and triggered by the native spell system.
+        if (spellInfo->IsPassive())
+            return reject("passive ability");
+        if (bot->IsInCombat() && !spellInfo->CanBeUsedInCombat())
+            return reject("out-of-combat ability");
+
+        // See SpellPredicates.cpp's IsKnownSpellCastable for the matching check on the legacy
+        // path -- a genuinely stunned bot cannot cast anything, so don't offer a candidate at all
+        // rather than let it fail SPELL_FAILED_STUNNED every tick until the stun wears off.
+        if (bot->HasUnitState(UNIT_STATE_STUNNED))
+            return reject("stunned");
+
+        // Native GCD check
+        if (bot->GetGlobalCooldownMgr().HasGlobalCooldown(spellInfo))
+            return reject("global cooldown");
+
+        if (IsSpellInFailureCooldown(bot->GetGUID(), resolvedSpellId))
+            return reject("recent-failure backoff");
+
+        if (bot->HasSpellCooldown(resolvedSpellId))
+            return reject("spell cooldown");
+
+        // Breakable CC protection
+        if (WouldAoEHitBreakableCrowdControl(bot, target, spellInfo))
+            return reject("would break a party CC");
+
+        // State requirement check
+        if (desc.stateRequirement == StateRequirement::EmergencyOnly)
+        {
+            if (ctx.botHpPct > 35.0f && (!ctx.lowestAlly || ctx.lowestAllyHpPct > 35.0f))
+                return reject("emergency-only, nobody critical");
+        }
+
+        // A direct heal is only worth its mana when the target needs it and the heal would not mostly overheal; a profile
+        // heal with the default maxTargetHpPct of 100 used to land on any ally the urgency ranking liked, full health included.
+        // Heals that carry an absorb (Shield tag) are valued for more than their health and keep their own descriptor limits.
+        if ((HasTag(desc.tags, AbilityTag::DirectHeal) || HasTag(desc.tags, AbilityTag::EmergencyHeal)) &&
+            !HasTag(desc.tags, AbilityTag::Shield) && bot->IsFriendlyTo(target))
+        {
+            if (Player* healTarget = target->ToPlayer())
+            {
+                if (!HealEvaluator::IsDirectHealWorthCasting(bot, healTarget, spellInfo))
+                    return reject("heal would be wasted (target needs no healing or it would mostly overheal)");
+            }
+        }
+
+        // A pure absorb shield is worth casting when it adds protection: not when shields already on the target cover what is expected to
+        // arrive while it lasts and are at least half as large as the new one (two healers, or a shield cast again too early).
+        if (HasTag(desc.tags, AbilityTag::Shield) && !HasTag(desc.tags, AbilityTag::DirectHeal) && !HasTag(desc.tags, AbilityTag::EmergencyHeal) &&
+            bot->IsFriendlyTo(target))
+        {
+            uint32 added = 0;
+            for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                if (spellInfo->Effects[i].ApplyAuraName == SPELL_AURA_SCHOOL_ABSORB)
+                    if (int32 value = spellInfo->Effects[i].CalcValue(bot); value > 0)
+                        added += uint32(value);
+            constexpr uint32 SHIELD_HORIZON_MS = 6000;
+            uint32 existing = HealEvaluator::UsableAbsorb(target, SHIELD_HORIZON_MS, 0);
+            float expectedDamage = DamageTracker::SampleIncomingDps(target) * float(SHIELD_HORIZON_MS) / 1000.0f;
+            if (Decisions::ShieldIsRedundant(existing, added, expectedDamage))
+                return reject("an absorb already covers what is expected to arrive");
+        }
+
+        // Persistent entity tracking (Pets, Minions, Turrets, Wards)
+        if (desc.trackedEntityType == TrackedEntityType::Pet)
+        {
+            if (bot->GetPet())
+                return reject("already has a pet");
+        }
+        else if (desc.trackedEntityType == TrackedEntityType::Turret ||
+                 desc.trackedEntityType == TrackedEntityType::Ward ||
+                 desc.trackedEntityType == TrackedEntityType::Minion)
+        {
+            if (desc.trackedEntityEntry != 0)
+            {
+                std::unordered_set<ObjectGuid> owned;
+                auto consider = [&](Unit* unit)
+                {
+                    if (unit && unit->IsAlive() && unit->GetEntry() == desc.trackedEntityEntry &&
+                        bot->InSamePhase(unit) && (unit->GetCharmerOrOwnerGUID() == bot->GetGUID() ||
+                        unit->GetOwnerGUID() == bot->GetGUID()))
+                        owned.insert(unit->GetGUID());
+                };
+                for (Unit* controlled : bot->m_Controlled)
+                    consider(controlled);
+                // Native timed summons may not be registered in m_Controlled.
+                std::list<Unit*> nearby;
+                Acore::AnyUnitInObjectRangeCheck check(bot, 60.0f);
+                Acore::UnitListSearcher<Acore::AnyUnitInObjectRangeCheck> search(bot, nearby, check);
+                Cell::VisitObjects(bot, search, 60.0f);
+                for (Unit* unit : nearby)
+                    consider(unit);
+                size_t liveCount = owned.size();
+                if (liveCount >= (desc.maxActiveEntities ? desc.maxActiveEntities : 1))
+                    return reject("tracked entity cap reached");
+            }
+        }
+
+        // Caster aura state & requirements (chain-aware: Round 3.2.2)
+        if (desc.requiredAuraOnCaster && !bot->HasAura(desc.requiredAuraOnCaster))
+            return reject("missing required caster aura");
+
+        // missingAuraOnCaster: block cast if the aura IS present (rank-chain aware)
+        if (desc.missingAuraOnCaster)
+        {
+            // Build a minimal descriptor that only points at the missingAuraOnCaster ID
+            // so FindCasterAuraForDescriptor resolves its rank chain.
+            AbilityDescriptor missingCheck{};
+            missingCheck.rootSpellId = desc.missingAuraOnCaster;
+            missingCheck.casterAuraId = desc.missingAuraOnCaster;
+            uint32 missingResolved = SpellResolver::ResolveSpell(bot, desc.missingAuraOnCaster);
+            if (FindCasterAuraForDescriptor(bot, missingCheck, missingResolved ? missingResolved : desc.missingAuraOnCaster))
+                return reject("blocking caster aura present");
+        }
+
+        // casterAuraId: if aura is active, apply refresh policy; if no policy → block cast
+        if (desc.casterAuraId)
+        {
+            Aura const* cAura = FindCasterAuraForDescriptor(bot, desc, resolvedSpellId);
+            if (cAura && !ShouldRefreshCasterAura(cAura, desc))
+                return reject("caster aura already up, not due for refresh");
+        }
+
+        // The core asks HasAuraState with the spell and the caster, which honours "ignore aura state" auras and per-caster states (a
+        // debuff only counts when this caster applied it); the one-argument form answered differently and sent casts the core then refused.
+        if (spellInfo->CasterAuraState && !bot->HasAuraState(AuraStateType(spellInfo->CasterAuraState), spellInfo, bot))
+            return reject("missing spell-defined caster aura state");
+        if (spellInfo->CasterAuraSpell && !bot->HasAura(spellInfo->CasterAuraSpell))
+            return reject("missing spell-defined caster aura");
+        // Native prerequisites the core would otherwise answer with a failed cast on every retry
+        // (Taldaram's Torment in a Cursed Form, Shieldgore without a shield, Standard of Valiance without its totem item).
+        if (char const* prerequisite = NativeCastPrerequisiteFailure(bot, spellInfo))
+            return reject(prerequisite);
+
+        // Target aura requirements with refresh policies
+        if (!IsTargetAuraDue(bot, target, desc, resolvedSpellId))
+            return reject("target aura not due for refresh yet");
+
+        if (spellInfo->TargetAuraState && !target->HasAuraState(AuraStateType(spellInfo->TargetAuraState), spellInfo, bot))
+            return reject("missing spell-defined target aura state");
+        if (spellInfo->TargetAuraStateNot && target->HasAuraState(AuraStateType(spellInfo->TargetAuraStateNot), spellInfo, bot))
+            return reject("blocked by spell-defined target aura state");
+        if (spellInfo->TargetAuraSpell && !target->HasAura(spellInfo->TargetAuraSpell))
+            return reject("missing spell-defined target aura");
+
+        // Resource management hard floor
+        if (desc.minPowerPct > 0.0f && ctx.botPowerPct < desc.minPowerPct)
+            return reject("below minPowerPct floor");
+
+        // Universal resource-management engine
+        if (!IsNativeFormAllowed(bot, spellInfo))
+            return reject("native stance/form requirement");
+        if (!CombatResourceEvaluator::CanAfford(ctx.resources, bot, resolvedSpellId))
+            return reject("can't afford (see CombatResource log line above for which resource)");
+
+        // Range check
+        if (target != bot)
+        {
+            if (!IsWithinNativeMaxRange(bot, target, spellInfo))
+                return reject("out of max range");
+
+            if (!IsOutsideNativeMinRange(bot, target, spellInfo))
+                return reject("inside min range");
+        }
+
+        return true;
+    }
+
+    float ActionEvaluator::ScoreAbility(CombatContext const& ctx, AbilityDescriptor const& desc, Unit* target, SpecStrategy const* strategy, CombatPhase phase)
+    {
+        if (!target)
+            return -1.0f;
+
+        float targetHpPct = target->GetHealthPct();
+        if (targetHpPct < desc.minTargetHpPct || targetHpPct > desc.maxTargetHpPct)
+            return -1.0f;
+
+        // A defensive with a health ceiling is meant for a hurt bot; when a damaging cast is about to land on the bot it is worth using at
+        // any health (the tank is at full health when a tankbuster starts casting).
+        bool burstOverridesCeiling = ctx.burstIncoming && HasTag(desc.tags, AbilityTag::DefensiveCD);
+        if (burstOverridesCeiling)
+        {
+            // One defensive answers a moderate hit: a second one is spent only on a large hit or when the bot would end up low.
+            auto last = s_lastDefensiveMs.find(ctx.bot->GetGUID());
+            uint32 since = last == s_lastDefensiveMs.end() ? 0xFFFFFFFFu : getMSTime() - last->second;
+            if (!Decisions::StackedDefensiveAllowed(ctx.predictedBurstPct, ctx.botHpPct, since))
+                burstOverridesCeiling = false;
+        }
+        if (ctx.botHpPct < desc.minSelfHpPct || (ctx.botHpPct > desc.maxSelfHpPct && !burstOverridesCeiling))
+            return -1.0f;
+
+        if (desc.minInjuredAllies > 0 && ctx.injuredAllyCount < desc.minInjuredAllies)
+            return -1.0f;
+
+        float score = desc.baseScore;
+
+        // Tag-driven contextual utility bonuses
+        if (HasTag(desc.tags, AbilityTag::EmergencyHeal))
+        {
+            score += (40.0f - targetHpPct) * 15.0f;
+            if (target == ctx.tankAlly)
+                score += 50.0f;
+        }
+        if (HasTag(desc.tags, AbilityTag::DirectHeal))
+        {
+            score += (100.0f - targetHpPct) * 2.0f;
+            if (target == ctx.tankAlly)
+                score += 30.0f;
+        }
+        if (HasTag(desc.tags, AbilityTag::PeriodicHeal))
+        {
+            if (target == ctx.tankAlly)
+                score += 35.0f;
+            score += (100.0f - targetHpPct) * 0.8f;
+        }
+        if (HasTag(desc.tags, AbilityTag::AoEHeal))
+        {
+            score += static_cast<float>(ctx.injuredAllyCount) * 25.0f;
+        }
+        if (HasTag(desc.tags, AbilityTag::Interrupt))
+        {
+            if (!ctx.victimIsCastingInterruptible)
+                return -1.0f;
+            score += 500.0f;
+        }
+        if (HasTag(desc.tags, AbilityTag::Taunt))
+        {
+            if (!ctx.victimTargetingNonTank)
+                return -1.0f;
+            score += 400.0f;
+        }
+        if (HasTag(desc.tags, AbilityTag::Execute))
+        {
+            // Native aura/resource/health requirements decide availability. A tag alone
+            // must not invent a universal 20% health restriction for CoA abilities.
+            if (targetHpPct <= 20.0f)
+                score += 150.0f;
+        }
+        if (HasTag(desc.tags, AbilityTag::AoEDamage))
+        {
+            if (ctx.engagedEnemyCount < desc.minAoETargets)
+                return -1.0f;
+            score += static_cast<float>(ctx.engagedEnemyCount) * 20.0f;
+        }
+        if (HasTag(desc.tags, AbilityTag::DefensiveCD))
+        {
+            if (ctx.worthDefensiveCooldown)
+                score += 200.0f;
+            else
+                score *= 0.5f;
+        }
+
+        // Custom scriptable scoring callback
+        if (desc.customScorer)
+        {
+            float customBonus = desc.customScorer(ctx, desc);
+            if (customBonus < 0.0f)
+                return -1.0f;
+            score += customBonus;
+        }
+
+        // Cooldown fight-value gate
+        if (HasTag(desc.tags, AbilityTag::OffensiveCD) && !ctx.worthOffensiveCooldown)
+            score *= 0.15f;
+
+        // Resource management soft floor
+        if (desc.reservePowerPct > 0.0f && ctx.botPowerPct < desc.reservePowerPct)
+        {
+            float depth = 1.0f - (ctx.botPowerPct / desc.reservePowerPct);
+            float inefficiencyPenalty = std::max(0.0f, 1.0f - desc.resourceEfficiency);
+            score *= std::max(0.15f, 1.0f - depth * inefficiencyPenalty);
+        }
+
+        // Defensive reserve protection: prevent offensive spenders from starving active mitigation
+        if (strategy && !strategy->resourcePolicies.empty())
+        {
+            uint32 resolvedSpellId = SpellResolver::ResolveCastSpell(ctx.bot, desc.rootSpellId);
+            bool isDefensiveOrEmergency = HasTag(desc.tags, AbilityTag::DefensiveCD) || HasTag(desc.tags, AbilityTag::EmergencyHeal) || HasTag(desc.tags, AbilityTag::Taunt);
+
+            for (ResourcePolicy const& pol : strategy->resourcePolicies)
+            {
+                CombatResourceState const* st = ctx.resources.Find(pol.key);
+                if (!st)
+                    continue;
+
+                // 1. Defensive reserve check
+                if (!isDefensiveOrEmergency && pol.reserveForDefensive && pol.defensiveReserve > 0)
+                {
+                    bool allowDump = (phase == CombatPhase::Burst && pol.allowDumpDuringBurst);
+                    if (!allowDump)
+                    {
+                        int32 projected = ProjectResourceAfterAbility(ctx, pol.key, resolvedSpellId);
+                        if (projected < pol.defensiveReserve)
+                        {
+                            score *= 0.1f;
+                        }
+                    }
+                }
+
+                // 2. Overcap threshold logic: near overcap -> spender bonus (+100) / builder penalty (0.3x)
+                if (pol.overcapThreshold > 0 && st->current >= pol.overcapThreshold)
+                {
+                    int32 projected = ProjectResourceAfterAbility(ctx, pol.key, resolvedSpellId);
+                    if (projected < st->current)
+                    {
+                        score += 100.0f; // spender bonus
+                    }
+                    else
+                    {
+                        // Check if ability gains this resource
+                        for (auto const& gain : CombatResourceEvaluator::ResolveGains(ctx.classId, resolvedSpellId))
+                        {
+                            if (gain.key == pol.key)
+                            {
+                                score *= 0.3f; // overcap waste penalty
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 3. Builder bonus specifically for this resource when below minToEngage or defensiveReserve
+                if (pol.minToEngage > 0 || pol.defensiveReserve > 0)
+                {
+                    int32 threshold = std::max(pol.minToEngage, pol.defensiveReserve);
+                    if (st->current < threshold)
+                    {
+                        for (auto const& gain : CombatResourceEvaluator::ResolveGains(ctx.classId, resolvedSpellId))
+                        {
+                            if (gain.key == pol.key)
+                            {
+                                score += 150.0f; // builder bonus specifically for this starving resource
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Generic builder bonus during recovery or when low on primary power
+        if (phase == CombatPhase::Recovery || ctx.botPowerPct < 30.0f)
+        {
+            uint32 resolvedSpellId = SpellResolver::ResolveCastSpell(ctx.bot, desc.rootSpellId);
+            if (resolvedSpellId)
+            {
+                auto const& gains = CombatResourceEvaluator::ResolveGains(ctx.classId, resolvedSpellId);
+                if (!gains.empty())
+                {
+                    score += 100.0f;
+                }
+            }
+        }
+
+        // Phase-specific adjustments
+        if (phase == CombatPhase::Recovery)
+        {
+            if (HasTag(desc.tags, AbilityTag::Filler))
+                score += 150.0f;
+            else if (HasTag(desc.tags, AbilityTag::DefensiveCD) || HasTag(desc.tags, AbilityTag::EmergencyHeal))
+                score += 100.0f;
+            else if (HasTag(desc.tags, AbilityTag::OffensiveCD))
+                score *= 0.1f;
+        }
+        else if (phase == CombatPhase::Opener)
+        {
+            if (HasTag(desc.tags, AbilityTag::Taunt))
+                score += 200.0f;
+            else if (HasTag(desc.tags, AbilityTag::MeleeAttack) || HasTag(desc.tags, AbilityTag::RangedAttack) || HasTag(desc.tags, AbilityTag::Buff))
+                score += 50.0f;
+        }
+        else if (phase == CombatPhase::Burst)
+        {
+            if (HasTag(desc.tags, AbilityTag::OffensiveCD))
+                score += 250.0f;
+        }
+
+        return score;
+    }
+
+    int32 ActionEvaluator::ProjectResourceAfterAbility(CombatContext const& ctx, CombatResourceKey const& key, uint32 resolvedSpellId)
+    {
+        CombatResourceState const* st = ctx.resources.Find(key);
+        if (!st)
+            return 0;
+
+        int32 current = st->current;
+        if (!resolvedSpellId)
+            return current;
+
+        for (auto const& req : CombatResourceEvaluator::ResolveRequirements(ctx.bot, resolvedSpellId))
+        {
+            if (req.key == key && req.activeForBot)
+            {
+                if (req.consumption == AscensionCompatData::ResourceConsumption::All)
+                {
+                    current = 0;
+                }
+                else if (req.consumption == AscensionCompatData::ResourceConsumption::Fixed)
+                {
+                    current = std::max(0, current - req.amount);
+                }
+                // ResourceConsumption::None: current is unchanged
+            }
+        }
+        return current;
+    }
+
+    BotAction ActionEvaluator::EvaluateBestAction(CombatContext const& ctx, std::vector<AbilityDescriptor> const& abilities)
+    {
+        SpecStrategy const* strategy = SpecStrategyRegistry::FindStrategy(ctx.classId, ctx.activeSpec, ctx.role);
+        return EvaluateBestAction(ctx, abilities, strategy);
+    }
+
+    BotAction ActionEvaluator::EvaluateBestAction(CombatContext const& ctx, std::vector<AbilityDescriptor> const& abilities, SpecStrategy const* strategy)
+    {
+        CoaBotPerf::Scope profile(CoaBotPerf::Metric::ActionEvaluation, CoaBotPerf::CombatProfileEnabled());
+        CoaTraining::BeginDecision(ctx);
+        struct DecisionEnd
+        {
+            CombatContext const& ctx;
+            BotAction const& action;
+            ~DecisionEnd() { CoaTraining::EndDecision(ctx.bot->GetGUID(), action.spellId, action.score,
+                uint32(SpecStrategyRegistry::GetRuntime(ctx.bot->GetGUID()).phase)); }
+        };
+        BotAction bestAction;
+        DecisionEnd decisionEnd{ctx, bestAction};
+        float bestScore = 0.0f;
+        uint32 now = getMSTime();
+
+        SpecStrategyRuntime& runtime = SpecStrategyRegistry::GetRuntime(ctx.bot->GetGUID());
+        if (ctx.bot->IsInCombat())
+        {
+            if (runtime.combatStartMs == 0)
+                runtime.combatStartMs = now;
+        }
+        else
+        {
+            runtime.combatStartMs = 0;
+            runtime.successfulCastsCount = 0;
+            runtime.successfulCombatCasts = 0;
+            runtime.openerCompleted = false;
+            runtime.burstWindowActive = false;
+            runtime.burstConsumedThisCombat = false;
+            runtime.burstStartedMs = 0;
+        }
+
+        // 1. Form / Stance readiness check and form dancing state machine
+        BotAction stateRecoveryAction;
+        CombatStateStatus stateStatus = SpecStrategyRegistry::EvaluateCombatState(ctx.bot, strategy, ctx, &stateRecoveryAction);
+
+        if (stateRecoveryAction.IsValid())
+        {
+            char const* recoveryReason = ValidateActionReason(ctx, stateRecoveryAction);
+            if (!recoveryReason)
+            {
+                bestAction = stateRecoveryAction;
+                return bestAction;
+            }
+            // Without this the decision log is empty while a form is missing and the recovery cast is blocked.
+            CoaTraining::Candidate(ctx.bot->GetGUID(), stateRecoveryAction.spellId, stateRecoveryAction.name, false, 0, recoveryReason);
+        }
+
+        // If missing baseline state or setup is required and no recovery action was generated,
+        // do NOT allow normal rotation
+        if (stateStatus == CombatStateStatus::NeedEnterBaseline || stateStatus == CombatStateStatus::SetupRequired || stateStatus == CombatStateStatus::ReturningToBaseline)
+        {
+            return bestAction;
+        }
+
+        // 2. Burst window management: single 15s window per combat
+        if (ctx.worthOffensiveCooldown && !runtime.burstWindowActive && !runtime.burstConsumedThisCombat)
+        {
+            runtime.burstWindowActive = true;
+            runtime.burstStartedMs = now;
+        }
+        else if (runtime.burstWindowActive && now >= runtime.burstStartedMs + 15000)
+        {
+            runtime.burstWindowActive = false;
+            runtime.burstConsumedThisCombat = true;
+            runtime.lastBurstEndMs = now;
+        }
+
+        // 3. Combat Phase Detection
+        CombatPhase phase = CombatPhase::SingleTarget;
+        // Priority 1: Emergency always preempts normal rotation, opener, and burst
+        if (ctx.botHpPct < 25.0f || (ctx.lowestAlly && ctx.lowestAllyHpPct < 25.0f))
+        {
+            phase = CombatPhase::Emergency;
+        }
+        // Priority 2: Opener phase during first 4 seconds or first 3 casts
+        else if (ctx.bot->IsInCombat() && runtime.combatStartMs != 0 && (now < runtime.combatStartMs + 4000) && runtime.successfulCombatCasts < 3 && !runtime.openerCompleted)
+        {
+            phase = CombatPhase::Opener;
+        }
+        else
+        {
+            runtime.openerCompleted = true;
+            if (strategy && strategy->detectPhase)
+            {
+                phase = strategy->detectPhase(ctx);
+            }
+            else
+            {
+                if (ctx.role == BotRole::Tank)
+                {
+                    if (strategy && strategy->recoveryThreshold > 0.0f && ctx.botPowerPct < strategy->recoveryThreshold)
+                        phase = CombatPhase::Recovery;
+                    else if (ctx.engagedEnemyCount >= 3)
+                        phase = CombatPhase::AoE;
+                    else if (ctx.engagedEnemyCount == 2)
+                        phase = CombatPhase::Cleave;
+                    else if (runtime.burstWindowActive)
+                        phase = CombatPhase::Burst;
+                    else
+                        phase = CombatPhase::SingleTarget;
+                }
+                else if (ctx.role == BotRole::Healer)
+                {
+                    if (ctx.lowestAlly && ctx.lowestAllyHpPct < 50.0f)
+                        phase = CombatPhase::Emergency;
+                    else if (strategy && strategy->recoveryThreshold > 0.0f && ctx.botPowerPct < strategy->recoveryThreshold)
+                        phase = CombatPhase::Recovery;
+                    else if (ctx.engagedEnemyCount >= 3)
+                        phase = CombatPhase::AoE;
+                    else
+                        phase = CombatPhase::SingleTarget;
+                }
+                else // DPS
+                {
+                    if (ctx.targetHpPct < 20.0f)
+                        phase = CombatPhase::Execute; // Execute outranks generic Burst
+                    else if (strategy && strategy->recoveryThreshold > 0.0f && ctx.botPowerPct < strategy->recoveryThreshold)
+                        phase = CombatPhase::Recovery;
+                    else if (runtime.burstWindowActive)
+                        phase = CombatPhase::Burst;
+                    else if (ctx.engagedEnemyCount >= 3)
+                        phase = CombatPhase::AoE;
+                    else if (ctx.engagedEnemyCount == 2)
+                        phase = CombatPhase::Cleave;
+                    else
+                        phase = CombatPhase::SingleTarget;
+                }
+            }
+        }
+        runtime.phase = phase;
+
+        for (AbilityDescriptor const& desc : abilities)
+        {
+            // State requirement gating
+            StateRequirement effReq = desc.stateRequirement;
+            if (effReq == StateRequirement::Default)
+            {
+                effReq = (strategy && strategy->HasMandatoryBaselineState()) ? StateRequirement::BaselineOnly : StateRequirement::Any;
+            }
+
+            if (stateStatus != CombatStateStatus::Ready)
+            {
+                if (effReq == StateRequirement::BaselineOnly)
+                {
+                    if (ctx.bot)
+                        LOG_DEBUG(BotAI::BotDebugLog::LoggerName(ctx.bot->GetGUID()),
+                            "ActionEvaluator: bot '{}' skipping '{}' (root spell {}) -- state requirement BaselineOnly, state not Ready.",
+                            ctx.bot->GetName(), desc.name, desc.rootSpellId);
+                    CoaTraining::Candidate(ctx.bot->GetGUID(), desc.rootSpellId, desc.name, false, 0, "state requirement");
+                    continue;
+                }
+            }
+            if (stateStatus == CombatStateStatus::TemporaryAlternate)
+            {
+                if (effReq != StateRequirement::AllowedInTemporary &&
+                    effReq != StateRequirement::EmergencyOnly &&
+                    effReq != StateRequirement::Any)
+                {
+                    if (ctx.bot)
+                        LOG_DEBUG(BotAI::BotDebugLog::LoggerName(ctx.bot->GetGUID()),
+                            "ActionEvaluator: bot '{}' skipping '{}' (root spell {}) -- state requirement disallows TemporaryAlternate.",
+                            ctx.bot->GetName(), desc.name, desc.rootSpellId);
+                    CoaTraining::Candidate(ctx.bot->GetGUID(), desc.rootSpellId, desc.name, false, 0, "state requirement");
+                    continue;
+                }
+            }
+
+            uint32 resolvedSpellId = SpellResolver::ResolveCastSpell(ctx.bot, desc.rootSpellId);
+            if (!resolvedSpellId)
+            {
+                if (ctx.bot)
+                    LOG_DEBUG(BotAI::BotDebugLog::LoggerName(ctx.bot->GetGUID()),
+                        "ActionEvaluator: bot '{}' skipping '{}' (root spell {}) -- SpellResolver::ResolveSpell returned 0 (not known/resolvable).",
+                        ctx.bot->GetName(), desc.name, desc.rootSpellId);
+                CoaTraining::Candidate(ctx.bot->GetGUID(), desc.rootSpellId, desc.name, false, 0, "not known/resolvable");
+                continue;
+            }
+
+            Unit* target = ResolveTarget(ctx, desc.targetType, desc, resolvedSpellId);
+            if (!target || !target->IsAlive())
+            {
+                if (ctx.bot)
+                    LOG_DEBUG(BotAI::BotDebugLog::LoggerName(ctx.bot->GetGUID()),
+                        "ActionEvaluator: bot '{}' skipping '{}' (spell {}) -- ResolveTarget found {} (targetType {}).",
+                        ctx.bot->GetName(), desc.name, resolvedSpellId, target ? "a dead target" : "no target",
+                        uint32(desc.targetType));
+                CoaTraining::Candidate(ctx.bot->GetGUID(), resolvedSpellId, desc.name, false, 0, "target condition");
+                continue;
+            }
+
+            if (!CanCast(ctx, desc, resolvedSpellId, target))
+                continue;
+
+            float score = ScoreAbility(ctx, desc, target, strategy, phase);
+            if (score <= 0.0f)
+            {
+                LOG_DEBUG(BotAI::BotDebugLog::LoggerName(ctx.bot->GetGUID()),
+                    "ActionEvaluator: bot '{}' skipping '{}' (spell {}) -- score <= 0.",
+                    ctx.bot->GetName(), desc.name, resolvedSpellId);
+                CoaTraining::Candidate(ctx.bot->GetGUID(), resolvedSpellId, desc.name, false, 0, "score <= 0");
+                continue;
+            }
+
+            // Apply phase score modifiers from strategy
+            if (strategy)
+            {
+                auto it = strategy->phaseModifiers.find(phase);
+                if (it != strategy->phaseModifiers.end())
+                {
+                    for (PhaseScoreModifier const& mod : it->second)
+                    {
+                        if (HasTag(desc.tags, mod.tag))
+                        {
+                            score = (score * mod.multiplier) + mod.additive;
+                        }
+                    }
+                }
+            }
+
+            CoaTraining::Candidate(ctx.bot->GetGUID(), resolvedSpellId, desc.name, true, score, "eligible");
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestAction.spellId = resolvedSpellId;
+                bestAction.rootSpellId = desc.rootSpellId;
+                bestAction.target = target;
+                bestAction.score = score;
+                bestAction.tags = desc.tags;
+                bestAction.name = desc.name;
+                bestAction.reason = "highest utility score";
+                bestAction.internalThrottleMs = desc.internalThrottleMs;
+            }
+        }
+
+        if (ctx.bot)
+        {
+            if (bestAction.IsValid())
+                LOG_DEBUG(BotAI::BotDebugLog::LoggerName(ctx.bot->GetGUID()),
+                    "ActionEvaluator: bot '{}' chose '{}' (spell {}, score {:.1f}, reason: {}) on target '{}'.",
+                    ctx.bot->GetName(), bestAction.name, bestAction.spellId, bestAction.score, bestAction.reason,
+                    bestAction.target ? bestAction.target->GetName() : "<none>");
+            else
+                LOG_DEBUG(BotAI::BotDebugLog::LoggerName(ctx.bot->GetGUID()),
+                    "ActionEvaluator: bot '{}' found no usable action among {} candidate abilities.",
+                    ctx.bot->GetName(), abilities.size());
+        }
+
+        return bestAction;
+    }
+}

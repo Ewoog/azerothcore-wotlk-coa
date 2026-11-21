@@ -1,0 +1,1705 @@
+From db76f291e1163124f75c19520cce56fbd5cec862 Mon Sep 17 00:00:00 2001
+From: Ewoog <Ewoog@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 20:53:56 -0600
+Subject: [PATCH 1/4] Add grouped-companion inventory cleanup
+
+Bots grouped with a real player sell grey junk and outgrown white or
+green gear when a vendor is already within 20 yards, even if their bags
+are not nearly full. Opening a vendor (or gossip on a vendor NPC) makes
+nearby grouped bots sell too. .botcmd inventory <guid|all> and the
+COABOT INVENTORY verb force the same sweep and report gold earned.
+Blues and better are kept unless bags are down to two free slots.
+The command and vendor-open hook never destroy items in the field;
+destruction without a vendor still only happens when bags are completely
+full. Sales honor OnPlayerCanSellItem. New keys (all default on):
+CoaBots.Inventory.SellWhenNearVendor, SellOnLeaderVendor, KeepQuality=3.
+---
+ module/conf/mod_coa_playerbots.conf.dist |  28 ++++
+ module/src/BotAI.cpp                     | 164 +++++++++++++++++++----
+ module/src/BotAI.h                       |  27 ++++
+ module/src/BotAddonChat.cpp              |  10 ++
+ module/src/BotCommand.cpp                |  80 +++++++++++
+ module/src/BotMgr.cpp                    |   3 +
+ module/src/BotMgr.h                      |   6 +
+ module/src/BotWorldScript.cpp            |  29 +++-
+ 8 files changed, 318 insertions(+), 29 deletions(-)
+
+diff --git a/module/conf/mod_coa_playerbots.conf.dist b/module/conf/mod_coa_playerbots.conf.dist
+index 631e710..1795f2c 100644
+--- a/module/conf/mod_coa_playerbots.conf.dist
++++ b/module/conf/mod_coa_playerbots.conf.dist
+@@ -278,6 +278,34 @@ CoaBots.AI.IdleIntervalMs = 250
+ 
+ CoaBots.Trade.Enable = 1
+ 
++#
++# INVENTORY
++#
++#    CoaBots.Inventory.SellWhenNearVendor
++#        Description: When a bot is grouped with a real player and a vendor is within 20 yards,
++#                     sell grey junk and outgrown white/green gear even if the bags are not nearly
++#                     full. Solo bots still wait until they have two free slots or fewer. 0 keeps
++#                     the old "only when nearly full" gate for grouped bots too.
++#        Default:     1
++#
++#    CoaBots.Inventory.SellOnLeaderVendor
++#        Description: When a real player in the group opens a vendor (or gossip on a vendor NPC),
++#                     grouped bots within 20 yards of that vendor sell their junk. 0 turns the hook
++#                     off; SellWhenNearVendor still applies on the regular 10-second scan.
++#        Default:     1
++#
++#    CoaBots.Inventory.KeepQuality
++#        Description: Gear of this quality or better (3 = rare/blue) is not sold as "outgrown"
++#                     unless the bot has two free bag slots or fewer. Greys are always sold.
++#                     Quest items, trade goods, profession tools, bags and consumables are never
++#                     sold. 0 = Poor, 1 = Common, 2 = Uncommon, 3 = Rare, 4 = Epic.
++#        Default:     3
++#
++
++CoaBots.Inventory.SellWhenNearVendor = 1
++CoaBots.Inventory.SellOnLeaderVendor = 1
++CoaBots.Inventory.KeepQuality = 3
++
+ #
+ #    CoaBots.MarkSessionsAsBots
+ #        Description: Mark companion sessions as bots, so the server skips per-client work they have no client for
+diff --git a/module/src/BotAI.cpp b/module/src/BotAI.cpp
+index 0c81114..4e34596 100644
+--- a/module/src/BotAI.cpp
++++ b/module/src/BotAI.cpp
+@@ -115,6 +115,7 @@
+ #include "QuestDef.h"
+ #include "ScriptMgr.h"
+ #include "SharedDefines.h"
++#include "StringFormat.h"
+ #include "SpellAuraEffects.h"
+ #include "SpellInfo.h"
+ #include "Spell.h"
+@@ -1149,12 +1150,41 @@ bool HasGearBelowRepairThreshold(Player* bot)
+     return false;
+ }
+ 
++// True when this group contains at least one online, non-bot player. The relaxed "sell when a
++// vendor is already within 20 yards" gate is only for companions travelling with a person, not
++// for a pack of ungrouped or bot-only party members.
++bool GroupedWithRealPlayer(Player* bot)
++{
++    Group* group = bot->GetGroup();
++    if (!group)
++        return false;
++    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
++    {
++        Player* member = ref->GetSource();
++        if (!member || member == bot || !member->GetSession())
++            continue;
++        if (!BotMgr::IsBotAccountId(member->GetSession()->GetAccountId()))
++            return true;
++    }
++    return false;
++}
++
++bool CanSweepInventory(Player const* bot)
++{
++    return bot && bot->IsAlive() && bot->IsInWorld()
++        && !bot->IsInCombat()
++        && !bot->IsBeingTeleported()
++        && !bot->GetTradeData()
++        && bot->GetLootGUID().IsEmpty();
++}
++
+ // True grey vendor trash, OR gear this bot could equip but has already been superseded in that
+ // exact slot -- the same "is this an upgrade" comparison TryUpgradeGearOnce makes, just answering
+ // the opposite question. Shared by HasSellableJunk (the ambient "go find a vendor" signal) and
+ // TryMaintainEquipment's actual clearing pass, so the two can never disagree about what counts.
+-// Deliberately does NOT touch Trade Goods (ore/herbs/cloth/etc) -- those are worth real money or
+-// a guild bank deposit, never vendor trash, see BotMgr::DepositLooseResourcesToGuildBank.
++// Never touches quest items, trade goods, profession tools, bags, consumables, or archived gear.
++// Blue (or whatever CoaBots.Inventory.KeepQuality is set to) and better superseded gear is kept
++// unless the bags are down to BAG_CLEANUP_FREE_SLOT_THRESHOLD free slots or fewer.
+ bool IsClutterItem(Player* bot, Item const* item, BotRole role)
+ {
+     if (!item || BotGear::Archived(item))
+@@ -1163,11 +1193,16 @@ bool IsClutterItem(Player* bot, Item const* item, BotRole role)
+     if (!proto)
+         return false;
+ 
++    if (proto->Class == ITEM_CLASS_QUEST || proto->StartQuest || proto->Bonding == BIND_QUEST_ITEM ||
++        proto->Bonding == BIND_QUEST_ITEM1 || bot->HasQuestForItem(proto->ItemId))
++        return false;
++    if (proto->Class == ITEM_CLASS_TRADE_GOODS || proto->Class == ITEM_CLASS_CONTAINER ||
++        proto->Class == ITEM_CLASS_CONSUMABLE || BotAI::IsProfessionTool(proto))
++        return false;
++
+     if (proto->Quality == ITEM_QUALITY_POOR && proto->SellPrice > 0)
+         return true;
+ 
+-    if (BotAI::IsProfessionTool(proto))
+-        return false;
+     if (proto->Class != ITEM_CLASS_ARMOR && proto->Class != ITEM_CLASS_WEAPON)
+         return false;
+ 
+@@ -1181,7 +1216,13 @@ bool IsClutterItem(Player* bot, Item const* item, BotRole role)
+ 
+     // Same 5% margin as TryUpgradeGearOnce, inverted: anything that wouldn't even count as an
+     // upgrade there is dead weight here.
+-    return ScoreItemForBot(bot, proto, role) <= ScoreItemForBot(bot, current->GetTemplate(), role) * 1.05f;
++    if (ScoreItemForBot(bot, proto, role) > ScoreItemForBot(bot, current->GetTemplate(), role) * 1.05f)
++        return false;
++
++    uint32 const keepQuality = sBotMgr->InventoryKeepQuality();
++    if (proto->Quality >= keepQuality && bot->GetFreeInventorySpace() > BAG_CLEANUP_FREE_SLOT_THRESHOLD)
++        return false;
++    return true;
+ }
+ 
+ // The ambient Vendor errand only makes sense when a vendor can actually help: this module only
+@@ -1206,13 +1247,17 @@ bool HasSellableJunk(Player* bot, BotRole role)
+ }
+ 
+ // force skips the "only bother once nearly full" opportunistic gate below -- for a caller that
+-// needs bag space right now (a guild task about to start, or TakeAllLoot finding zero room for
+-// whatever it's about to hand the bot) rather than whenever a vendor happens to be nearby anyway.
+-// The *destroy-with-no-vendor* safety gate further down stays in effect either way: force never
+-// makes this throw away items it wouldn't otherwise have thrown away, it only makes it check
+-// sooner.
+-void TryMaintainEquipment(Player* bot, BotRole role, bool force)
++// needs bag space right now (a guild task about to start, TakeAllLoot finding zero room, or a
++// player telling the bot to clean its bags). The *destroy-with-no-vendor* safety gate further
++// down stays in effect when allowDestroy is true: force never makes this throw away items it
++// wouldn't otherwise have thrown away, it only makes it check sooner. allowDestroy is false
++// for the command and the "leader opened a vendor" hook, so those paths never destroy in the field.
++// Grouped bots travelling with a real player also skip the nearly-full gate when a vendor is
++// already within VENDOR_SEARCH_RADIUS (CoaBots.Inventory.SellWhenNearVendor).
++BotAI::InventorySweepResult TryMaintainEquipment(Player* bot, BotRole role, bool force, bool allowDestroy = true)
+ {
++    BotAI::InventorySweepResult result;
++
+     if (HasGearBelowRepairThreshold(bot))
+     {
+         Creature* repairNpc = nullptr;
+@@ -1238,23 +1283,27 @@ void TryMaintainEquipment(Player* bot, BotRole role, bool force)
+         }
+     }
+ 
+-    if (!force && bot->GetFreeInventorySpace() > BAG_CLEANUP_FREE_SLOT_THRESHOLD)
+-        return;
++    // Selling and destroying stay out of combat, trades, teleports, and open loot windows.
++    // Repair above is unchanged: it still runs when an armorer is already in range.
++    if (!CanSweepInventory(bot))
++        return result;
+ 
+     Creature* vendorNpc = nullptr;
+     VendorNpcCheck vendorCheck(bot, VENDOR_SEARCH_RADIUS);
+     Acore::CreatureLastSearcher<VendorNpcCheck> vendorSearcher(bot, vendorNpc, vendorCheck);
+     Cell::VisitObjects(bot, vendorSearcher, VENDOR_SEARCH_RADIUS);
+ 
+-    // No vendor nearby: only force clutter out as a last resort once bags are truly full --
+-    // otherwise leave it for a later scan that might catch a vendor instead. This safety gate
+-    // applies even when the caller asked for `force`: skipping the opportunistic gate above is
+-    // not the same as being allowed to destroy things it wouldn't otherwise destroy.
+-    if (!vendorNpc && bot->GetFreeInventorySpace() > 0)
+-        return;
++    bool skipNearlyFullGate = force;
++    if (!skipNearlyFullGate && vendorNpc && sBotMgr->InventorySellWhenNearVendor() && GroupedWithRealPlayer(bot))
++        skipNearlyFullGate = true;
++    if (!skipNearlyFullGate && bot->GetFreeInventorySpace() > BAG_CLEANUP_FREE_SLOT_THRESHOLD)
++        return result;
+ 
+-    uint32 totalEarned = 0;
+-    uint32 itemsCleared = 0;
++    // No vendor nearby: only force clutter out as a last resort once bags are truly full --
++    // otherwise leave it for a later scan that might catch a vendor instead. The command and
++    // the vendor-open hook set allowDestroy to false so they never take this branch.
++    if (!vendorNpc && (!allowDestroy || bot->GetFreeInventorySpace() > 0))
++        return result;
+ 
+     auto clearIfJunk = [&](Item* item) -> bool
+     {
+@@ -1264,14 +1313,22 @@ void TryMaintainEquipment(Player* bot, BotRole role, bool force)
+         if (item->IsNotEmptyBag() || item->IsRefundable() || bot->GetLootGUID() == item->GetGUID())
+             return false;
+ 
+-        if (vendorNpc && proto->SellPrice > 0 && sScriptMgr->OnPlayerCanSellItem(bot, item, vendorNpc))
++        if (vendorNpc)
+         {
++            // Honor OnPlayerCanSellItem: if another module (or the core) refuses the sale, leave
++            // the stack alone rather than destroying it for no gold.
++            if (proto->SellPrice <= 0 || !sScriptMgr->OnPlayerCanSellItem(bot, item, vendorNpc))
++                return false;
+             uint32 money = proto->SellPrice * item->GetCount();
+             bot->ModifyMoney(money);
+-            totalEarned += money;
++            result.copperEarned += money;
++            bot->DestroyItem(item->GetBagSlot(), item->GetSlot(), true);
++            ++result.stacksSold;
++            return true;
+         }
++
+         bot->DestroyItem(item->GetBagSlot(), item->GetSlot(), true);
+-        ++itemsCleared;
++        ++result.stacksDestroyed;
+         return true;
+     };
+ 
+@@ -1287,15 +1344,16 @@ void TryMaintainEquipment(Player* bot, BotRole role, bool force)
+             clearIfJunk(pBag->GetItemByPos(j));
+     }
+ 
+-    if (itemsCleared)
++    if (result.stacksSold || result.stacksDestroyed)
+     {
+         if (vendorNpc)
+             LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotAI: bot '{}' sold {} junk item stack(s) to '{}' for {} copper.",
+-                bot->GetName(), itemsCleared, vendorNpc->GetName(), totalEarned);
++                bot->GetName(), result.stacksSold, vendorNpc->GetName(), result.copperEarned);
+         else
+             LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotAI: bot '{}' destroyed {} junk item stack(s) (bags full, no vendor nearby).",
+-                bot->GetName(), itemsCleared);
++                bot->GetName(), result.stacksDestroyed);
+     }
++    return result;
+ }
+ 
+ // Confirmed live -- explicit user pushback on the original design: auto-signing the moment a
+@@ -5806,7 +5864,57 @@ void MaintainEquipmentNow(Player* bot)
+ 
+ void PrepareBagsForTask(Player* bot)
+ {
+-    TryMaintainEquipment(bot, GetRole(bot->GetGUID()), true);
++    TryMaintainEquipment(bot, GetRole(bot->GetGUID()), true, true);
++}
++
++InventorySweepResult SweepInventory(Player* bot, bool force, bool allowDestroy)
++{
++    InventorySweepResult result;
++    if (!bot)
++        return result;
++    return TryMaintainEquipment(bot, GetRole(bot->GetGUID()), force, allowDestroy);
++}
++
++std::string DescribeInventorySweep(Player const* bot, InventorySweepResult const& result)
++{
++    if (!bot)
++        return "BotMgr: no bot.";
++    if (!result.stacksSold && !result.stacksDestroyed)
++        return Acore::StringFormat("BotMgr: bot '{}' had nothing to sell.", bot->GetName());
++    return Acore::StringFormat("BotMgr: bot '{}' sold {} stack(s) for {}g {}s {}c and destroyed {} stack(s).",
++        bot->GetName(), result.stacksSold, result.copperEarned / 10000, (result.copperEarned / 100) % 100,
++        result.copperEarned % 100, result.stacksDestroyed);
++}
++
++void OnPlayerOpenedVendor(Player* player, Creature* vendor)
++{
++    if (!player || !vendor || !player->GetSession() || !sBotMgr->InventorySellOnLeaderVendor())
++        return;
++    if (BotMgr::IsBotAccountId(player->GetSession()->GetAccountId()))
++        return;
++    if (!vendor->IsAlive() || !vendor->IsVendor())
++        return;
++    Group* group = player->GetGroup();
++    if (!group)
++        return;
++
++    // Gossip hello and SendListInventory can fire back-to-back for the same NPC; don't sweep twice.
++    uint32 const now = getMSTime();
++    static std::unordered_map<ObjectGuid, uint32> lastSweepAt;
++
++    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
++    {
++        Player* member = ref->GetSource();
++        if (!member || member == player || !sBotMgr->FindBotPlayer(member->GetGUID().GetCounter()))
++            continue;
++        if (member->GetMap() != vendor->GetMap() || !member->IsWithinDistInMap(vendor, 20.0f))
++            continue;
++        uint32& lastAt = lastSweepAt[member->GetGUID()];
++        if (lastAt && getMSTimeDiff(lastAt, now) < 2000)
++            continue;
++        lastAt = now;
++        TryMaintainEquipment(member, GetRole(member->GetGUID()), true, false);
++    }
+ }
+ 
+ bool IsInCity(Player const* bot)
+diff --git a/module/src/BotAI.h b/module/src/BotAI.h
+index 61cd7bc..51c1871 100644
+--- a/module/src/BotAI.h
++++ b/module/src/BotAI.h
+@@ -13,7 +13,10 @@
+ #include "Define.h"
+ #include "ObjectGuid.h"
+ 
++#include <string>
++
+ class ChatHandler;
++class Creature;
+ class Player;
+ struct ItemTemplate;
+ struct Loot;
+@@ -81,6 +84,30 @@ namespace BotAI
+     bool IsInCity(Player const* bot);
+     void TryMountForTravel(Player* bot);
+ 
++    // One pass of selling or destroying bag clutter. copperEarned is only set for stacks
++    // actually sold to a vendor (OnPlayerCanSellItem passed and the item had a sell price).
++    struct InventorySweepResult
++    {
++        uint32 copperEarned = 0;
++        uint32 stacksSold = 0;
++        uint32 stacksDestroyed = 0;
++    };
++
++    // Sells grey junk and outgrown white/green gear to a vendor within 20 yards. Blue or
++    // better gear is kept unless the bot has two free bag slots or fewer. `force` skips the
++    // "only when bags are nearly full" gate (the .botcmd inventory command and the hook that
++    // fires when a grouped player opens a vendor both use it). Destruction without a vendor
++    // still only happens when bags are completely full, and only when `allowDestroy` is true
++    // -- the command and hook leave that off so they never throw items away in the field.
++    InventorySweepResult SweepInventory(Player* bot, bool force = true, bool allowDestroy = false);
++    // One line for the commander: gold earned and stacks sold or destroyed, or "had nothing to sell".
++    std::string DescribeInventorySweep(Player const* bot, InventorySweepResult const& result);
++
++    // A real (non-bot) player in a group opened a vendor, or gossip on a vendor NPC. Grouped
++    // bots within 20 yards of that vendor sell their junk if CoaBots.Inventory.SellOnLeaderVendor
++    // is on. Silent: the command and the COABOT INVENTORY verb are what report the result.
++    void OnPlayerOpenedVendor(Player* player, Creature* vendor);
++
+     // Forces an immediate junk/obsolete-gear sweep (sell to a vendor standing right there, else
+     // destroy only if bags are truly out of room), skipping MaintainEquipmentNow's "only bother
+     // once nearly full" opportunistic gate. For a caller that needs bag space *now* rather than
+diff --git a/module/src/BotAddonChat.cpp b/module/src/BotAddonChat.cpp
+index e9707ba..a6ea773 100644
+--- a/module/src/BotAddonChat.cpp
++++ b/module/src/BotAddonChat.cpp
+@@ -437,6 +437,16 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
+         BotAI::GetFarm(bot->GetGUID(), entry, radius, mapId);
+         SendCoaBotReply(commander, "FARM:" + std::to_string(botGuidLow) + ":" + std::to_string(entry) + ":" + std::to_string(uint32(radius)));
+     }
++    else if (verb == "INVENTORY")
++    {
++        // INVENTORY:<botGuidLow> -- sell junk to a vendor within 20 yards. Never destroys
++        // items in the field. Replies INVENTORY:<guid>:<copper>:<sold>:<destroyed>.
++        BotAI::InventorySweepResult const result = BotAI::SweepInventory(bot, true, false);
++        SendCoaBotReply(commander, "INVENTORY:" + std::to_string(botGuidLow) + ":" +
++            std::to_string(result.copperEarned) + ":" + std::to_string(result.stacksSold) + ":" +
++            std::to_string(result.stacksDestroyed));
++        ChatHandler(commander->GetSession()).SendSysMessage(BotAI::DescribeInventorySweep(bot, result));
++    }
+     else if (verb == "SETROLE" && parts.size() >= 3)
+         sBotMgr->SetRole(botGuidLow, parts[2], nullptr);
+     else if (verb == "LEARNSPEC" && parts.size() >= 3)
+diff --git a/module/src/BotCommand.cpp b/module/src/BotCommand.cpp
+index 2a9745a..3378b2e 100644
+--- a/module/src/BotCommand.cpp
++++ b/module/src/BotCommand.cpp
+@@ -22,6 +22,7 @@
+ #include "Chat.h"
+ #include "CommandScript.h"
+ #include "Creature.h"
++#include "Group.h"
+ #include "GameTime.h"
+ #include "LFGMgr.h"
+ #include "ObjectAccessor.h"
+@@ -30,6 +31,7 @@
+ #include "Player.h"
+ #include "RBAC.h"
+ #include "ScriptMgr.h"
++#include <cstdlib>
+ #include <sstream>
+ #include <string>
+ #include <vector>
+@@ -87,6 +89,7 @@ public:
+             { "stopattack",   HandleBotStopAttackCommand,   rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+             { "farm",         HandleBotFarmCommand,         rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
+             { "farmstop",     HandleBotFarmStopCommand,     rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
++            { "inventory",    HandleBotInventoryCommand,    rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
+             { "kill",         HandleBotKillCommand,         rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+             { "suspend",      HandleBotSuspendCommand,      rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+             { "resume",       HandleBotResumeCommand,       rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+@@ -907,6 +910,83 @@ public:
+         return true;
+     }
+ 
++    // `.botcmd inventory <guid|all>`: grouped bots sell junk to a vendor within 20 yards.
++    // `all` is every online bot in the commanding player's group. In-game only (Console::No).
++    // Never destroys items in the field -- see BotAI::SweepInventory.
++    static bool HandleBotInventoryCommand(ChatHandler* handler, Tail args)
++    {
++        Player* commander = handler->GetPlayer();
++        if (!commander)
++        {
++            handler->SendSysMessage("BotMgr: .botcmd inventory needs an in-game player.");
++            return true;
++        }
++
++        std::string raw(args);
++        while (!raw.empty() && raw.front() == ' ')
++            raw.erase(raw.begin());
++        while (!raw.empty() && raw.back() == ' ')
++            raw.pop_back();
++        if (raw.empty())
++        {
++            handler->SendSysMessage("Usage: .botcmd inventory <guid|all>");
++            return true;
++        }
++
++        auto runOne = [&](Player* bot)
++        {
++            BotAI::InventorySweepResult const result = BotAI::SweepInventory(bot, true, false);
++            handler->SendSysMessage(BotAI::DescribeInventorySweep(bot, result));
++            return result;
++        };
++
++        if (raw == "all" || raw == "ALL")
++        {
++            Group* group = commander->GetGroup();
++            if (!group)
++            {
++                handler->SendSysMessage("BotMgr: you are not in a group.");
++                return true;
++            }
++
++            uint32 bots = 0, sold = 0, destroyed = 0, copper = 0;
++            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
++            {
++                Player* member = ref->GetSource();
++                if (!member || member == commander || !sBotMgr->FindBotPlayer(member->GetGUID().GetCounter()))
++                    continue;
++                BotAI::InventorySweepResult const result = runOne(member);
++                ++bots;
++                sold += result.stacksSold;
++                destroyed += result.stacksDestroyed;
++                copper += result.copperEarned;
++            }
++            if (!bots)
++                handler->SendSysMessage("BotMgr: no online bots are in your group.");
++            else if (bots > 1)
++                handler->PSendSysMessage("BotMgr: {} bot(s) sold {} stack(s) for {}g {}s {}c and destroyed {} stack(s).",
++                    bots, sold, copper / 10000, (copper / 100) % 100, copper % 100, destroyed);
++            return true;
++        }
++
++        char* end = nullptr;
++        unsigned long const guid = std::strtoul(raw.c_str(), &end, 10);
++        if (!guid || (end && *end))
++        {
++            handler->SendSysMessage("Usage: .botcmd inventory <guid|all>");
++            return true;
++        }
++
++        Player* bot = sBotMgr->FindBotPlayer(ObjectGuid::LowType(guid));
++        if (!bot)
++        {
++            handler->PSendSysMessage("BotMgr: no online bot with guid {}.", guid);
++            return true;
++        }
++        runOne(bot);
++        return true;
++    }
++
+     static bool HandleBotKillCommand(ChatHandler* handler, ObjectGuid::LowType charLowGuid)
+     {
+         sBotMgr->Kill(charLowGuid, handler);
+diff --git a/module/src/BotMgr.cpp b/module/src/BotMgr.cpp
+index fffe6d6..fada053 100644
+--- a/module/src/BotMgr.cpp
++++ b/module/src/BotMgr.cpp
+@@ -3557,6 +3557,9 @@ void BotMgr::Update(uint32 diff)
+         _aiIdleIntervalMs = sConfigMgr->GetOption<uint32>("CoaBots.AI.IdleIntervalMs", 250);
+         _tradeEnabled = sConfigMgr->GetOption<bool>("CoaBots.Trade.Enable", true);
+         _autoLootInGroup = sConfigMgr->GetOption<bool>("CoaBots.Loot.AutoLootInGroup", false);
++        _inventorySellWhenNearVendor = sConfigMgr->GetOption<bool>("CoaBots.Inventory.SellWhenNearVendor", true);
++        _inventorySellOnLeaderVendor = sConfigMgr->GetOption<bool>("CoaBots.Inventory.SellOnLeaderVendor", true);
++        _inventoryKeepQuality = sConfigMgr->GetOption<uint32>("CoaBots.Inventory.KeepQuality", 3);
+     }
+     {
+         CoaBotPerf::Scope scope(CoaBotPerf::Metric::ManagerTrades);
+diff --git a/module/src/BotMgr.h b/module/src/BotMgr.h
+index c00ac7c..dd4e140 100644
+--- a/module/src/BotMgr.h
++++ b/module/src/BotMgr.h
+@@ -576,6 +576,9 @@ private:
+     std::unordered_map<ObjectGuid, uint32> _tradeAgeMs;
+     bool _tradeEnabled = true;
+     bool _autoLootInGroup = false;
++    bool _inventorySellWhenNearVendor = true;
++    bool _inventorySellOnLeaderVendor = true;
++    uint32 _inventoryKeepQuality = 3;
+     void UpdateTrades(uint32 diff);
+     std::mutex _killEventLock;
+     std::vector<KillEvent> _killEvents;
+@@ -591,6 +594,9 @@ public:
+     // already-running server without needing a restart.
+     void QueueAllBotsForAutoLogin();
+     bool AutoLootInGroup() const { return _autoLootInGroup; }
++    bool InventorySellWhenNearVendor() const { return _inventorySellWhenNearVendor; }
++    bool InventorySellOnLeaderVendor() const { return _inventorySellOnLeaderVendor; }
++    uint32 InventoryKeepQuality() const { return _inventoryKeepQuality; }
+ };
+ 
+ #define sBotMgr BotMgr::instance()
+diff --git a/module/src/BotWorldScript.cpp b/module/src/BotWorldScript.cpp
+index 05fcf98..6d577c5 100644
+--- a/module/src/BotWorldScript.cpp
++++ b/module/src/BotWorldScript.cpp
+@@ -12,9 +12,11 @@
+ #include "DangerMap.h"
+ #include "world/encounters/WorldEncounterDirector.h"
+ #include "Config.h"
++#include "AllCreatureScript.h"
+ #include "Creature.h"
+ #include "KillRewarder.h"
+ #include "Log.h"
++#include "ObjectAccessor.h"
+ #include "Group.h"
+ #include "Player.h"
+ #include "PlayerScript.h"
+@@ -93,7 +95,15 @@ public:
+ class coa_playerbots_playerscript : public PlayerScript
+ {
+ public:
+-    coa_playerbots_playerscript() : PlayerScript("coa_playerbots_playerscript", { PLAYERHOOK_ON_REWARD_KILL_REWARDER, PLAYERHOOK_ON_LOGOUT, PLAYERHOOK_ON_PLAYER_KILLED_BY_CREATURE, PLAYERHOOK_ON_PLAYER_JUST_DIED, PLAYERHOOK_ON_LOOT_ITEM, PLAYERHOOK_ON_LEARN_SPELL, PLAYERHOOK_ON_LEVEL_CHANGED }) { }
++    coa_playerbots_playerscript() : PlayerScript("coa_playerbots_playerscript", { PLAYERHOOK_ON_REWARD_KILL_REWARDER, PLAYERHOOK_ON_LOGOUT, PLAYERHOOK_ON_PLAYER_KILLED_BY_CREATURE, PLAYERHOOK_ON_PLAYER_JUST_DIED, PLAYERHOOK_ON_LOOT_ITEM, PLAYERHOOK_ON_LEARN_SPELL, PLAYERHOOK_ON_LEVEL_CHANGED, PLAYERHOOK_ON_SEND_LIST_INVENTORY }) { }
++
++    void OnPlayerSendListInventory(Player* player, ObjectGuid vendorGuid, uint32& /*vendorEntry*/) override
++    {
++        if (!player || vendorGuid.IsEmpty())
++            return;
++        if (Creature* vendor = ObjectAccessor::GetCreature(*player, vendorGuid))
++            BotAI::OnPlayerOpenedVendor(player, vendor);
++    }
+ 
+     void OnPlayerLootItem(Player* player, Item*, uint32 count, ObjectGuid lootGuid) override
+     {
+@@ -205,8 +215,25 @@ public:
+     }
+ };
+ 
++// Fires when a player talks to a vendor that has a gossip menu (trainers with a Browse goods
++// option, innkeepers, and so on). OnPlayerSendListInventory covers the vendor window itself.
++// Always returns false so the gossip menu still opens.
++class coa_playerbots_vendor_gossip_script : public AllCreatureScript
++{
++public:
++    coa_playerbots_vendor_gossip_script() : AllCreatureScript("coa_playerbots_vendor_gossip_script") { }
++
++    bool CanCreatureGossipHello(Player* player, Creature* creature) override
++    {
++        if (creature && creature->IsVendor())
++            BotAI::OnPlayerOpenedVendor(player, creature);
++        return false;
++    }
++};
++
+ void AddSC_coa_playerbots_worldscript()
+ {
+     new coa_playerbots_worldscript();
+     new coa_playerbots_playerscript();
++    new coa_playerbots_vendor_gossip_script();
+ }
+-- 
+2.47.3
+
+
+From f94be9f31fd7344c3bff4173006ca42d8db34acf Mon Sep 17 00:00:00 2001
+From: Ewoog <Ewoog@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 20:55:57 -0600
+Subject: [PATCH 2/4] Share quest accept and turn-in with nearby grouped bots
+
+When a real player in a group accepts a quest, grouped bots within 40
+yards take it too if they can (CanTakeQuest and CanAddQuest). When that
+player turns a quest in, bots that also have it complete hand it in,
+receive the XP and gold, and pick the reward with the existing
+PickRewardIndex scoring (ScoreItemForBot). CanRewardQuest is required,
+so a bot missing item objectives or bag space is skipped rather than
+force-completed. Bot-initiated accept and turn-in do not recurse.
+New keys, both default on: CoaBots.Quest.ShareTurnIn and ShareAccept.
+---
+ module/conf/mod_coa_playerbots.conf.dist |  22 +++
+ module/src/BotMgr.cpp                    |   2 +
+ module/src/BotMgr.h                      |   4 +
+ module/src/BotWorldScript.cpp            |  23 +++-
+ module/src/world/QuestInteraction.cpp    | 164 +++++++++++++++++++++++
+ module/src/world/QuestInteraction.h      |   8 ++
+ 6 files changed, 222 insertions(+), 1 deletion(-)
+
+diff --git a/module/conf/mod_coa_playerbots.conf.dist b/module/conf/mod_coa_playerbots.conf.dist
+index 1795f2c..18a8309 100644
+--- a/module/conf/mod_coa_playerbots.conf.dist
++++ b/module/conf/mod_coa_playerbots.conf.dist
+@@ -306,6 +306,28 @@ CoaBots.Inventory.SellWhenNearVendor = 1
+ CoaBots.Inventory.SellOnLeaderVendor = 1
+ CoaBots.Inventory.KeepQuality = 3
+ 
++#
++# QUEST SHARING
++#
++#    CoaBots.Quest.ShareTurnIn
++#        Description: When a real player in a group turns in a quest, grouped bots within 40 yards
++#                     that also have that quest complete hand it in too. They get the XP and gold
++#                     and pick the reward item that is the best upgrade for them (the same scoring
++#                     used when a solo bot turns a quest in). A bot that is missing required items,
++#                     or cannot take the reward yet, is skipped. 0 turns this off.
++#        Default:     1
++#
++#    CoaBots.Quest.ShareAccept
++#        Description: When a real player in a group accepts a quest, grouped bots within 40 yards
++#                     also take it if they can (level, race, class, prerequisites, quest log room).
++#                     Kill credit is already shared by the group; item-objective drops are not,
++#                     so a bot still has to loot those itself. 0 turns this off.
++#        Default:     1
++#
++
++CoaBots.Quest.ShareTurnIn = 1
++CoaBots.Quest.ShareAccept = 1
++
+ #
+ #    CoaBots.MarkSessionsAsBots
+ #        Description: Mark companion sessions as bots, so the server skips per-client work they have no client for
+diff --git a/module/src/BotMgr.cpp b/module/src/BotMgr.cpp
+index fada053..4d7676f 100644
+--- a/module/src/BotMgr.cpp
++++ b/module/src/BotMgr.cpp
+@@ -3560,6 +3560,8 @@ void BotMgr::Update(uint32 diff)
+         _inventorySellWhenNearVendor = sConfigMgr->GetOption<bool>("CoaBots.Inventory.SellWhenNearVendor", true);
+         _inventorySellOnLeaderVendor = sConfigMgr->GetOption<bool>("CoaBots.Inventory.SellOnLeaderVendor", true);
+         _inventoryKeepQuality = sConfigMgr->GetOption<uint32>("CoaBots.Inventory.KeepQuality", 3);
++        _questShareTurnIn = sConfigMgr->GetOption<bool>("CoaBots.Quest.ShareTurnIn", true);
++        _questShareAccept = sConfigMgr->GetOption<bool>("CoaBots.Quest.ShareAccept", true);
+     }
+     {
+         CoaBotPerf::Scope scope(CoaBotPerf::Metric::ManagerTrades);
+diff --git a/module/src/BotMgr.h b/module/src/BotMgr.h
+index dd4e140..f01aa48 100644
+--- a/module/src/BotMgr.h
++++ b/module/src/BotMgr.h
+@@ -579,6 +579,8 @@ private:
+     bool _inventorySellWhenNearVendor = true;
+     bool _inventorySellOnLeaderVendor = true;
+     uint32 _inventoryKeepQuality = 3;
++    bool _questShareTurnIn = true;
++    bool _questShareAccept = true;
+     void UpdateTrades(uint32 diff);
+     std::mutex _killEventLock;
+     std::vector<KillEvent> _killEvents;
+@@ -597,6 +599,8 @@ public:
+     bool InventorySellWhenNearVendor() const { return _inventorySellWhenNearVendor; }
+     bool InventorySellOnLeaderVendor() const { return _inventorySellOnLeaderVendor; }
+     uint32 InventoryKeepQuality() const { return _inventoryKeepQuality; }
++    bool QuestShareTurnIn() const { return _questShareTurnIn; }
++    bool QuestShareAccept() const { return _questShareAccept; }
+ };
+ 
+ #define sBotMgr BotMgr::instance()
+diff --git a/module/src/BotWorldScript.cpp b/module/src/BotWorldScript.cpp
+index 6d577c5..0b4d35d 100644
+--- a/module/src/BotWorldScript.cpp
++++ b/module/src/BotWorldScript.cpp
+@@ -1,5 +1,6 @@
+ #include "training/TrainingArenaManager.h"
+ #include "BotAI.h"
++#include "QuestInteraction.h"
+ #include "BotPerformance.h"
+ #include "BotCheckpoint.h"
+ #include "BotBenchmarkDriver.h"
+@@ -95,7 +96,7 @@ public:
+ class coa_playerbots_playerscript : public PlayerScript
+ {
+ public:
+-    coa_playerbots_playerscript() : PlayerScript("coa_playerbots_playerscript", { PLAYERHOOK_ON_REWARD_KILL_REWARDER, PLAYERHOOK_ON_LOGOUT, PLAYERHOOK_ON_PLAYER_KILLED_BY_CREATURE, PLAYERHOOK_ON_PLAYER_JUST_DIED, PLAYERHOOK_ON_LOOT_ITEM, PLAYERHOOK_ON_LEARN_SPELL, PLAYERHOOK_ON_LEVEL_CHANGED, PLAYERHOOK_ON_SEND_LIST_INVENTORY }) { }
++    coa_playerbots_playerscript() : PlayerScript("coa_playerbots_playerscript", { PLAYERHOOK_ON_REWARD_KILL_REWARDER, PLAYERHOOK_ON_LOGOUT, PLAYERHOOK_ON_PLAYER_KILLED_BY_CREATURE, PLAYERHOOK_ON_PLAYER_JUST_DIED, PLAYERHOOK_ON_LOOT_ITEM, PLAYERHOOK_ON_LEARN_SPELL, PLAYERHOOK_ON_LEVEL_CHANGED, PLAYERHOOK_ON_SEND_LIST_INVENTORY, PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST, PLAYERHOOK_ON_PLAYER_QUEST_ACCEPT, PLAYERHOOK_ON_QUEST_GIVER_CHOOSE_REWARD }) { }
+ 
+     void OnPlayerSendListInventory(Player* player, ObjectGuid vendorGuid, uint32& /*vendorEntry*/) override
+     {
+@@ -105,6 +106,26 @@ public:
+             BotAI::OnPlayerOpenedVendor(player, vendor);
+     }
+ 
++    void OnPlayerQuestAccept(Player* player, Quest const* quest) override
++    {
++        QuestInteraction::OnCompanionLeaderAccepted(player, quest, nullptr);
++    }
++
++    // Fires at the end of RewardQuest (every turn-in path). Bots that already handed the
++    // quest in from OnPlayerQuestGiverChooseReward are skipped by their quest status.
++    void OnPlayerCompleteQuest(Player* player, Quest const* quest) override
++    {
++        QuestInteraction::OnCompanionLeaderTurnedIn(player, quest, nullptr);
++    }
++
++    // Fires when the player confirms a turn-in and we still have the quest giver. Always
++    // return false so the core still rewards the player.
++    bool OnPlayerQuestGiverChooseReward(Player* player, Object* questGiver, Quest const* quest, uint32 /*reward*/) override
++    {
++        QuestInteraction::OnCompanionLeaderTurnedIn(player, quest, questGiver);
++        return false;
++    }
++
+     void OnPlayerLootItem(Player* player, Item*, uint32 count, ObjectGuid lootGuid) override
+     {
+         if (player && player->GetSession() && player->GetSession()->IsBot())
+diff --git a/module/src/world/QuestInteraction.cpp b/module/src/world/QuestInteraction.cpp
+index 703083a..b8a6648 100644
+--- a/module/src/world/QuestInteraction.cpp
++++ b/module/src/world/QuestInteraction.cpp
+@@ -1,8 +1,13 @@
+ #include "engine/BotDebugLog.h"
+ #include "QuestInteraction.h"
+ #include "BotAI.h"
++#include "BotMgr.h"
++#include "CellImpl.h"
+ #include "Creature.h"
+ #include "GameObject.h"
++#include "GridNotifiers.h"
++#include "GridNotifiersImpl.h"
++#include "Group.h"
+ #include "IQuestObjectiveHandler.h"
+ #include "ItemTemplate.h"
+ #include "ObjectAccessor.h"
+@@ -474,4 +479,163 @@ namespace QuestInteraction
+                 return ExecResult::Failed;
+         }
+     }
++
++    constexpr float COMPANION_SHARE_RANGE = 40.0f;
++
++    class NearbyQuestCreatureCheck
++    {
++    public:
++        NearbyQuestCreatureCheck(Player* player, uint32 questId, float range, bool turnIn)
++            : _player(player), _questId(questId), _range(range), _turnIn(turnIn) { }
++
++        bool operator()(Creature* creature)
++        {
++            if (!creature->IsAlive())
++                return false;
++            if (_turnIn ? !creature->hasInvolvedQuest(_questId) : !creature->hasQuest(_questId))
++                return false;
++            if (!_player->IsWithinDistInMap(creature, _range))
++                return false;
++            _range = _player->GetDistance(creature);
++            return true;
++        }
++
++    private:
++        Player* _player;
++        uint32 _questId;
++        float _range;
++        bool _turnIn;
++    };
++
++    class NearbyQuestGameObjectCheck
++    {
++    public:
++        NearbyQuestGameObjectCheck(Player* player, uint32 questId, float range, bool turnIn)
++            : _player(player), _questId(questId), _range(range), _turnIn(turnIn) { }
++
++        bool operator()(GameObject* object)
++        {
++            if (_turnIn ? !object->hasInvolvedQuest(_questId) : !object->hasQuest(_questId))
++                return false;
++            if (!_player->IsWithinDistInMap(object, _range))
++                return false;
++            _range = _player->GetDistance(object);
++            return true;
++        }
++
++    private:
++        Player* _player;
++        uint32 _questId;
++        float _range;
++        bool _turnIn;
++    };
++
++    Object* FindNearbyQuestObject(Player* player, uint32 questId, bool turnIn)
++    {
++        if (Unit* selected = player->GetSelectedUnit())
++        {
++            if (Creature* creature = selected->ToCreature())
++            {
++                bool matches = turnIn ? creature->hasInvolvedQuest(questId) : creature->hasQuest(questId);
++                if (creature->IsAlive() && matches && player->IsWithinDistInMap(creature, COMPANION_SHARE_RANGE))
++                    return creature;
++            }
++        }
++
++        Creature* creature = nullptr;
++        NearbyQuestCreatureCheck creatureCheck(player, questId, COMPANION_SHARE_RANGE, turnIn);
++        Acore::CreatureLastSearcher<NearbyQuestCreatureCheck> creatureSearcher(player, creature, creatureCheck);
++        Cell::VisitObjects(player, creatureSearcher, COMPANION_SHARE_RANGE);
++
++        GameObject* object = nullptr;
++        NearbyQuestGameObjectCheck objectCheck(player, questId, COMPANION_SHARE_RANGE, turnIn);
++        Acore::GameObjectLastSearcher<NearbyQuestGameObjectCheck> objectSearcher(player, object, objectCheck);
++        Cell::VisitObjects(player, objectSearcher, COMPANION_SHARE_RANGE);
++
++        if (creature && object)
++            return player->GetDistance(creature) <= player->GetDistance(object) ? static_cast<Object*>(creature) : static_cast<Object*>(object);
++        if (creature)
++            return creature;
++        if (object)
++            return object;
++        return player;
++    }
++
++    bool IsCompanionShareSource(Player* player)
++    {
++        return player && player->IsAlive() && player->IsInWorld() && player->GetSession()
++            && !BotMgr::IsBotAccountId(player->GetSession()->GetAccountId())
++            && player->GetGroup();
++    }
++
++    template<typename Fn>
++    void ForNearbyGroupedBots(Player* player, Fn const& fn)
++    {
++        Group* group = player->GetGroup();
++        if (!group)
++            return;
++        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
++        {
++            Player* member = ref->GetSource();
++            if (!member || member == player || !member->IsAlive() || !member->IsInWorld())
++                continue;
++            if (member->IsBeingTeleported() || !sBotMgr->FindBotPlayer(member->GetGUID().GetCounter()))
++                continue;
++            if (member->GetMap() != player->GetMap() || !member->IsWithinDistInMap(player, COMPANION_SHARE_RANGE))
++                continue;
++            fn(member);
++        }
++    }
++
++    void OnCompanionLeaderAccepted(Player* player, Quest const* quest, Object* giver)
++    {
++        if (!sBotMgr->QuestShareAccept() || !quest || !IsCompanionShareSource(player))
++            return;
++
++        Object* source = giver ? giver : FindNearbyQuestObject(player, quest->GetQuestId(), false);
++        ForNearbyGroupedBots(player, [&](Player* bot)
++        {
++            if (bot->GetQuestStatus(quest->GetQuestId()) != QUEST_STATUS_NONE)
++                return;
++            if (!bot->CanTakeQuest(quest, false) || !bot->CanAddQuest(quest, false))
++                return;
++            bot->AddQuestAndCheckCompletion(quest, source);
++            if (uint32 spell = quest->GetSrcSpell())
++                bot->CastSpell(bot, spell, true);
++            LOG_INFO("module.coa-playerbots.quests", "QuestSharedAccept: '{}' took quest {} '{}' because '{}' accepted it.",
++                bot->GetName(), quest->GetQuestId(), quest->GetTitle(), player->GetName());
++        });
++    }
++
++    void OnCompanionLeaderTurnedIn(Player* player, Quest const* quest, Object* giver)
++    {
++        if (!sBotMgr->QuestShareTurnIn() || !quest || !IsCompanionShareSource(player))
++            return;
++
++        Object* source = giver ? giver : FindNearbyQuestObject(player, quest->GetQuestId(), true);
++        ForNearbyGroupedBots(player, [&](Player* bot)
++        {
++            uint32 const questId = quest->GetQuestId();
++            if (bot->GetQuestRewardStatus(questId) && !quest->IsRepeatable() && !quest->IsDaily() && !quest->IsWeekly() && !quest->IsMonthly())
++                return;
++            if (bot->CanCompleteQuest(questId))
++                bot->CompleteQuest(questId);
++            if (bot->GetQuestStatus(questId) != QUEST_STATUS_COMPLETE)
++                return;
++
++            uint32 reward = PickRewardIndex(bot, quest);
++            if (!bot->CanRewardQuest(quest, reward, false) && bot->GetFreeInventorySpace() < 3)
++                BotAI::FreeBagSlots(bot, 3);
++            if (!bot->CanRewardQuest(quest, reward, false))
++            {
++                LOG_INFO("module.coa-playerbots.quests", "QuestSharedTurnInBlocked: '{}' could not hand in quest {} '{}' (choice {}, {} free bag slots).",
++                    bot->GetName(), questId, quest->GetTitle(), reward, bot->GetFreeInventorySpace());
++                return;
++            }
++
++            bot->RewardQuest(quest, reward, source, true);
++            LOG_INFO("module.coa-playerbots.quests", "QuestSharedTurnIn: '{}' handed in quest {} '{}' with '{}' (reward choice {}).",
++                bot->GetName(), questId, quest->GetTitle(), player->GetName(), reward);
++        });
++    }
+ }
+diff --git a/module/src/world/QuestInteraction.h b/module/src/world/QuestInteraction.h
+index ee77ab7..aa5e381 100644
+--- a/module/src/world/QuestInteraction.h
++++ b/module/src/world/QuestInteraction.h
+@@ -70,6 +70,14 @@ namespace QuestInteraction
+ 
+     // The time budget of an NPC task's current phase, as UpdateNpcTask enforces it (0: none).
+     uint32 PhaseBudgetMs(BrainState const& state);
++
++    // A real player in a group accepted or turned in a quest. Nearby grouped bots (40 yards)
++    // take or hand in the same quest when CoaBots.Quest.ShareAccept / ShareTurnIn is on.
++    // Turn-in uses PickRewardIndex, CanRewardQuest and RewardQuest; accept uses CanTakeQuest,
++    // CanAddQuest and AddQuestAndCheckCompletion. Bots as the source are ignored so a bot's
++    // own turn-in cannot recurse or reward the player a second time.
++    void OnCompanionLeaderAccepted(Player* player, Quest const* quest, Object* giver);
++    void OnCompanionLeaderTurnedIn(Player* player, Quest const* quest, Object* giver);
+ }
+ 
+ #endif // COA_PLAYERBOTS_QUEST_INTERACTION_H
+-- 
+2.47.3
+
+
+From 9c1458d9f74530fc7f6f26c5e5e977f3aa571f9f Mon Sep 17 00:00:00 2001
+From: Ewoog <Ewoog@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:07:58 -0600
+Subject: [PATCH 3/4] Add party bag view and manual equip commands
+
+Grouped commanders can query a bot's bags (GETBAGS), equip a bag item
+(EQUIP) or unequip a slot (UNEQUIP) over the existing COABOT channel.
+Manual equip and unequip lock that equipment slot so auto-upgrade will
+not undo the choice until UNLOCK or the bot relogs.
+---
+ module/src/BotAI.cpp        | 199 ++++++++++++++++++++++++++++++++++++
+ module/src/BotAI.h          |  53 ++++++++++
+ module/src/BotAddonChat.cpp |  84 +++++++++++++++
+ 3 files changed, 336 insertions(+)
+
+diff --git a/module/src/BotAI.cpp b/module/src/BotAI.cpp
+index 4e34596..5232df5 100644
+--- a/module/src/BotAI.cpp
++++ b/module/src/BotAI.cpp
+@@ -237,6 +237,11 @@ struct BotAIState
+     float farmAnchorX = 0.0f, farmAnchorY = 0.0f, farmAnchorZ = 0.0f;
+     uint32 farmNextScanAtMs = 0;
+ 
++    // Bit i set means EQUIPMENT_SLOT i was locked by a commander EQUIP/UNEQUIP and
++    // TryUpgradeGearOnce must leave it alone. Cleared by Forget (despawn / bot relog)
++    // or by the UNLOCK verb. See BotAI::LockEquipSlot.
++    uint32 manualEquipLockMask = 0;
++
+     // See BotAI::SetSuspended's comment in BotAI.h.
+     bool suspended = false;
+ 
+@@ -1051,6 +1056,10 @@ void TryUpgradeGearOnce(Player* bot, BotRole role)
+         if (eslot == NULL_SLOT)
+             return false;
+ 
++        // A commander-chosen piece (or an emptied slot) stays put until UNLOCK or relog.
++        if (eslot < 32 && (states[bot->GetGUID()].manualEquipLockMask & (1u << eslot)))
++            return false;
++
+         Item* current = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, eslot);
+         float newScore = ScoreItemForBot(bot, proto, role) + BotGear::PowerScore(bot, proto);
+         if (current)
+@@ -6273,6 +6282,196 @@ bool GetFarm(ObjectGuid botGuid, uint32& creatureEntry, float& radius, uint32& m
+     return true;
+ }
+ 
++char const* GearActionToken(GearActionResult result)
++{
++    switch (result)
++    {
++        case GearActionResult::Ok:       return "ok";
++        case GearActionResult::Combat:   return "combat";
++        case GearActionResult::Trade:    return "trade";
++        case GearActionResult::Teleport: return "teleport";
++        case GearActionResult::Dead:     return "dead";
++        case GearActionResult::Empty:    return "empty";
++        case GearActionResult::Invalid:  return "invalid";
++        case GearActionResult::Cannot:   return "cannot";
++        case GearActionResult::NoSpace:  return "nospace";
++    }
++    return "invalid";
++}
++
++void LockEquipSlot(ObjectGuid botGuid, uint8 slot)
++{
++    if (slot >= EQUIPMENT_SLOT_END)
++        return;
++    states[botGuid].manualEquipLockMask |= (1u << slot);
++}
++
++void UnlockEquipSlot(ObjectGuid botGuid, uint8 slot)
++{
++    if (slot >= EQUIPMENT_SLOT_END)
++        return;
++    auto itr = states.find(botGuid);
++    if (itr == states.end())
++        return;
++    itr->second.manualEquipLockMask &= ~(1u << slot);
++}
++
++void UnlockAllEquipSlots(ObjectGuid botGuid)
++{
++    auto itr = states.find(botGuid);
++    if (itr == states.end())
++        return;
++    itr->second.manualEquipLockMask = 0;
++}
++
++bool IsEquipSlotLocked(ObjectGuid botGuid, uint8 slot)
++{
++    if (slot >= EQUIPMENT_SLOT_END)
++        return false;
++    auto itr = states.find(botGuid);
++    if (itr == states.end())
++        return false;
++    return (itr->second.manualEquipLockMask & (1u << slot)) != 0;
++}
++
++uint32 GetLockedEquipMask(ObjectGuid botGuid)
++{
++    auto itr = states.find(botGuid);
++    if (itr == states.end())
++        return 0;
++    return itr->second.manualEquipLockMask;
++}
++
++namespace
++{
++GearActionResult CheckGearActionAllowed(Player* bot)
++{
++    if (!bot)
++        return GearActionResult::Invalid;
++    if (!bot->IsAlive())
++        return GearActionResult::Dead;
++    if (bot->IsInCombat())
++        return GearActionResult::Combat;
++    if (bot->GetTrader())
++        return GearActionResult::Trade;
++    if (bot->IsBeingTeleported())
++        return GearActionResult::Teleport;
++    return GearActionResult::Ok;
++}
++
++bool IsBackpackItemSlot(uint8 bag, uint8 slot)
++{
++    return bag == INVENTORY_SLOT_BAG_0
++        && slot >= INVENTORY_SLOT_ITEM_START
++        && slot < INVENTORY_SLOT_ITEM_END;
++}
++
++bool IsWornBagItemSlot(Player* bot, uint8 bag, uint8 slot)
++{
++    if (bag < INVENTORY_SLOT_BAG_START || bag >= INVENTORY_SLOT_BAG_END)
++        return false;
++    Bag* worn = bot->GetBagByPos(bag);
++    return worn && slot < worn->GetBagSize();
++}
++} // namespace
++
++GearActionResult EquipBagItem(Player* bot, uint8 bag, uint8 slot, uint8* outDestSlot)
++{
++    if (outDestSlot)
++        *outDestSlot = NULL_SLOT;
++
++    GearActionResult allowed = CheckGearActionAllowed(bot);
++    if (allowed != GearActionResult::Ok)
++        return allowed;
++
++    if (!IsBackpackItemSlot(bag, slot) && !IsWornBagItemSlot(bot, bag, slot))
++        return GearActionResult::Invalid;
++
++    Item* item = bot->GetItemByPos(bag, slot);
++    if (!item)
++        return GearActionResult::Empty;
++
++    ItemTemplate const* proto = item->GetTemplate();
++    if (!proto)
++        return GearActionResult::Invalid;
++
++    uint8 eslot = bot->FindEquipSlot(proto, NULL_SLOT, true);
++    if (eslot == NULL_SLOT)
++        return GearActionResult::Cannot;
++
++    uint16 dest = uint16(eslot) | (uint16(INVENTORY_SLOT_BAG_0) << 8);
++    if (bot->CanEquipItem(NULL_SLOT, dest, item, true) != EQUIP_ERR_OK)
++        return GearActionResult::Cannot;
++
++    bot->SwapItem(item->GetPos(), dest);
++    LockEquipSlot(bot->GetGUID(), eslot);
++    if (outDestSlot)
++        *outDestSlot = eslot;
++    return GearActionResult::Ok;
++}
++
++GearActionResult UnequipToBags(Player* bot, uint8 equipSlot)
++{
++    GearActionResult allowed = CheckGearActionAllowed(bot);
++    if (allowed != GearActionResult::Ok)
++        return allowed;
++
++    if (equipSlot >= EQUIPMENT_SLOT_END)
++        return GearActionResult::Invalid;
++
++    Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, equipSlot);
++    if (!item)
++        return GearActionResult::Empty;
++
++    ItemPosCountVec dest;
++    if (bot->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false) != EQUIP_ERR_OK)
++        return GearActionResult::NoSpace;
++
++    bot->RemoveItem(INVENTORY_SLOT_BAG_0, equipSlot, true);
++    bot->StoreItem(dest, item, true);
++    LockEquipSlot(bot->GetGUID(), equipSlot);
++    return GearActionResult::Ok;
++}
++
++void CollectBagSlots(Player* bot, std::vector<BagSlotInfo>& out)
++{
++    out.clear();
++    if (!bot)
++        return;
++
++    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
++    {
++        if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
++            out.push_back({ INVENTORY_SLOT_BAG_0, slot, item->GetEntry(), item->GetCount() });
++    }
++
++    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
++    {
++        Bag* worn = bot->GetBagByPos(bag);
++        if (!worn)
++            continue;
++        for (uint32 i = 0; i < worn->GetBagSize(); ++i)
++        {
++            if (Item* item = worn->GetItemByPos(uint8(i)))
++                out.push_back({ bag, uint8(i), item->GetEntry(), item->GetCount() });
++        }
++    }
++}
++
++void CollectBagSizes(Player* bot, uint8& backpackSlots, uint8 bagSizes[4])
++{
++    backpackSlots = INVENTORY_SLOT_ITEM_END - INVENTORY_SLOT_ITEM_START;
++    for (uint8 i = 0; i < 4; ++i)
++        bagSizes[i] = 0;
++    if (!bot)
++        return;
++    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
++    {
++        if (Bag* worn = bot->GetBagByPos(bag))
++            bagSizes[bag - INVENTORY_SLOT_BAG_START] = uint8(worn->GetBagSize());
++    }
++}
++
+ void SetSuspended(ObjectGuid botGuid, bool suspended)
+ {
+     BotAIState& state = states[botGuid];
+diff --git a/module/src/BotAI.h b/module/src/BotAI.h
+index 51c1871..8b2b97e 100644
+--- a/module/src/BotAI.h
++++ b/module/src/BotAI.h
+@@ -14,6 +14,7 @@
+ #include "ObjectGuid.h"
+ 
+ #include <string>
++#include <vector>
+ 
+ class ChatHandler;
+ class Creature;
+@@ -185,6 +186,58 @@ namespace BotAI
+     // True while the bot is farming; fills the farmed entry, radius and anchor map.
+     bool GetFarm(ObjectGuid botGuid, uint32& creatureEntry, float& radius, uint32& mapId);
+ 
++    // Result codes for EQUIP/UNEQUIP addon verbs. Wire form is "ok" or "err:<token>"
++    // with no colons inside the token (see BotAddonChat.cpp). Do not name a token
++    // "error" -- Windows headers #define ERROR.
++    enum class GearActionResult : uint8
++    {
++        Ok = 0,
++        Combat,
++        Trade,
++        Teleport,
++        Dead,
++        Empty,
++        Invalid,
++        Cannot,
++        NoSpace
++    };
++    char const* GearActionToken(GearActionResult result);
++
++    // Manual equipment locks: EQUIP and UNEQUIP set a bit on the destination / emptied
++    // slot so TryUpgradeGearOnce will not immediately undo the player's choice (swap a
++    // lower-scored item back off, or refill an emptied slot). Locks live only in the
++    // in-memory BotAIState, so they clear when the bot despawns or relogs (Forget).
++    // UNLOCK:<guid>:<slot|all> clears them while the bot stays online. Slot 0-18 only
++    // (EQUIPMENT_SLOT_*); bag containers in slots 19-22 are not locked.
++    void LockEquipSlot(ObjectGuid botGuid, uint8 slot);
++    void UnlockEquipSlot(ObjectGuid botGuid, uint8 slot);
++    void UnlockAllEquipSlots(ObjectGuid botGuid);
++    bool IsEquipSlotLocked(ObjectGuid botGuid, uint8 slot);
++    uint32 GetLockedEquipMask(ObjectGuid botGuid);
++
++    // Equip the bag item at (bag, slot). bag is INVENTORY_SLOT_BAG_0 (255) for the
++    // backpack, or 19-22 for an equipped bag. Locks the destination equipment slot on
++    // success. Refuses in combat, while trading, while teleporting, or when dead.
++    GearActionResult EquipBagItem(Player* bot, uint8 bag, uint8 slot, uint8* outDestSlot = nullptr);
++
++    // Move the item in equipment slot `equipSlot` into bags if there is room, then lock
++    // that slot so auto-upgrade does not refill it. Same combat/trade/teleport/dead
++    // refusals as EquipBagItem. Refuses to unequip a bag that still has items in it.
++    GearActionResult UnequipToBags(Player* bot, uint8 equipSlot);
++
++    // Occupied backpack and equipped-bag slots, no item names (the client uses
++    // GetItemInfo). Caller pages these into BAGS replies under the addon size limit.
++    struct BagSlotInfo
++    {
++        uint8 bag = 0;
++        uint8 slot = 0;
++        uint32 entry = 0;
++        uint32 count = 0;
++    };
++    void CollectBagSlots(Player* bot, std::vector<BagSlotInfo>& out);
++    // Backpack slot count, then the size of each equipped bag (0 if that bag slot is empty).
++    void CollectBagSizes(Player* bot, uint8& backpackSlots, uint8 bagSizes[4]);
++
+     // Immediately stops the bot's current attack and reverts any manual command to None
+     // (falls back to normal follow/idle behavior next tick).
+     void StopAttack(ObjectGuid botGuid);
+diff --git a/module/src/BotAddonChat.cpp b/module/src/BotAddonChat.cpp
+index a6ea773..3309118 100644
+--- a/module/src/BotAddonChat.cpp
++++ b/module/src/BotAddonChat.cpp
+@@ -544,6 +544,90 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
+ 
+         SendCoaBotReply(commander, "GEARPREFS:" + std::to_string(botGuidLow) + ":" + legalArmor + ":" + legalWeapon +
+             ":" + armorPrefName + ":" + weaponPrefName);
++        SendCoaBotReply(commander, "GEARLOCKS:" + std::to_string(botGuidLow) + ":" +
++            std::to_string(BotAI::GetLockedEquipMask(bot->GetGUID())));
++    }
++    else if (verb == "GETBAGS")
++    {
++        // GETBAGS:<botGuidLow> -- occupied backpack and bag slots only, no item names (the
++        // client resolves those with GetItemInfo). Replies are paged so each body stays under
++        // the 255-character addon-whisper limit. Shape:
++        //   BAGMETA:<guid>:<backpackSlots>:<bag19>:<bag20>:<bag21>:<bag22>
++        //   BAGS:<guid>:<page>:<pages>:<bag>:<slot>:<itemId>:<count>|...
++        //   BAGSEND:<guid>:<itemCount>
++        uint8 backpackSlots = 0;
++        uint8 bagSizes[4] = {};
++        BotAI::CollectBagSizes(bot, backpackSlots, bagSizes);
++        SendCoaBotReply(commander, "BAGMETA:" + std::to_string(botGuidLow) + ":" +
++            std::to_string(uint32(backpackSlots)) + ":" +
++            std::to_string(uint32(bagSizes[0])) + ":" + std::to_string(uint32(bagSizes[1])) + ":" +
++            std::to_string(uint32(bagSizes[2])) + ":" + std::to_string(uint32(bagSizes[3])));
++
++        std::vector<BotAI::BagSlotInfo> items;
++        BotAI::CollectBagSlots(bot, items);
++
++        // "COABOT\t" is prepended by SendCoaBotReply, so keep the verb body comfortably
++        // under 255. A single item chunk is at most "255:38:4294967295:4294967295|" (34).
++        constexpr std::size_t MAX_BODY = 220;
++        std::string const prefix = "BAGS:" + std::to_string(botGuidLow) + ":";
++        std::vector<std::string> pages;
++        std::string page;
++        for (BotAI::BagSlotInfo const& info : items)
++        {
++            std::string chunk = std::to_string(uint32(info.bag)) + ":" + std::to_string(uint32(info.slot)) + ":" +
++                std::to_string(info.entry) + ":" + std::to_string(info.count) + "|";
++            // Reserve room for the prefix plus "99:99:" page numbers.
++            if (!page.empty() && prefix.size() + 6 + page.size() + chunk.size() > MAX_BODY)
++            {
++                pages.push_back(page);
++                page.clear();
++            }
++            page += chunk;
++        }
++        if (!page.empty() || pages.empty())
++            pages.push_back(page);
++
++        uint32 const pageCount = uint32(pages.size());
++        for (uint32 i = 0; i < pageCount; ++i)
++        {
++            // Skip a completely empty first page when there were no items -- BAGSEND still fires.
++            if (pages[i].empty() && items.empty())
++                continue;
++            SendCoaBotReply(commander, prefix + std::to_string(i + 1) + ":" + std::to_string(pageCount) + ":" + pages[i]);
++        }
++        SendCoaBotReply(commander, "BAGSEND:" + std::to_string(botGuidLow) + ":" + std::to_string(items.size()));
++    }
++    else if (verb == "EQUIP" && parts.size() >= 4)
++    {
++        // EQUIP:<botGuidLow>:<bag>:<slot> -- bag 255 is the backpack, 19-22 an equipped bag.
++        uint8 bag = uint8(std::strtoul(parts[2].c_str(), nullptr, 10));
++        uint8 slot = uint8(std::strtoul(parts[3].c_str(), nullptr, 10));
++        BotAI::GearActionResult result = BotAI::EquipBagItem(bot, bag, slot);
++        char const* token = BotAI::GearActionToken(result);
++        SendCoaBotReply(commander, std::string("EQUIPRESULT:") + std::to_string(botGuidLow) + ":" +
++            (result == BotAI::GearActionResult::Ok ? "ok:" : "err:") + token);
++    }
++    else if (verb == "UNEQUIP" && parts.size() >= 3)
++    {
++        // UNEQUIP:<botGuidLow>:<equipSlot> -- moves the piece into bags if there is room and
++        // locks the emptied slot so auto-upgrade does not immediately refill it.
++        uint8 equipSlot = uint8(std::strtoul(parts[2].c_str(), nullptr, 10));
++        BotAI::GearActionResult result = BotAI::UnequipToBags(bot, equipSlot);
++        char const* token = BotAI::GearActionToken(result);
++        SendCoaBotReply(commander, std::string("UNEQUIPRESULT:") + std::to_string(botGuidLow) + ":" +
++            (result == BotAI::GearActionResult::Ok ? "ok:" : "err:") + token);
++    }
++    else if (verb == "UNLOCK" && parts.size() >= 3)
++    {
++        // UNLOCK:<botGuidLow>:<slot|all> -- clears a manual equipment lock so TryUpgradeGearOnce
++        // may fill or replace that slot again. "all" clears every lock on this bot.
++        if (parts[2] == "all")
++            BotAI::UnlockAllEquipSlots(bot->GetGUID());
++        else
++            BotAI::UnlockEquipSlot(bot->GetGUID(), uint8(std::strtoul(parts[2].c_str(), nullptr, 10)));
++        SendCoaBotReply(commander, "UNLOCKRESULT:" + std::to_string(botGuidLow) + ":ok:ok");
++        SendCoaBotReply(commander, "GEARLOCKS:" + std::to_string(botGuidLow) + ":" +
++            std::to_string(BotAI::GetLockedEquipMask(bot->GetGUID())));
+     }
+ }
+ 
+-- 
+2.47.3
+
+
+From cf263b8cf6b0a9a4b3206394d96dc54f09c9daa3 Mon Sep 17 00:00:00 2001
+From: Ewoog <Ewoog@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:11:20 -0600
+Subject: [PATCH 4/4] Gather herb and ore nodes while following a player
+
+Grouped bots that are following a real player will walk to a nearby
+herbalism or mining node they can actually open, cast the real gather
+spell, loot it, and resume following. Farm mode, group combat, Stay,
+and a leader more than 40 yards away all skip this. Reuses the existing
+solo-gather lock and skill checks.
+---
+ module/conf/mod_coa_playerbots.conf.dist |  24 ++++
+ module/src/BotAI.cpp                     | 169 ++++++++++++++++++++++-
+ module/src/BotMgr.cpp                    |   7 +
+ module/src/BotMgr.h                      |   4 +
+ 4 files changed, 203 insertions(+), 1 deletion(-)
+
+diff --git a/module/conf/mod_coa_playerbots.conf.dist b/module/conf/mod_coa_playerbots.conf.dist
+index 18a8309..71c0d19 100644
+--- a/module/conf/mod_coa_playerbots.conf.dist
++++ b/module/conf/mod_coa_playerbots.conf.dist
+@@ -328,6 +328,30 @@ CoaBots.Inventory.KeepQuality = 3
+ CoaBots.Quest.ShareTurnIn = 1
+ CoaBots.Quest.ShareAccept = 1
+ 
++#
++# GATHERING WHILE FOLLOWING
++#
++#    CoaBots.Gather.WhileFollowing
++#        Description: When a bot is following a real player, it will opportunistically gather
++#                     herbalism and mining nodes it passes if it has the matching profession
++#                     and enough skill for the node (the same lock/skill check a player uses).
++#                     The bot must be out of combat, nobody in the group may be in combat, the
++#                     leader must be within 40 yards, and the bot must have bag space. It walks
++#                     to the node, casts the real gather spell (skill-ups apply normally), loots,
++#                     then resumes following. Farm mode skips this so a farm order is not
++#                     interrupted. Chests, lockboxes and skinnable corpses are not gathered.
++#                     0 turns this off.
++#        Default:     1
++#
++#    CoaBots.Gather.FollowRadius
++#        Description: How close a node must be (yards) for a following bot to notice it.
++#                     Clamped to 5-40.
++#        Default:     20
++#
++
++CoaBots.Gather.WhileFollowing = 1
++CoaBots.Gather.FollowRadius = 20
++
+ #
+ #    CoaBots.MarkSessionsAsBots
+ #        Description: Mark companion sessions as bots, so the server skips per-client work they have no client for
+diff --git a/module/src/BotAI.cpp b/module/src/BotAI.cpp
+index 5232df5..b6ffa3f 100644
+--- a/module/src/BotAI.cpp
++++ b/module/src/BotAI.cpp
+@@ -427,6 +427,13 @@ constexpr uint32 GATHER_NODE_RETRY_MS = 60000;
+ // the arrival test simply never becomes true.
+ constexpr uint32 GATHER_WALK_TIMEOUT_MS = 20000;
+ 
++// Opportunistic herb/ore gathering while following a real player. Shorter than the solo
++// walk budget: the bot should not wander off the group for long. Scan more often than
++// idle solo gathering because the window for passing a node is brief.
++constexpr uint32 FOLLOW_GATHER_WALK_TIMEOUT_MS = 8000;
++constexpr uint32 FOLLOW_GATHER_SCAN_INTERVAL_MS = 2500;
++constexpr float FOLLOW_GATHER_LEADER_RANGE = 40.0f;
++
+ // How long a targeted guild-gather order tolerates finding zero matching nodes nearby before
+ // asking BotMgr to resolve and teleport to a fresh location for the same item. Node respawn
+ // timers and other bots/players competing for the same resource both mean "nothing here right
+@@ -2865,6 +2872,30 @@ void SetGatherNodeRetryCooldown(BotAIState& state, ObjectGuid nodeGuid)
+     state.gatherNodeRetryAtMs[nodeGuid] = nowMs + GATHER_NODE_RETRY_MS;
+ }
+ 
++// One bot at a time per node, shared by solo gathering and gather-while-following, so two
++// grouped companions do not walk to the same herb. Key is the node's guid, value is the
++// claiming bot. Released when the gather finishes, is abandoned, or the bot is Forgotten.
++std::unordered_map<ObjectGuid, ObjectGuid> claimedGatherNodes;
++
++bool IsGatherNodeClaimedByOther(ObjectGuid nodeGuid, ObjectGuid botGuid)
++{
++    auto itr = claimedGatherNodes.find(nodeGuid);
++    return itr != claimedGatherNodes.end() && itr->second != botGuid;
++}
++
++void ClaimGatherNode(ObjectGuid nodeGuid, ObjectGuid botGuid)
++{
++    for (auto itr = claimedGatherNodes.begin(); itr != claimedGatherNodes.end();)
++        itr = (itr->second == botGuid) ? claimedGatherNodes.erase(itr) : std::next(itr);
++    claimedGatherNodes[nodeGuid] = botGuid;
++}
++
++void ReleaseGatherClaim(ObjectGuid botGuid)
++{
++    for (auto itr = claimedGatherNodes.begin(); itr != claimedGatherNodes.end();)
++        itr = (itr->second == botGuid) ? claimedGatherNodes.erase(itr) : std::next(itr);
++}
++
+ // Loot ids of chest-type objects whose every loot row requires a quest. Filled once at startup by
+ // BotAI::LoadGatherLootData -- the split is static data, so there's no reason to re-derive it.
+ std::unordered_set<uint32> _questOnlyGameObjectLoot;
+@@ -2953,6 +2984,9 @@ public:
+         if (IsGatherNodeOnRetryCooldown(_state, go->GetGUID()))
+             return false;
+ 
++        if (IsGatherNodeClaimedByOther(go->GetGUID(), _bot->GetGUID()))
++            return false;
++
+         if (YieldsNothingForBot(go, _bot))
+             return false;
+ 
+@@ -2997,6 +3031,7 @@ void TryFinishGathering(Player* bot, BotAIState& state)
+ 
+     ObjectGuid nodeGuid = state.gatherTargetGuid;
+     state.gatherTargetGuid = ObjectGuid::Empty; // one-shot regardless of outcome below
++    ReleaseGatherClaim(bot->GetGUID());
+ 
+     GameObject* node = ObjectAccessor::GetGameObject(*bot, nodeGuid);
+     if (!node || bot->GetLootGUID() != node->GetGUID())
+@@ -3087,6 +3122,7 @@ void AbandonGatherWalk(Player* bot, BotAIState& state, char const* reason)
+     LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotAI: bot '{}' abandoned gather walk ({}).", bot->GetName(), reason);
+     SetGatherNodeRetryCooldown(state, state.gatherWalkTargetGuid);
+     state.gatherWalkTargetGuid = ObjectGuid::Empty;
++    ReleaseGatherClaim(bot->GetGUID());
+     // Administrative release: abandoned gather walk
+     BotMovement::ForceReleaseOwner(bot, MoveOwner::Gather);
+ }
+@@ -3104,6 +3140,7 @@ void TryContinueGatherWalk(Player* bot, uint32 diff, BotAIState& state)
+     if (!node || !node->isSpawned())
+     {
+         state.gatherWalkTargetGuid = ObjectGuid::Empty;
++        ReleaseGatherClaim(bot->GetGUID());
+         // Administrative release: node despawned
+         BotMovement::ForceReleaseOwner(bot, MoveOwner::Gather);
+         return;
+@@ -3178,6 +3215,8 @@ bool TryStartGathering(Player* bot, uint32 diff, BotAIState& state, uint32 requi
+     if (!node || !gatherSpellId)
+         return false;
+ 
++    ClaimGatherNode(node->GetGUID(), bot->GetGUID());
++
+     if (!IsInGatherRange(bot, node, gatherSpellId))
+     {
+         state.gatherWalkTargetGuid = node->GetGUID();
+@@ -3193,6 +3232,7 @@ bool TryStartGathering(Player* bot, uint32 diff, BotAIState& state, uint32 requi
+         if (!MoveBotToPoint(bot, MoveOwner::Gather, node->GetPositionX(), node->GetPositionY(), node->GetPositionZ()))
+         {
+             state.gatherWalkTargetGuid = ObjectGuid::Empty;
++            ReleaseGatherClaim(bot->GetGUID());
+             return false;
+         }
+ 
+@@ -3203,6 +3243,119 @@ bool TryStartGathering(Player* bot, uint32 diff, BotAIState& state, uint32 requi
+     return true;
+ }
+ 
++bool GroupMemberInCombat(Group* group)
++{
++    if (!group)
++        return false;
++    for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
++    {
++        if (Player* member = itr->GetSource())
++            if (member->IsInCombat())
++                return true;
++    }
++    return false;
++}
++
++// Grouped companions following a real player pick up herbalism/mining nodes they walk past,
++// using the same GatherSpellForNode / CastGatherAt path as solo gathering (real spells, so
++// skill-ups apply). Not used during farm mode, Stay, group combat, or when the leader is
++// another bot. Returns true while a gather is in progress so the caller can skip follow.
++bool TryGatherWhileFollowing(Player* bot, uint32 diff, BotAIState& state)
++{
++    auto abandonIfBusy = [&]() -> bool
++    {
++        if (!state.gatherTargetGuid.IsEmpty() || !state.gatherWalkTargetGuid.IsEmpty())
++        {
++            if (!state.gatherTargetGuid.IsEmpty())
++            {
++                // Do not interrupt a cast already underway; finish it next ticks if possible.
++                if (bot->IsNonMeleeSpellCast(false))
++                    return true;
++                TryFinishGathering(bot, state);
++            }
++            if (!state.gatherWalkTargetGuid.IsEmpty())
++                AbandonGatherWalk(bot, state, "follow-gather conditions no longer hold");
++            return true;
++        }
++        return false;
++    };
++
++    if (!sBotMgr->GatherWhileFollowing() || state.farmActive)
++        return abandonIfBusy();
++    if (state.manualCommand == BotManualCommand::Stay)
++        return abandonIfBusy();
++    if (!bot->IsAlive() || bot->GetTrader() || bot->IsBeingTeleported())
++        return abandonIfBusy();
++
++    Group* group = bot->GetGroup();
++    if (!group)
++        return abandonIfBusy();
++
++    Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID());
++    if (!leader || leader == bot)
++        return abandonIfBusy();
++    // Only when following a real player, not another bot.
++    if (sBotMgr->FindBotPlayer(leader->GetGUID().GetCounter()))
++        return abandonIfBusy();
++
++    if (bot->GetMap() && (bot->GetMap()->IsDungeon() || bot->GetMap()->IsRaid() || bot->InBattleground()))
++        return abandonIfBusy();
++
++    if (GroupMemberInCombat(group))
++        return abandonIfBusy();
++
++    if (bot->GetDistance(leader) > FOLLOW_GATHER_LEADER_RANGE)
++        return abandonIfBusy();
++
++    if (bot->GetFreeInventorySpace() == 0)
++        return abandonIfBusy();
++
++    if (!state.gatherTargetGuid.IsEmpty())
++    {
++        TryFinishGathering(bot, state);
++        return !state.gatherTargetGuid.IsEmpty() || !state.gatherWalkTargetGuid.IsEmpty() || bot->IsNonMeleeSpellCast(false);
++    }
++    if (!state.gatherWalkTargetGuid.IsEmpty())
++    {
++        TryContinueGatherWalk(bot, diff, state);
++        return !state.gatherTargetGuid.IsEmpty() || !state.gatherWalkTargetGuid.IsEmpty();
++    }
++
++    if (state.nextGatherScanMs > diff)
++    {
++        state.nextGatherScanMs -= diff;
++        return false;
++    }
++    state.nextGatherScanMs = FOLLOW_GATHER_SCAN_INTERVAL_MS;
++
++    float searchRadius = sBotMgr->GatherFollowRadius();
++    uint32 gatherSpellId = 0;
++    GameObject* node = nullptr;
++    GatherableNodeCheck check(bot, searchRadius, gatherSpellId, state);
++    Acore::GameObjectLastSearcher<GatherableNodeCheck> searcher(bot, node, check);
++    Cell::VisitObjects(bot, searcher, searchRadius);
++    if (!node || !gatherSpellId)
++        return false;
++
++    ClaimGatherNode(node->GetGUID(), bot->GetGUID());
++
++    if (!IsInGatherRange(bot, node, gatherSpellId))
++    {
++        state.gatherWalkTargetGuid = node->GetGUID();
++        state.gatherWalkTimeoutMs = FOLLOW_GATHER_WALK_TIMEOUT_MS;
++        if (!MoveBotToPoint(bot, MoveOwner::Gather, node->GetPositionX(), node->GetPositionY(), node->GetPositionZ()))
++        {
++            state.gatherWalkTargetGuid = ObjectGuid::Empty;
++            ReleaseGatherClaim(bot->GetGUID());
++            return false;
++        }
++        return true;
++    }
++
++    CastGatherAt(bot, state, node, gatherSpellId);
++    return !state.gatherTargetGuid.IsEmpty() || !state.gatherWalkTargetGuid.IsEmpty();
++}
++
+ bool IsFishingPole(Item const* item)
+ {
+     if (!item)
+@@ -3523,6 +3676,11 @@ void ResumeFollowingLeader(Player* bot, BotAIState& state)
+     if (BotMovement::GetPendingMountSpell(bot) || bot->IsNonMeleeSpellCast(false, false, /*skipAutorepeat=*/true))
+         return;
+ 
++    // A follow-gather walk or cast owns movement until it finishes. Travel outranks Gather
++    // in MoveOwner, so issuing follow here would yank the bot off the node every tick.
++    if (!state.gatherTargetGuid.IsEmpty() || !state.gatherWalkTargetGuid.IsEmpty())
++        return;
++
+     // Stay means exactly this: don't resume following just because there's nothing to fight
+     // right now. Self-defense (the attacker-retaliation fallback in UpdateOffensive) still
+     // applies regardless -- Stay only suppresses the idle-follow behavior, not combat. Confirmed
+@@ -4417,7 +4575,15 @@ void UpdateOffensive(Player* bot, uint32 diff, BotRole combatRole, BotRole profi
+             bool inEncounterGroup = bot->GetGroup() &&
+                 WorldEncounterDirector::IsEncounterTemporaryGroup(bot->GetGroup()->GetGUID().GetCounter());
+ 
+-            if (!bot->InBattleground() && !inEncounter)
++            // Opportunistic herb/ore gathering while following a real player. Farm already
++            // returned above, so a farm order is never interrupted. Travel outranks Gather,
++            // so follow is skipped while this returns true.
++            bool followGathering = false;
++            if (bot->GetGroup() && !WorldParties::IsLeader(bot->GetGUID()) && !inEncounter
++                && state.manualCommand != BotManualCommand::Stay && !bot->InBattleground())
++                followGathering = TryGatherWhileFollowing(bot, diff, state);
++
++            if (!bot->InBattleground() && !inEncounter && !followGathering)
+                 ResumeFollowingLeader(bot, state);
+ 
+             // Ungrouped means no leader to fight alongside or follow -- ResumeFollowingLeader
+@@ -5783,6 +5949,7 @@ void Forget(ObjectGuid botGuid)
+ {
+     CoaBotScheduling::Forget(botGuid);
+     CoaBotScheduling::CancelWork(botGuid);
++    ReleaseGatherClaim(botGuid);
+     states.erase(botGuid);
+     BotAI::ForgetRotationState(botGuid);
+     SpellResolver::Invalidate(botGuid);
+diff --git a/module/src/BotMgr.cpp b/module/src/BotMgr.cpp
+index 4d7676f..ea0ed6c 100644
+--- a/module/src/BotMgr.cpp
++++ b/module/src/BotMgr.cpp
+@@ -3562,6 +3562,13 @@ void BotMgr::Update(uint32 diff)
+         _inventoryKeepQuality = sConfigMgr->GetOption<uint32>("CoaBots.Inventory.KeepQuality", 3);
+         _questShareTurnIn = sConfigMgr->GetOption<bool>("CoaBots.Quest.ShareTurnIn", true);
+         _questShareAccept = sConfigMgr->GetOption<bool>("CoaBots.Quest.ShareAccept", true);
++        _gatherWhileFollowing = sConfigMgr->GetOption<bool>("CoaBots.Gather.WhileFollowing", true);
++        float followRadius = sConfigMgr->GetOption<float>("CoaBots.Gather.FollowRadius", 20.0f);
++        if (followRadius < 5.0f)
++            followRadius = 5.0f;
++        else if (followRadius > 40.0f)
++            followRadius = 40.0f;
++        _gatherFollowRadius = followRadius;
+     }
+     {
+         CoaBotPerf::Scope scope(CoaBotPerf::Metric::ManagerTrades);
+diff --git a/module/src/BotMgr.h b/module/src/BotMgr.h
+index f01aa48..3b9fac8 100644
+--- a/module/src/BotMgr.h
++++ b/module/src/BotMgr.h
+@@ -581,6 +581,8 @@ private:
+     uint32 _inventoryKeepQuality = 3;
+     bool _questShareTurnIn = true;
+     bool _questShareAccept = true;
++    bool _gatherWhileFollowing = true;
++    float _gatherFollowRadius = 20.0f;
+     void UpdateTrades(uint32 diff);
+     std::mutex _killEventLock;
+     std::vector<KillEvent> _killEvents;
+@@ -601,6 +603,8 @@ public:
+     uint32 InventoryKeepQuality() const { return _inventoryKeepQuality; }
+     bool QuestShareTurnIn() const { return _questShareTurnIn; }
+     bool QuestShareAccept() const { return _questShareAccept; }
++    bool GatherWhileFollowing() const { return _gatherWhileFollowing; }
++    float GatherFollowRadius() const { return _gatherFollowRadius; }
+ };
+ 
+ #define sBotMgr BotMgr::instance()
+-- 
+2.47.3
+

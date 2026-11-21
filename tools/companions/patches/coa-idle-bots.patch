@@ -1,0 +1,489 @@
+diff --git a/module/src/BotAI.cpp b/module/src/BotAI.cpp
+index 03b5647..d5540f0 100644
+--- a/module/src/BotAI.cpp
++++ b/module/src/BotAI.cpp
+@@ -288,6 +288,21 @@ struct BotAIState
+     uint32 nextHuntScanMs = 0;
+     bool huntLastScanFound = false;
+ 
++    // Idle watchdog (UpdateIdleWatchdog): where the bot stood when its current still stretch
++    // began and since when, the last tick the watchdog saw it (a gap means something else --
++    // combat, resting, looting -- had the bot), how many times in a row it has had to step in,
++    // and what it last did, for `.botcmd idle` / `.botcmd why`. idleWasGrouped catches the
++    // moment a bot leaves its group, so a Stay/Follow meant for that group can be dropped.
++    uint32 idleMapId = 0;
++    float idleAnchorX = 0.0f;
++    float idleAnchorY = 0.0f;
++    uint32 idleSinceMs = 0;
++    uint32 idleLastSeenMs = 0;
++    uint32 idleLastActionMs = 0;
++    uint8 idleStrikes = 0;
++    bool idleWasGrouped = false;
++    std::string idleLastReason;
++
+     // Nodes this bot has tried and failed to gather from, each mapped to the GameTime ms at which
+     // it becomes eligible again (see GATHER_NODE_RETRY_MS). Absolute deadlines rather than
+     // countdowns on purpose: nothing has to tick this map every frame, which matters with
+@@ -4703,6 +4718,137 @@ void UpdateSoloWorld(Player* bot, uint32 diff, BotAIState& state)
+ // value, except for Support, which fights like Dps (combatRole) but must still find its own
+ // Support-tagged profile (profileRole), not silently fail profile lookup and fall back to the
+ // generic spellbook chain forever.
++// Idle watchdog for bots living their own open-world life (ungrouped, or leading a temporary
++// bot party). Every layer above has its own timeouts, but each one only knows about itself: a
++// quest task whose target never shows up waits out its phase budget, a town break lasts minutes,
++// an ambient layer whose every option is on cooldown just stands, and a bot with no work on its
++// map can't be relocated while a real player stands next to it. Taken together that is a bot
++// standing in one spot for minutes on end. This only looks at the result: a bot that has not
++// moved IDLE_WATCHDOG_MOVE_YARDS for IDLE_WATCHDOG_STILL_MS while nothing else had it (no fight,
++// rest, loot, cast, errand, maintenance trip, guild order or encounter) gets pushed, harder each
++// time it happens again soon after:
++//   1. stale gather/fish/grind leftovers are cleared, and the brain lets go of whatever it was
++//      holding the bot on and sends it grinding with an immediate re-plan (WorldBrain::Nudge);
++//   2. still standing: zone progression moves it to a hub for its level (by flight if it can);
++//   3. still standing: the same, forced -- a teleport even with a player close by.
++constexpr uint32 IDLE_WATCHDOG_STILL_MS = 75 * IN_MILLISECONDS;
++constexpr float IDLE_WATCHDOG_MOVE_YARDS = 4.0f;
++constexpr uint32 IDLE_WATCHDOG_GAP_MS = 5 * IN_MILLISECONDS;
++constexpr uint32 IDLE_WATCHDOG_STRIKE_RESET_MS = 6 * MINUTE * IN_MILLISECONDS;
++// Teleports touch the character DB (homebind); a crowd of idle bots is moved a few at a time.
++constexpr uint32 IDLE_WATCHDOG_RELOCATE_SPACING_MS = 250;
++
++void ResetIdleWatch(Player* bot, BotAIState& state, uint32 now)
++{
++    state.idleMapId = bot->GetMapId();
++    state.idleAnchorX = bot->GetPositionX();
++    state.idleAnchorY = bot->GetPositionY();
++    state.idleSinceMs = now;
++}
++
++// What, if anything, legitimately owns a still bot right now; nullptr when nothing does.
++char const* IdleWatchdogExemption(Player* bot, BotAIState const& state)
++{
++    if (!bot->IsAlive())
++        return "dead";
++    if (bot->IsInCombat())
++        return "in combat";
++    if (bot->IsInFlight() || bot->IsBeingTeleported())
++        return "flying or teleporting";
++    if (Map* map = bot->GetMap(); !map || map->Instanceable())
++        return "in an instance";
++    if (bot->IsNonMeleeSpellCast(false))
++        return "casting";
++    if (!state.gatherTargetGuid.IsEmpty() || !state.fishingBobberGuid.IsEmpty() || state.fishingCastInProgress)
++        return "gathering or fishing";
++    // Errands include the repair/ammo maintenance trips; each errand has its own deadline.
++    if (BotWorldBehavior::HasActiveErrand(bot->GetGUID()))
++        return "on an errand or maintenance trip";
++    if (sBotMgr->GetGuildGatherOrder(bot->GetGUID()))
++        return "on a guild gather order";
++    if (WorldEncounterDirector::IsBotInEncounter(bot->GetGUID()))
++        return "in an encounter";
++    return nullptr;
++}
++
++void ClearStaleIdleState(Player* bot, BotAIState& state)
++{
++    state.gatherWalkTargetGuid = ObjectGuid::Empty;
++    state.gatherWalkTimeoutMs = 0;
++    state.huntSkinGuid = ObjectGuid::Empty;
++    state.hasGrindAnchor = false;
++    BotMovement::ForceStopOwner(bot, MoveOwner::Gather);
++    BotMovement::ForceStopOwner(bot, MoveOwner::Fish);
++    BotMovement::ForceStopOwner(bot, MoveOwner::Grind);
++}
++
++// Called once per solo-life tick (see UpdateOffensive); anything else that has the bot simply
++// stops calling it, and the gap restarts the clock.
++void UpdateIdleWatchdog(Player* bot, BotAIState& state)
++{
++    uint32 now = uint32(GameTime::GetGameTimeMS().count());
++    bool gap = !state.idleLastSeenMs || now - state.idleLastSeenMs > IDLE_WATCHDOG_GAP_MS;
++    state.idleLastSeenMs = now;
++
++    if (gap || IdleWatchdogExemption(bot, state) || bot->GetMapId() != state.idleMapId ||
++        std::hypot(bot->GetPositionX() - state.idleAnchorX, bot->GetPositionY() - state.idleAnchorY) > IDLE_WATCHDOG_MOVE_YARDS)
++    {
++        ResetIdleWatch(bot, state, now);
++        return;
++    }
++    if (now - state.idleSinceMs < IDLE_WATCHDOG_STILL_MS)
++        return;
++
++    if (now - state.idleLastActionMs > IDLE_WATCHDOG_STRIKE_RESET_MS)
++        state.idleStrikes = 0;
++
++    uint8 strike = std::min<uint8>(uint8(state.idleStrikes + 1), 3);
++    if (strike >= 2)
++    {
++        static uint32 lastRelocateMs = 0;
++        if (lastRelocateMs && now - lastRelocateMs < IDLE_WATCHDOG_RELOCATE_SPACING_MS)
++            return; // next tick
++        lastRelocateMs = now;
++    }
++
++    uint32 stillSec = (now - state.idleSinceMs) / IN_MILLISECONDS;
++    ClearStaleIdleState(bot, state);
++    std::string what = WorldBrain::Nudge(bot);
++    if (strike >= 2)
++    {
++        bool const forced = strike >= 3;
++        if (BotZoneProgression::RelocateBot(bot, forced))
++            what += forced ? "; teleported to a hub for its level" : "; sent to a hub for its level";
++        else
++            what += forced ? "; forced relocation refused" : "; relocation refused (player close by, quest work here, or no hub)";
++    }
++
++    state.idleStrikes = strike;
++    state.idleLastActionMs = now;
++    state.idleLastReason = Acore::StringFormat("strike {} after {}s still: {}", uint32(strike), stillSec, what);
++    LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotAI: idle watchdog: bot '{}' stood still {}s at ({:.0f} {:.0f}) map {} -- strike {}: {}.",
++        bot->GetName(), stillSec, bot->GetPositionX(), bot->GetPositionY(), bot->GetMapId(), uint32(strike), what);
++    ResetIdleWatch(bot, state, now);
++}
++
++// A Stay or Follow is an order for the group the bot was in. Nothing used to clear it when the bot
++// left that group, and an ungrouped bot on Stay never runs its own life again -- it stood where it
++// was told to until the next restart.
++void DropGroupOrdersOnLeave(Player* bot, BotAIState& state)
++{
++    bool const grouped = bot->GetGroup() != nullptr;
++    if (!grouped && state.idleWasGrouped &&
++        (state.manualCommand == BotManualCommand::Stay || state.manualCommand == BotManualCommand::Follow))
++    {
++        LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotAI: bot '{}' left its group; dropping its {} order.",
++            bot->GetName(), state.manualCommand == BotManualCommand::Stay ? "Stay" : "Follow");
++        state.manualCommand = BotManualCommand::None;
++        state.idleLastReason = "left its group: dropped the Stay/Follow order it had";
++        ClearActiveFollow(bot);
++    }
++    state.idleWasGrouped = grouped;
++}
++
+ void UpdateOffensive(Player* bot, uint32 diff, BotRole combatRole, BotRole profileRole, BotAIState& state)
+ {
+     CoaBotPerf::Scope perfScope(CoaBotPerf::Metric::Offensive);
+@@ -4881,6 +5027,8 @@ void UpdateOffensive(Player* bot, uint32 diff, BotRole combatRole, BotRole profi
+             if (TryRestIfNeeded(bot, diff, combatRole, state))
+                 return;
+ 
++            DropGroupOrdersOnLeave(bot, state);
++
+             // Farm mode outranks following the leader and the open-world layer below.
+             if (TryFarm(bot, state))
+                 return;
+@@ -4937,6 +5085,7 @@ void UpdateOffensive(Player* bot, uint32 diff, BotRole combatRole, BotRole profi
+                     TryWaitForFishingCast(bot, diff, state);
+                 else
+                     UpdateSoloWorld(bot, diff, state);
++                UpdateIdleWatchdog(bot, state);
+             }
+             else
+             {
+@@ -6711,6 +6860,111 @@ void StopAttack(ObjectGuid botGuid)
+     }
+ }
+ 
++namespace
++{
++    char const* ManualCommandName(BotManualCommand command)
++    {
++        switch (command)
++        {
++            case BotManualCommand::Stay:   return "Stay";
++            case BotManualCommand::Follow: return "Follow";
++            case BotManualCommand::None:   return "none";
++            default:                       return "Pull";
++        }
++    }
++
++    // Who decides what the bot does right now, in a few words.
++    std::string IdleOwner(Player* bot, BotAIState const& state)
++    {
++        if (Group* group = bot->GetGroup())
++        {
++            if (WorldParties::IsLeader(bot->GetGUID()))
++                return "leads a temporary bot party";
++            if (WorldParties::IsInParty(bot->GetGUID()))
++                return "member of a temporary bot party (follows its bot leader)";
++            if (WorldEncounterDirector::IsBotInEncounter(bot->GetGUID()))
++                return "in an encounter group";
++            Player* leader = ObjectAccessor::FindConnectedPlayer(group->GetLeaderGUID());
++            if (!leader)
++                return "grouped, leader offline";
++            bool realLeader = !BotMgr::IsBotAccountId(leader->GetSession()->GetAccountId());
++            return Acore::StringFormat("grouped with {} ({})", leader->GetName(), realLeader ? "player" : "bot");
++        }
++        if (state.manualCommand == BotManualCommand::Stay)
++            return "ungrouped but told to Stay (own life paused)";
++        if (state.farmActive)
++            return "farm order";
++        return "own life";
++    }
++}
++
++std::string IdleSummary(Player* bot)
++{
++    if (!bot)
++        return "";
++    auto itr = states.find(bot->GetGUID());
++    if (itr == states.end())
++        return "no AI state yet";
++    BotAIState const& state = itr->second;
++    uint32 now = uint32(GameTime::GetGameTimeMS().count());
++
++    std::string brain = "brain: none";
++    WorldGoal goal = WorldGoal::None;
++    WorldTaskType taskType = WorldTaskType::None;
++    TaskPhase phase = TaskPhase::Planning;
++    bool isBreak = false;
++    if (WorldBrain::GetBrainActivity(bot->GetGUID(), goal, taskType, phase, isBreak))
++        brain = taskType != WorldTaskType::None
++            ? Acore::StringFormat("brain: {} {} ({})", WorldGoalName(goal), WorldTaskTypeName(taskType), TaskPhaseName(phase))
++            : Acore::StringFormat("brain: {}{}", WorldGoalName(goal), isBreak ? " (break)" : "");
++
++    char const* exempt = IdleWatchdogExemption(bot, state);
++    bool watched = state.idleLastSeenMs && now - state.idleLastSeenMs <= IDLE_WATCHDOG_GAP_MS;
++    std::string still = exempt ? std::string(exempt)
++        : watched ? Acore::StringFormat("still {}s", (now - state.idleSinceMs) / IN_MILLISECONDS)
++        : std::string("not on its own life");
++
++    return Acore::StringFormat("{} | order {} | {} | {} | watchdog strikes {}", IdleOwner(bot, state),
++        ManualCommandName(state.manualCommand), brain, still, uint32(state.idleStrikes));
++}
++
++std::vector<std::string> ExplainIdle(Player* bot)
++{
++    std::vector<std::string> lines;
++    if (!bot)
++        return lines;
++    lines.push_back(Acore::StringFormat("Bot '{}' (guid {}, level {}) map {} zone {} at ({:.0f}, {:.0f}, {:.0f}).", bot->GetName(),
++        bot->GetGUID().GetCounter(), uint32(bot->GetLevel()), bot->GetMapId(), bot->GetZoneId(), bot->GetPositionX(),
++        bot->GetPositionY(), bot->GetPositionZ()));
++    lines.push_back("  " + IdleSummary(bot));
++
++    auto itr = states.find(bot->GetGUID());
++    if (itr != states.end())
++    {
++        BotAIState const& state = itr->second;
++        uint32 now = uint32(GameTime::GetGameTimeMS().count());
++        if (!state.idleLastReason.empty())
++            lines.push_back(Acore::StringFormat("  watchdog: {} ({}s ago)", state.idleLastReason,
++                state.idleLastActionMs ? (now - state.idleLastActionMs) / IN_MILLISECONDS : 0));
++        else
++            lines.push_back("  watchdog: has not had to step in");
++        if (!bot->GetGroup() && state.manualCommand == BotManualCommand::Stay)
++            lines.push_back("  hint: `.botcmd follow` or `.botcmd stopattack` with its guid clears the Stay.");
++    }
++
++    std::string errand = BotWorldBehavior::Describe(bot->GetGUID());
++    if (!errand.empty())
++        lines.push_back("  ambient: " + errand);
++    std::string party = WorldParties::Describe(bot->GetGUID());
++    if (!party.empty())
++        lines.push_back("  party: " + party);
++    if (BotMgr::GuildGatherOrder const* order = sBotMgr->GetGuildGatherOrder(bot->GetGUID()))
++        lines.push_back(Acore::StringFormat("  guild gather order: {} left{}", order->remainingCount,
++            order->status.empty() ? "" : " - " + order->status));
++    lines.push_back("  (`.botcmd brain <guid>` has the full open-world state.)");
++    return lines;
++}
++
+ bool StartFarm(Player* bot, uint32 creatureEntry, float radius)
+ {
+     if (!bot || !bot->IsInWorld() || !creatureEntry)
+diff --git a/module/src/BotAI.h b/module/src/BotAI.h
+index e4b1b96..1bfa09b 100644
+--- a/module/src/BotAI.h
++++ b/module/src/BotAI.h
+@@ -166,6 +166,12 @@ namespace BotAI
+     // Training A/B switch: true makes ScoreItemForBot use the old class-only stat guess instead of the spec stat model.
+     void SetLegacyGearScoring(bool legacy);
+ 
++    // Idle diagnostics (`.botcmd idle` / `.botcmd why`): a one-line summary of what has the bot
++    // right now -- its group, standing order, brain activity, errand, how long it has stood still
++    // and what the idle watchdog last did -- and the longer explanation behind it.
++    std::string IdleSummary(Player* bot);
++    std::vector<std::string> ExplainIdle(Player* bot);
++
+     // Sets a manual movement/engagement command (see BotManualCommand above). pullTarget is
+     // only used for Pull -- the guid of whatever the commanding player currently has
+     // selected, resolved by the caller (BotAddonChat.cpp) so this API doesn't need to know
+diff --git a/module/src/BotCommand.cpp b/module/src/BotCommand.cpp
+index 938cc4e..188d594 100644
+--- a/module/src/BotCommand.cpp
++++ b/module/src/BotCommand.cpp
+@@ -27,10 +27,12 @@
+ #include "LFGMgr.h"
+ #include "ObjectAccessor.h"
+ #include "ObjectGuid.h"
++#include "ObjectMgr.h"
+ #include "PathGenerator.h"
+ #include "Player.h"
+ #include "RBAC.h"
+ #include "ScriptMgr.h"
++#include <algorithm>
+ #include <cstdlib>
+ #include <sstream>
+ #include <string>
+@@ -100,6 +102,8 @@ public:
+             { "quickfill",    HandleBotQuickFillCommand,    rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+             { "invitebot",    HandleBotInviteRoleCommand,   rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+             { "botlist",      HandleBotListCommand,         rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
++            { "idle",         HandleBotIdleCommand,         rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
++            { "why",          HandleBotWhyCommand,          rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+             { "craftorder",   HandleBotCraftOrderCommand,   rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+             { "recipecoverage", HandleBotRecipeCoverageCommand, rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+             { "guildroster",  HandleBotGuildRosterCommand,  rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+@@ -361,6 +365,70 @@ public:
+         return true;
+     }
+ 
++    // `.botcmd idle [yards]`: every bot within `yards` (default 60, 5-500) of the GM, nearest
++    // first, with what has it right now -- its group, standing order, open-world activity, how
++    // long it has stood still and the idle watchdog's strikes. `.botcmd why <name>` explains one.
++    static bool HandleBotIdleCommand(ChatHandler* handler, Optional<float> yards)
++    {
++        Player* gm = handler ? handler->GetPlayer() : nullptr;
++        if (!gm)
++        {
++            if (handler)
++                handler->SendSysMessage("BotMgr: .botcmd idle lists bots around you, so it needs an in-game character.");
++            return true;
++        }
++        float radius = std::clamp(yards.value_or(60.0f), 5.0f, 500.0f);
++
++        std::vector<std::pair<float, Player*>> nearby;
++        for (auto const& [guid, player] : ObjectAccessor::GetPlayers())
++        {
++            if (!player || player == gm || !player->IsInWorld() || !player->GetSession() ||
++                player->GetMapId() != gm->GetMapId() || player->GetInstanceId() != gm->GetInstanceId())
++                continue;
++            if (!BotMgr::IsBotAccountId(player->GetSession()->GetAccountId()))
++                continue;
++            float dist = gm->GetDistance(player);
++            if (dist <= radius)
++                nearby.emplace_back(dist, player);
++        }
++        std::sort(nearby.begin(), nearby.end(), [](auto const& lhs, auto const& rhs) { return lhs.first < rhs.first; });
++
++        handler->PSendSysMessage("BotMgr: {} bot(s) within {:.0f} yd.", nearby.size(), radius);
++        uint32 shown = 0;
++        for (auto const& [dist, bot] : nearby)
++        {
++            if (++shown > 40)
++            {
++                handler->PSendSysMessage("  ... {} more; use a smaller radius.", nearby.size() - 40);
++                break;
++            }
++            handler->PSendSysMessage("  {} (guid {}, lvl {}, {:.0f} yd): {}", bot->GetName(), bot->GetGUID().GetCounter(),
++                uint32(bot->GetLevel()), dist, BotAI::IdleSummary(bot));
++        }
++        return true;
++    }
++
++    // `.botcmd why <bot name>`: why that bot is doing what it is doing (or nothing).
++    static bool HandleBotWhyCommand(ChatHandler* handler, std::string name)
++    {
++        if (!handler)
++            return true;
++        if (!normalizePlayerName(name))
++        {
++            handler->SendSysMessage("BotMgr: usage: .botcmd why <bot name>");
++            return true;
++        }
++        Player* bot = ObjectAccessor::FindPlayerByName(name, false);
++        if (!bot || !bot->GetSession() || !BotMgr::IsBotAccountId(bot->GetSession()->GetAccountId()))
++        {
++            handler->PSendSysMessage("BotMgr: no online bot named {}.", name);
++            return true;
++        }
++        for (std::string const& line : BotAI::ExplainIdle(bot))
++            handler->SendSysMessage(line);
++        return true;
++    }
++
+     // `.botcmd invitebot <player guid> <tank|healer|dps>`: what the addon's "Invite" button does for that player.
+     static bool HandleBotInviteRoleCommand(ChatHandler* handler, ObjectGuid::LowType charLowGuid, std::string role)
+     {
+diff --git a/module/src/world/WorldBrain.cpp b/module/src/world/WorldBrain.cpp
+index d141780..783c4bd 100644
+--- a/module/src/world/WorldBrain.cpp
++++ b/module/src/world/WorldBrain.cpp
+@@ -787,6 +787,52 @@ namespace WorldBrain
+         WorldExecutor::PauseTask(bot, itr->second, "ambient errand");
+     }
+ 
++    std::string Nudge(Player* bot)
++    {
++        auto itr = _states.find(bot->GetGUID());
++        if (itr == _states.end())
++            return "no brain state yet";
++        BrainState& state = itr->second;
++        BrainExtra& extra = _extra[bot->GetGUID()];
++        uint32 now = NowMs();
++        std::string what;
++
++        if (state.opportunityActive)
++        {
++            EndOpportunity(bot, state, extra, "idle watchdog");
++            what = "ended a gathering detour";
++        }
++        if (state.task.IsValid())
++        {
++            std::string task = Acore::StringFormat("{} #{} (quest {}, phase {})", WorldTaskTypeName(state.task.type),
++                state.task.id, state.task.quest.questId, TaskPhaseName(state.task.phase));
++            if (state.task.quest.questId)
++                SuspendQuest(bot, state, state.task.quest.questId, FailureReason::NoProgress);
++            DropTask(bot, state, FailureReason::NoProgress);
++            what += (what.empty() ? "" : ", ") + Acore::StringFormat("dropped stuck task {}", task);
++        }
++        if (state.breakUntilMs)
++        {
++            state.breakUntilMs = 0;
++            StartSession(state, now);
++            what += what.empty() ? "ended a town break" : ", ended a town break";
++        }
++        if (what.empty())
++            what = Acore::StringFormat("no task; activity was {}", WorldDirectiveName(state.activity));
++
++        // Something to do right away: grinding needs nothing but mobs nearby (and gives way to
++        // wandering by itself if there are none); a fresh plan is asked for at once too.
++        state.activity = WorldDirective::Grind;
++        state.activityUntilMs = now + 120000;
++        state.activityIdleSinceMs = 0;
++        state.goal = WorldGoal::Grinding;
++        state.emptyPlans = 0;
++        state.nextPlanMs = now;
++        state.nextRelocationAskMs = 0;
++        NoteEvent(state, "idle watchdog: " + what);
++        return what;
++    }
++
+     void Suspend(Player* bot, SuspendReason reason)
+     {
+         WorldEncounterDirector::OnBotSuspended(bot, SuspendReasonName(reason));
+diff --git a/module/src/world/WorldBrain.h b/module/src/world/WorldBrain.h
+index 33ad016..dc6a65e 100644
+--- a/module/src/world/WorldBrain.h
++++ b/module/src/world/WorldBrain.h
+@@ -28,6 +28,7 @@
+ 
+ #include "ObjectGuid.h"
+ #include "WorldTask.h"
++#include <string>
+ 
+ class ChatHandler;
+ class Player;
+@@ -50,6 +51,12 @@ namespace WorldBrain
+     // The ambient layer took the tick (a repair/vendor need, a flight): the current task pauses.
+     void NotifyAmbientBusy(Player* bot);
+ 
++    // The idle watchdog (BotAI) saw the bot stand still with nothing to show for a while: whatever
++    // the brain was holding it on -- a stuck task (its quest is set aside like any other failed
++    // run), a detour, a town break -- is let go, and the bot is sent grinding with an immediate
++    // re-plan. Returns a short description of what was reset, for the log and `.botcmd why`.
++    std::string Nudge(Player* bot);
++
+     // Something else owns the bot now (a group, a manual command, a battleground, a dungeon).
+     // Releases every claim; the task is dropped and re-planned when the brain is next updated.
+     void Suspend(Player* bot, SuspendReason reason);

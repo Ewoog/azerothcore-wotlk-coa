@@ -1,0 +1,101 @@
+/*
+ * mod-coa-playerbots
+ *
+ * Bulk random-bot creation: `.botcmd spawnrandom [count]` (BotCommand.cpp) makes brand new
+ * characters on the fly, in whatever quantity is asked for, instead of only being able to
+ * spawn existing hand-made test characters (BotMgr::SpawnBot). See BotSpawnRandom.cpp's
+ * header comment for why this clones an existing character row rather than simulating the
+ * real CMSG_CHAR_CREATE packet flow.
+ */
+
+#ifndef COA_PLAYERBOTS_BOT_SPAWN_RANDOM_H
+#define COA_PLAYERBOTS_BOT_SPAWN_RANDOM_H
+
+#include "Define.h"
+#include "ObjectGuid.h"
+#include <string>
+
+class ChatHandler;
+class Player;
+
+namespace BotSpawn
+{
+bool PrepareNameForLogin(uint32 guid, uint32 accountId);
+// requestedCount == 0 means "use CoaBots.RandomSpawn.DefaultCount"; the result is always
+// clamped to CoaBots.RandomSpawn.MaxCount regardless. Queues the batch for gradual creation
+// (a few bots every ProcessPendingRandomBotSpawns tick, not all of them in one go) and returns
+// immediately -- confirmed live that spawning 1000 in one synchronous burst crashed the
+// worldserver outright (no crash dump, consistent with the OS killing it under a memory/
+// resource spike from creating that many characters and WorldSessions back to back with nothing
+// to spread the load). See the .cpp for the throttle constants.
+void SpawnRandomBots(uint32 requestedCount, ChatHandler* handler);
+
+// Drains the queue SpawnRandomBots fills, a small batch at a time, throttled by real elapsed
+// time (not just tick count, so it stays paced the same regardless of server tick rate). Called
+// every tick from BotMgr::Update; a no-op whenever nothing is queued.
+void ProcessPendingRandomBotSpawns(uint32 diff);
+
+// Creates one new bot character of a specific race (rather than SpawnRandomBots' fully random
+// race) -- for a caller that needs faction control, e.g. BotBattlegroundFill topping off a
+// specific side. Random class/name/gender, same cloning mechanism as SpawnRandomBots. Does NOT
+// log the bot in -- returns 0 on failure (no template roster, no free/creatable account),
+// otherwise the new character's guid for the caller to pass to BotMgr::SpawnBot when ready.
+ObjectGuid::LowType CreateOneRandomBot(uint8 race, ChatHandler* handler = nullptr);
+
+// `.botcmd spawnleveled [count]` -- same gradual-queue mechanism as SpawnRandomBots, but each
+// bot gets a random level (weighted mostly 1-10, tapering off toward 80 -- see
+// RollWeightedLevel in the .cpp) instead of always 80, plus a level-bracketed gear pass,
+// a two-primary profession set, starting bags, and basic food/water. Clamped to twice
+// CoaBots.RandomSpawn.MaxCount (this path is meant for bigger population batches, 1000-1500).
+void SpawnLeveledBots(uint32 requestedCount, ChatHandler* handler);
+
+// Drains the queue SpawnLeveledBots fills. Called every tick from BotMgr::Update alongside
+// ProcessPendingRandomBotSpawns; a no-op whenever nothing is queued.
+void ProcessPendingLeveledBotSpawns(uint32 diff);
+
+// `.botcmd spawncancel` -- drops every bot still waiting in the spawnrandom / spawnleveled queues. Bots that were
+// already created stay (use despawnall / purgeall for those). Returns how many queued bots were cancelled.
+uint32 CancelPendingSpawns();
+
+// Resets cached bot template rosters and account index tracking (e.g. after purging bot characters).
+void ResetAccountLookupCache();
+
+// `.botcmd professiontrainer [charLowGuid]` -- grants every profession this realm allows to one
+// online bot (or every online bot, if omitted) at its current level's skill cap, with trainer
+// rank spells and the Woodcutting/Woodworking 300 ceiling. Marks the bot manual so login
+// auto-reroll will not replace the set. Standalone from ApplyFreshBotSetup so it can backfill
+// a bot that never went through that path (this project's original hand-made test characters
+// predate it and have zero profession skills).
+void RepairGear(Player* bot);
+
+// True when the bot's equipment does not suit it: an empty armor or main-hand slot, a piece that needs a higher level,
+// three or more pieces far below its level, or the weapon type its learned spells need missing (BotAI::KitGearMismatch).
+// RepairGear then runs the level-bracketed gear-up over it, replacing a piece only when the new one scores better.
+bool NeedsGearRefit(Player* bot);
+
+// Training A/B only: strips all equipment and equips by the live gear-up logic (see the definition).
+void GearUpForTraining(Player* bot);
+
+void GrantAllProfessions(Player* bot, uint8 level);
+
+// Creates and logs in one bot of an EXACT class (unlike CreateOneRandomBot's random pick) --
+// for a debugging population that needs guaranteed class coverage. Returns 0 (and reports via
+// handler) if that class has no matching-faction template character, rather than silently
+// substituting a different class.
+ObjectGuid::LowType CreateClassBot(uint8 classId, uint8 race, uint8 level, ChatHandler* handler = nullptr);
+
+// `.botcmd spawnfleet <race> <level>` -- one bot per custom class (ids 12-32, 21 total), same
+// race and level, logged in immediately and synchronously (no gradual-queue throttling; this is
+// a small, deliberate debugging population, not a bulk spawn). Reports which classes (if any)
+// had no matching-faction template instead of silently skipping or substituting them.
+void SpawnClassFleet(uint8 race, uint8 level, ChatHandler* handler = nullptr);
+ObjectGuid::LowType SpawnClassBot(uint8 classId, uint8 race, uint8 level, ChatHandler* handler = nullptr);
+
+bool IsValidBuildUuid(std::string const& id);
+bool ValidateCustomSpawnParams(uint32 count, uint8 level, uint8 forcedClassId, uint32 forcedSpec, std::string const& requestedArchetype, std::string& errorOut);
+void ApplyWildcardBotSetup(Player* bot, uint8 level, std::string const& requestedBuildId = "");
+void ApplyRebornBotSetup(Player* bot, uint8 level, uint32 forcedSpec = 0);
+void SpawnCustomBots(uint32 count, uint8 level, uint8 forcedClassId = 0, uint32 forcedSpec = 0, std::string const& requestedArchetype = "", ChatHandler* handler = nullptr);
+}
+
+#endif // COA_PLAYERBOTS_BOT_SPAWN_RANDOM_H

@@ -1,0 +1,1662 @@
+diff --git a/module/data/sql/db-characters/updates/2026_11_20_00_coa_bot_gather_orders.sql b/module/data/sql/db-characters/updates/2026_11_20_00_coa_bot_gather_orders.sql
+new file mode 100644
+index 0000000..9fd7d4d
+--- /dev/null
++++ b/module/data/sql/db-characters/updates/2026_11_20_00_coa_bot_gather_orders.sql
+@@ -0,0 +1,36 @@
++-- mod-coa-playerbots: guild gather order requester + gather order queue (acore_characters).
++-- Idempotent: safe to run more than once, and safe whether or not the worldserver already
++-- created these tables (BotMgr::LoadGuildGatherOrders does the same at startup).
++
++CREATE TABLE IF NOT EXISTS `mod_coa_bot_guild_gather_orders` (
++  `bot_guid` INT UNSIGNED NOT NULL PRIMARY KEY,
++  `item_entry` INT UNSIGNED NOT NULL,
++  `target_count` INT UNSIGNED NOT NULL,
++  `gathered_count` INT UNSIGNED NOT NULL,
++  `remaining_count` INT UNSIGNED NOT NULL,
++  `target_map` INT UNSIGNED NOT NULL,
++  `target_x` FLOAT NOT NULL,
++  `target_y` FLOAT NOT NULL,
++  `target_z` FLOAT NOT NULL,
++  `has_target_location` TINYINT UNSIGNED NOT NULL DEFAULT 0,
++  `requester_guid` INT UNSIGNED NOT NULL DEFAULT 0
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
++
++-- Tables created by an older module build lack requester_guid: add it only if missing.
++SET @coa_has_requester := (SELECT COUNT(*) FROM information_schema.COLUMNS
++    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'mod_coa_bot_guild_gather_orders' AND COLUMN_NAME = 'requester_guid');
++SET @coa_sql := IF(@coa_has_requester = 0,
++    'ALTER TABLE `mod_coa_bot_guild_gather_orders` ADD COLUMN `requester_guid` INT UNSIGNED NOT NULL DEFAULT 0',
++    'DO 0');
++PREPARE coa_stmt FROM @coa_sql;
++EXECUTE coa_stmt;
++DEALLOCATE PREPARE coa_stmt;
++
++CREATE TABLE IF NOT EXISTS `mod_coa_bot_guild_gather_queue` (
++  `queue_id` INT UNSIGNED NOT NULL PRIMARY KEY,
++  `position` INT UNSIGNED NOT NULL,
++  `guild_id` INT UNSIGNED NOT NULL,
++  `requester_guid` INT UNSIGNED NOT NULL DEFAULT 0,
++  `item_entry` INT UNSIGNED NOT NULL,
++  `item_count` INT UNSIGNED NOT NULL
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+diff --git a/module/src/BotAI.cpp b/module/src/BotAI.cpp
+index fa8e347..8a01d91 100644
+--- a/module/src/BotAI.cpp
++++ b/module/src/BotAI.cpp
+@@ -272,6 +272,13 @@ struct BotAIState
+     // ever nudged it toward a fresh location for the same item.
+     uint32 gatherOrderStallMs = 0;
+ 
++    // Guild-order hunting (TryHuntForOrder): the corpse a Skinning cast is in flight on and when
++    // it started; the 1 s target-scan throttle and whether the last scan found a target.
++    ObjectGuid huntSkinGuid;
++    uint32 huntSkinStartMs = 0;
++    uint32 nextHuntScanMs = 0;
++    bool huntLastScanFound = false;
++
+     // Nodes this bot has tried and failed to gather from, each mapped to the GameTime ms at which
+     // it becomes eligible again (see GATHER_NODE_RETRY_MS). Absolute deadlines rather than
+     // countdowns on purpose: nothing has to tick this map every frame, which matters with
+@@ -4146,6 +4153,210 @@ Unit* FindAllyThreatenedTarget(Player* tank, float range = 30.0f)
+ // real healer doesn't stand still doing nothing just because no one's low), passed
+ // BotRole::Dps so no taunt logic applies -- a healer without a Tank role assigned shouldn't
+ // be trying to hold aggro.
++// --- Targeted hunting for guild gather orders (cloth/meat/hides) -------------------------
++// A gather order for an item that no node or fishing pool yields, but that some creature's corpse
++// or skinning loot does (BotMgr::GatherSourceInfo::IsHunt), attacks only those creatures near the
++// order's spot and skins the ones whose hide carries the item. Same 45 s stall ->
++// RetryGuildGatherLocation recovery as the node search when nothing matching is around.
++constexpr float HUNT_SEARCH_RADIUS = 50.0f;     // yards around the bot
++constexpr float HUNT_SKIN_SEARCH_RADIUS = 30.0f;
++constexpr float HUNT_LEASH_RADIUS = 80.0f;      // walk back to the order's spot beyond this
++constexpr uint32 HUNT_MAX_LEVEL_ABOVE = 3;      // never pick a fight further above itself
++constexpr uint32 HUNT_SCAN_INTERVAL_MS = 1000;
++constexpr uint32 HUNT_SKIN_CAST_TIMEOUT_MS = 10000;
++constexpr uint32 HUNT_SKIN_IGNORE_MS = 120000;
++
++// Same formula as Spell::EffectSkinning's reqValue.
++uint32 HuntSkinSkillNeeded(uint32 creatureLevel)
++{
++    return creatureLevel < 10 ? 0 : creatureLevel < 20 ? (creatureLevel - 10) * 10 : creatureLevel * 5;
++}
++
++// The Skinning cast to use on a corpse: the highest rank the bot knows, else (a bot that has the
++// skill line from GrantAllProfessions but never learned a rank spell) the apprentice rank, which
++// the server casts fine -- EffectSkinning reads the skill value, not the rank. 0 = can't skin.
++uint32 FindSkinningSpell(Player* bot)
++{
++    static uint32 const ranks[] = { 50305, 32678, 10768, 8618, 8617, 8613 };
++    if (!bot->HasSkill(SKILL_SKINNING))
++        return 0;
++    uint32 fallback = 0;
++    for (uint32 spellId : ranks)
++    {
++        SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
++        if (!info || !info->HasEffect(SPELL_EFFECT_SKINNING))
++            continue;
++        if (bot->HasSpell(spellId))
++            return spellId;
++        fallback = spellId; // ends on the lowest valid rank
++    }
++    return fallback;
++}
++
++class HuntTargetCheck
++{
++public:
++    HuntTargetCheck(Player const* bot, BotMgr::GatherSourceInfo const& info, bool canSkin, float range, uint32 maxLevel)
++        : _bot(bot), _info(info), _canSkin(canSkin), _range(range), _maxLevel(maxLevel) { }
++
++    bool operator()(Creature* c)
++    {
++        if (!c || !c->IsAlive() || c->IsInEvadeMode())
++            return false;
++        uint32 const entry = c->GetEntry();
++        if (!_info.huntCorpseEntries.count(entry) && !(_canSkin && _info.huntSkinEntries.count(entry)))
++            return false;
++        if (c->GetLevel() > _maxLevel)
++            return false;
++        if (!_bot->IsWithinDistInMap(c, _range))
++            return false;
++        if (!_bot->IsValidAttackTarget(c))
++            return false;
++        if (c->hasLootRecipient() && !c->isTappedBy(_bot))
++            return false;
++        if (IsIgnoredTarget(_bot->GetGUID(), c->GetGUID()))
++            return false;
++        _range = _bot->GetDistance(c);
++        return true;
++    }
++
++private:
++    Player const* _bot;
++    BotMgr::GatherSourceInfo const& _info;
++    bool _canSkin;
++    float _range;
++    uint32 _maxLevel;
++};
++
++// A corpse this bot killed and looted (AllLootRemovedFromCorpse then sets UNIT_FLAG_SKINNABLE),
++// of a creature whose hide carries the ordered item, that its Skinning skill can open.
++class HuntSkinCheck
++{
++public:
++    HuntSkinCheck(Player const* bot, BotMgr::GatherSourceInfo const& info, uint32 skill, float range)
++        : _bot(bot), _info(info), _skill(skill), _range(range) { }
++
++    bool operator()(Creature* c)
++    {
++        if (!c || c->IsAlive() || !c->HasUnitFlag(UNIT_FLAG_SKINNABLE))
++            return false;
++        if (!_info.huntSkinEntries.count(c->GetEntry()))
++            return false;
++        if (c->GetLootRecipientGUID() != _bot->GetGUID())
++            return false;
++        if (HuntSkinSkillNeeded(c->GetLootSkillLevelFor(_bot)) > _skill)
++            return false;
++        if (!_bot->IsWithinDistInMap(c, _range))
++            return false;
++        if (IsIgnoredTarget(_bot->GetGUID(), c->GetGUID()))
++            return false;
++        _range = _bot->GetDistance(c);
++        return true;
++    }
++
++private:
++    Player const* _bot;
++    BotMgr::GatherSourceInfo const& _info;
++    uint32 _skill;
++    float _range;
++};
++
++// Returns true when the hunt did something this tick (skinning, walking to a corpse, a fight
++// started, or a scan that found something within the last second), false when nothing matching
++// is around -- the caller counts that toward GUILD_GATHER_RETELEPORT_MS. Corpse looting itself is
++// TryProcessPendingLoot's job (it runs before UpdateSoloWorld and loots every kill).
++bool TryHuntForOrder(Player* bot, uint32 diff, BotAIState& state, BotMgr::GatherSourceInfo const& info)
++{
++    // 1. A skinning cast in flight: wait for it, then take the hide and close the loot window.
++    if (!state.huntSkinGuid.IsEmpty())
++    {
++        if (bot->IsNonMeleeSpellCast(false) && getMSTimeDiff(state.huntSkinStartMs, getMSTime()) < HUNT_SKIN_CAST_TIMEOUT_MS)
++            return true;
++        if (bot->IsNonMeleeSpellCast(false))
++            bot->InterruptNonMeleeSpells(false);
++        ObjectGuid const corpseGuid = state.huntSkinGuid;
++        state.huntSkinGuid = ObjectGuid::Empty;
++        Creature* corpse = ObjectAccessor::GetCreature(*bot, corpseGuid);
++        if (corpse && bot->GetLootGUID() == corpseGuid)
++        {
++            BotAI::TakeAllLoot(bot, corpse->loot);
++            WorldPacket releasePacket;
++            releasePacket << corpseGuid;
++            bot->GetSession()->HandleLootReleaseOpcode(releasePacket);
++            LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotAI: bot '{}' skinned '{}' for a guild order.",
++                bot->GetName(), corpse->GetName());
++        }
++        else
++            IgnoreTargetFor(bot->GetGUID(), corpseGuid, HUNT_SKIN_IGNORE_MS);
++        return true;
++    }
++
++    if (bot->IsNonMeleeSpellCast(false))
++        return true; // a buff or pet summon finishes first
++
++    uint32 const skinSpell = info.huntSkinEntries.empty() ? 0 : FindSkinningSpell(bot);
++
++    // 2. Skin our own looted corpses before looking for the next fight.
++    if (skinSpell)
++    {
++        Creature* corpse = nullptr;
++        HuntSkinCheck check(bot, info, bot->GetSkillValue(SKILL_SKINNING), HUNT_SKIN_SEARCH_RADIUS);
++        Acore::CreatureLastSearcher<HuntSkinCheck> searcher(bot, corpse, check);
++        Cell::VisitObjects(bot, searcher, HUNT_SKIN_SEARCH_RADIUS);
++        if (corpse)
++        {
++            if (!bot->IsWithinDistInMap(corpse, INTERACTION_DISTANCE))
++            {
++                MoveBotToPoint(bot, MoveOwner::Gather, corpse->GetPositionX(), corpse->GetPositionY(), corpse->GetPositionZ());
++                return true;
++            }
++            BotMovement::ForceReleaseOwner(bot, MoveOwner::Gather);
++            if (bot->isMoving())
++            {
++                // Spell::CheckCast refuses a cast-time spell while moving (see CastGatherAt).
++                BotMovement::ForceStopOwner(bot, MoveOwner::Gather);
++                return true;
++            }
++            if (bot->IsMounted())
++                BotMovement::RequestDismount(bot, MoveOwner::Gather, DismountReason::ActionForbidden);
++            SpellCastResult const result = bot->CastSpell(corpse, skinSpell, false);
++            if (result == SPELL_CAST_OK)
++            {
++                state.huntSkinGuid = corpse->GetGUID();
++                state.huntSkinStartMs = getMSTime();
++            }
++            else
++            {
++                IgnoreTargetFor(bot->GetGUID(), corpse->GetGUID(), HUNT_SKIN_IGNORE_MS);
++                LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotAI: bot '{}' failed Skinning ({}) on '{}' (result {}).",
++                    bot->GetName(), skinSpell, corpse->GetName(), uint32(result));
++            }
++            return true;
++        }
++    }
++
++    // 3. Attack the nearest live creature that can drop the item (or carry it as a hide we can skin).
++    if (state.nextHuntScanMs > diff)
++    {
++        state.nextHuntScanMs -= diff;
++        return state.huntLastScanFound;
++    }
++    state.nextHuntScanMs = HUNT_SCAN_INTERVAL_MS;
++
++    Creature* target = nullptr;
++    HuntTargetCheck check(bot, info, skinSpell != 0, HUNT_SEARCH_RADIUS, bot->GetLevel() + HUNT_MAX_LEVEL_ABOVE);
++    Acore::CreatureLastSearcher<HuntTargetCheck> searcher(bot, target, check);
++    Cell::VisitObjects(bot, searcher, HUNT_SEARCH_RADIUS);
++    state.huntLastScanFound = target != nullptr;
++    if (!target)
++        return false;
++
++    BotMovement::ForceReleaseOwner(bot, MoveOwner::Gather);
++    BotMovement::ForceReleaseOwner(bot, MoveOwner::Grind);
++    bot->Attack(target, true);
++    return true;
++}
++
+ AmbientLean LeanFor(SoloIntent intent)
+ {
+     switch (intent)
+@@ -4209,6 +4420,23 @@ void UpdateSoloWorld(Player* bot, uint32 diff, BotAIState& state)
+         // An explicit instruction owns the bot: the open-world task steps back with its clocks
+         // stopped, exactly as for any other manual command.
+         WorldBrain::Suspend(bot, SuspendReason::ManualCommand);
++
++        // Drop/skin-sourced items (cloth, meat, hides) get a targeted hunt instead of the old
++        // grind-and-hope fallback -- see TryHuntForOrder.
++        BotMgr::GatherSourceInfo const& sourceInfo = sBotMgr->GetGatherSourceInfo(gatherOrder->itemEntry);
++        bool const hunting = sourceInfo.IsHunt();
++        if (hunting && sourceInfo.SkinOnly() && !FindSkinningSpell(bot))
++        {
++            sBotMgr->FailGuildGatherOrder(bot->GetGUID(), "noskinning"); // gatherOrder dangles from here on
++            return;
++        }
++        // A skinning cast in flight finishes before any walk could cancel it.
++        if (hunting && !state.huntSkinGuid.IsEmpty())
++        {
++            TryHuntForOrder(bot, diff, state, sourceInfo);
++            return;
++        }
++
+         if (gatherOrder->hasTargetLocation)
+         {
+             if (bot->GetMapId() != gatherOrder->targetMapId)
+@@ -4219,7 +4447,8 @@ void UpdateSoloWorld(Player* bot, uint32 diff, BotAIState& state)
+             }
+ 
+             float dist = bot->GetExactDist2d(gatherOrder->targetX, gatherOrder->targetY);
+-            if (dist > 40.0f)
++            // A hunt ranges further from its spot than a node search (mobs wander and get chased).
++            if (dist > (hunting ? HUNT_LEASH_RADIUS : 40.0f))
+             {
+                 if (BotMovement::GetMountState(bot) == MountState::MountCasting)
+                 {
+@@ -4256,6 +4485,24 @@ void UpdateSoloWorld(Player* bot, uint32 diff, BotAIState& state)
+                 return;
+             }
+         }
++        if (hunting)
++        {
++            if (TryHuntForOrder(bot, diff, state, sourceInfo))
++                state.gatherOrderStallMs = 0;
++            else
++            {
++                // Nothing matching alive (or skinnable) around this spot: same stall-and-ask-for-
++                // somewhere-else recovery as the node search below.
++                state.gatherOrderStallMs += diff;
++                if (state.gatherOrderStallMs >= GUILD_GATHER_RETELEPORT_MS)
++                {
++                    state.gatherOrderStallMs = 0;
++                    sBotMgr->RetryGuildGatherLocation(bot->GetGUID());
++                }
++            }
++            return;
++        }
++
+         // A fish-only entry (never in any gameobject loot table) gets its own real fishing loop --
+         // TryStartGathering has no idea what a fishing rod is. The teleport target for a fishing
+         // order is a real GameObjectTemplate type 25 (FISHINGHOLE) spawn -- guaranteed to actually
+@@ -4292,11 +4539,10 @@ void UpdateSoloWorld(Player* bot, uint32 diff, BotAIState& state)
+             return;
+         }
+ 
+-        // Nodes (herbalism/mining) can be targeted precisely -- see GatherLootIdsByItem. Anything
+-        // else this order might ask for (cloth/meat off a kill, a skinned hide) has no equivalent
+-        // "seek this specific loot table" search yet, so those items keep the old opportunistic
+-        // behavior (whatever's nearest, grind fallback included) rather than going strictly idle
+-        // forever waiting for a node type that will never match.
++        // Nodes (herbalism/mining) can be targeted precisely -- see GatherLootIdsByItem. Drop and
++        // skin items were handled by the hunt above; anything left here (an item with no spawned
++        // creature source at all) keeps the old opportunistic behavior (whatever's nearest, grind
++        // fallback included) rather than going strictly idle forever.
+         bool itemIsNodeSourced = GatherLootIdsByItem().count(gatherOrder->itemEntry) != 0;
+         uint32 targetItem = itemIsNodeSourced ? gatherOrder->itemEntry : 0;
+ 
+diff --git a/module/src/BotAddonChat.cpp b/module/src/BotAddonChat.cpp
+index 5d4aa91..ea3c233 100644
+--- a/module/src/BotAddonChat.cpp
++++ b/module/src/BotAddonChat.cpp
+@@ -26,7 +26,9 @@
+ #include "map/BotMapService.h"
+ #include "Log.h"
+ #include "MotionMaster.h"
++#include "ObjectMgr.h"
+ #include "Player.h"
++#include "QuestDef.h"
+ #include "ScriptMgr.h"
+ #include "SharedDefines.h"
+ #include "Unit.h"
+@@ -129,6 +131,164 @@ void SendCoaBotReply(Player* recipient, std::string const& body)
+     recipient->SendDirectMessage(&packet);
+ }
+ 
++// Free text (quest titles, objective names) goes last on its reply line so the client can take
++// everything after the fixed fields verbatim, colons included. Pipes and line breaks are swapped
++// for spaces (a stray '|' would start a client escape sequence) and the text is cut on a UTF-8
++// character boundary so the whole body stays under the addon-whisper length cap.
++std::string WireText(std::string const& text, std::size_t maxBytes)
++{
++    std::string out;
++    out.reserve(text.size() < maxBytes ? text.size() : maxBytes);
++    for (char c : text)
++        out += (c == '|' || c == '\n' || c == '\r') ? ' ' : c;
++    if (out.size() > maxBytes)
++    {
++        std::size_t cut = maxBytes;
++        while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80)
++            --cut;
++        out.resize(cut);
++    }
++    return out;
++}
++
++// Room left for the trailing free-text field of a reply whose fixed part is `head`.
++std::size_t WireRoom(std::string const& head)
++{
++    constexpr std::size_t MAX_BODY = 240; // "COABOT\t" + body must stay under 255
++    return head.size() >= MAX_BODY ? 0 : MAX_BODY - head.size();
++}
++
++// GETQUESTS reply: QUESTHDR, then QUEST + its QOBJ lines per quest-log entry, then QUESTEND.
++void SendBotQuestLog(Player* commander, Player* bot, ObjectGuid::LowType botGuidLow)
++{
++    std::string const guid = std::to_string(botGuidLow);
++
++    std::vector<uint32> questIds;
++    for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
++    {
++        uint32 questId = bot->GetQuestSlotQuestId(slot);
++        if (questId && sObjectMgr->GetQuestTemplate(questId))
++            questIds.push_back(questId);
++    }
++
++    SendCoaBotReply(commander, "QUESTHDR:" + guid + ":" + std::to_string(questIds.size()) + ":" +
++        std::to_string(uint32(bot->GetLevel())));
++
++    QuestStatusMap& statusMap = bot->getQuestStatusMap();
++    for (uint32 questId : questIds)
++    {
++        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
++        QuestStatus status = bot->GetQuestStatus(questId);
++        uint32 statusCode = 0;
++        if (status == QUEST_STATUS_COMPLETE)
++            statusCode = 1;
++        else if (status == QUEST_STATUS_FAILED)
++            statusCode = 2;
++
++        int32 level = bot->GetQuestLevel(quest);
++        if (level <= 0)
++            level = int32(bot->GetLevel());
++
++        std::string const qid = std::to_string(questId);
++        std::string head = "QUEST:" + guid + ":" + qid + ":" + std::to_string(level) + ":" +
++            std::to_string(statusCode) + ":";
++        SendCoaBotReply(commander, head + WireText(quest->GetTitle(), WireRoom(head)));
++
++        QuestStatusData const* data = nullptr;
++        QuestStatusMap::const_iterator itr = statusMap.find(questId);
++        if (itr != statusMap.end())
++            data = &itr->second;
++
++        auto sendObjective = [&](char type, uint32 id, uint32 have, uint32 need, std::string const& name)
++        {
++            if (have > need)
++                have = need;
++            std::string objHead = "QOBJ:" + guid + ":" + qid + ":" + std::string(1, type) + ":" +
++                std::to_string(id) + ":" + std::to_string(have) + ":" + std::to_string(need) + ":";
++            SendCoaBotReply(commander, objHead + WireText(name, WireRoom(objHead)));
++        };
++
++        // Kill / use-object objectives (>0 creature entry, <0 gameobject entry).
++        for (uint8 i = 0; i < QUEST_OBJECTIVES_COUNT; ++i)
++        {
++            int32 npcOrGo = quest->RequiredNpcOrGo[i];
++            uint32 need = quest->RequiredNpcOrGoCount[i];
++            if (!npcOrGo || !need)
++                continue;
++
++            uint32 have = data ? data->CreatureOrGOCount[i] : 0;
++            std::string name = quest->ObjectiveText[i];
++            char type = 'c';
++            uint32 entry = 0;
++            if (npcOrGo > 0)
++            {
++                entry = uint32(npcOrGo);
++                if (name.empty())
++                    if (CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(entry))
++                        name = tmpl->Name;
++            }
++            else
++            {
++                type = 'g';
++                entry = uint32(-npcOrGo);
++                if (name.empty())
++                    if (GameObjectTemplate const* tmpl = sObjectMgr->GetGameObjectTemplate(entry))
++                        name = tmpl->name;
++            }
++            if (name.empty())
++                name = std::string(type == 'c' ? "Creature " : "Object ") + std::to_string(entry);
++            sendObjective(type, entry, have, need, name);
++        }
++
++        // Item objectives: what the bot is carrying (bank included), capped at the requirement.
++        for (uint8 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
++        {
++            uint32 itemId = quest->RequiredItemId[i];
++            uint32 need = quest->RequiredItemCount[i];
++            if (!itemId || !need)
++                continue;
++
++            uint32 have = bot->GetItemCount(itemId, true);
++            std::string name;
++            if (ItemTemplate const* tmpl = sObjectMgr->GetItemTemplate(itemId))
++                name = tmpl->Name1;
++            if (name.empty())
++                name = "Item " + std::to_string(itemId);
++            sendObjective('i', itemId, have, need, name);
++        }
++
++        // Player kills (PvP quests).
++        if (uint32 needKills = quest->GetPlayersSlain())
++            sendObjective('p', 0, data ? data->PlayerCount : 0, needKills, "Players slain");
++
++        // Exploration / scripted-event requirement: one done-or-not line.
++        if (quest->HasSpecialFlag(QUEST_SPECIAL_FLAGS_EXPLORATION_OR_EVENT))
++        {
++            std::string name;
++            for (uint8 i = 0; i < QUEST_OBJECTIVES_COUNT && name.empty(); ++i)
++                if (!quest->RequiredNpcOrGo[i] && !quest->ObjectiveText[i].empty())
++                    name = quest->ObjectiveText[i];
++            if (name.empty())
++                name = "Explore or complete the event";
++            bool done = (data && data->Explored) || statusCode == 1;
++            sendObjective('e', 0, done ? 1 : 0, 1, name);
++        }
++    }
++
++    SendCoaBotReply(commander, "QUESTEND:" + guid + ":" + std::to_string(questIds.size()));
++}
++
++void HandleCoaBotMessage(Player* commander, std::string const& body);
++}
++
++void CoaBotSendAddonReply(Player* recipient, std::string const& body)
++{
++    if (recipient && recipient->GetSession())
++        SendCoaBotReply(recipient, body);
++}
++
++namespace
++{
+ void HandleCoaBotMessage(Player* commander, std::string const& body)
+ {
+     std::vector<std::string> parts = SplitColon(body);
+@@ -306,6 +466,40 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
+         return;
+     }
+ 
++    // Task Board order management. These name a guild bot (or a queue id), not a grouped one, so
++    // they sit before the grouped-bot authorization gate below; BotMgr checks instead that the
++    // sender is in that guild and is a guild master/officer or the player who placed the order.
++    //   CANCELORDER:<botGuidLow>     -> ORDERRESULT:cancel:<botGuidLow>:<ok|denied|none>
++    //   PRIORITIZEORDER:<botGuidLow> -> ORDERRESULT:top:<botGuidLow>:<ok|denied|none|offline|busy|failed>
++    //   CANCELQUEUED:<queueId>       -> ORDERRESULT:cancelqueued:<queueId>:<ok|denied|none>
++    //   TOPQUEUED:<queueId>          -> ORDERRESULT:topqueued:<queueId>:<ok|denied|none>
++    if (verb == "CANCELORDER" || verb == "PRIORITIZEORDER" || verb == "CANCELQUEUED" || verb == "TOPQUEUED")
++    {
++        uint32 id = std::strtoul(parts[1].c_str(), nullptr, 10);
++        std::string result = "none";
++        char const* kind = "cancel";
++        if (verb == "CANCELORDER")
++            result = sBotMgr->CancelGatherOrder(commander, id);
++        else if (verb == "PRIORITIZEORDER")
++        {
++            kind = "top";
++            result = sBotMgr->PrioritizeGatherOrder(commander, id);
++        }
++        else if (verb == "CANCELQUEUED")
++        {
++            kind = "cancelqueued";
++            result = sBotMgr->CancelQueuedGatherOrder(commander, id);
++        }
++        else
++        {
++            kind = "topqueued";
++            result = sBotMgr->TopQueuedGatherOrder(commander, id);
++        }
++        LOG_INFO("module.coa-playerbots", "BotAddonChat: '{}' -> {} {} = {}.", commander->GetName(), verb, id, result);
++        SendCoaBotReply(commander, std::string("ORDERRESULT:") + kind + ":" + std::to_string(id) + ":" + result);
++        return;
++    }
++
+     // GOLDORDER: ask a free guild-mate bot to earn that many gold for the guild bank (0 cancels the
+     // guild's gold orders). Guild master or officers only, checked in BotEconomy::PlaceGoldOrder.
+     if (verb == "GOLDORDER" && parts.size() >= 2)
+@@ -630,6 +824,15 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
+         SendCoaBotReply(commander, "GEARLOCKS:" + std::to_string(botGuidLow) + ":" +
+             std::to_string(BotAI::GetLockedEquipMask(bot->GetGUID())));
+     }
++    else if (verb == "GETQUESTS")
++    {
++        // GETQUESTS:<botGuidLow> -- the bot's quest log with objective progress:
++        //   QUESTHDR:<guid>:<questCount>:<botLevel>
++        //   QUEST:<guid>:<questId>:<level>:<status 0 in progress|1 complete|2 failed>:<title>
++        //   QOBJ:<guid>:<questId>:<c|g|i|p|e>:<entry>:<have>:<need>:<name>
++        //   QUESTEND:<guid>:<questCount>
++        SendBotQuestLog(commander, bot, botGuidLow);
++    }
+     else if (verb == "GETPROFS")
+     {
+         // GETPROFS:<botGuidLow>
+diff --git a/module/src/BotMgr.cpp b/module/src/BotMgr.cpp
+index c560223..b265b11 100644
+--- a/module/src/BotMgr.cpp
++++ b/module/src/BotMgr.cpp
+@@ -8,6 +8,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cctype>
++#include <limits>
+ #include "AccountMgr.h"
+ #include "AscensionClassServiceBridge.h"
+ #include "AscensionCoATalentData.h"
+@@ -282,6 +283,261 @@ bool ResolveGatherLocationForItem(uint32 itemEntry, uint32 currentMapId, float c
+     return false;
+ }
+ 
++// --- Gather-order sourcing, assignment and lifecycle tuning -------------------------------
++// Level slack either way: a bot may take a source up to this many levels above itself, and a
++// hunt spawn counts as "level-appropriate" for location picking while its maxlevel is within it.
++constexpr uint32 GATHER_LEVEL_TOLERANCE = 2;
++// Beyond this many levels above the source a bot still qualifies, but every extra level makes it
++// a worse pick than a closer-level bot (so a level 80 is not sent for Linen while a 12 is free).
++constexpr uint32 GATHER_LEVEL_OVER_SOFT = 10;
++// RetryGuildGatherLocation calls (one per GUILD_GATHER_RETELEPORT_MS stall in BotAI.cpp, ~45 s)
++// without a single deposit in between before the order is given up as stuck (~7.5 minutes).
++constexpr uint32 GUILD_GATHER_MAX_STALLED_RETRIES = 10;
++// An order whose bot is online and in the world but deposits nothing for this long is given up
++// too -- catches loops the stall counter can't see (e.g. killing mobs that never drop the item).
++constexpr uint32 GUILD_GATHER_NO_PROGRESS_MS = 30 * MINUTE * IN_MILLISECONDS;
++// Retry picks avoid spawns this close (yards) to the spot the order was already pointed at.
++constexpr float HUNT_RETRY_AVOID_RADIUS = 100.0f;
++// A retry/first pick chooses at random among this many nearest level-appropriate spawns, so
++// repeated retries spread over a hunting area instead of always naming the same single mob.
++constexpr std::size_t HUNT_NEAREST_CANDIDATES = 6;
++
++bool IsOpenWorldContinent(uint32 mapId)
++{
++    return mapId == 0 || mapId == 1 || mapId == 530 || mapId == 571;
++}
++
++// Same formula as Spell::EffectSkinning's reqValue: the skill a creature of `level` needs.
++uint32 SkinningSkillForLevel(uint32 level)
++{
++    return level < 10 ? 0 : level < 20 ? (level - 10) * 10 : level * 5;
++}
++
++void CollectLootEntries(std::string const& sql, std::unordered_set<uint32>& out)
++{
++    if (QueryResult r = WorldDatabase.Query(sql))
++    {
++        do
++        {
++            out.insert(r->Fetch()[0].Get<uint32>());
++        } while (r->NextRow());
++    }
++}
++
++// One-time (per item, see BotMgr::GetGatherSourceInfo's cache) world-DB lookup of everything a
++// gather order for itemEntry can be sourced from. Loot tables come from SQL; templates and spawns
++// come from ObjectMgr's in-memory stores (already loaded, and the CoA `creature` schema's renamed
++// columns never come into play). Reference loot is followed one level deep only: an item that is
++// only reachable through a reference nested inside another reference is not found here.
++BotMgr::GatherSourceInfo BuildGatherSourceInfo(uint32 itemEntry)
++{
++    BotMgr::GatherSourceInfo info;
++    std::string const item = std::to_string(itemEntry);
++
++    // Only a real herbalism/mining node counts as "node-sourced". gameobject_loot_template also
++    // holds chests, crates and footlockers -- Linen Cloth and Light Leather are both in it (6 and
++    // 10 loot ids on a stock AzerothCore DB) -- and treating those as nodes is what sent cloth
++    // orders to random chest spawns before; such items are hunted instead.
++    std::unordered_set<uint32> goLootIds;
++    CollectLootEntries("SELECT DISTINCT Entry FROM gameobject_loot_template WHERE Item = " + item, goLootIds);
++    if (!goLootIds.empty())
++    {
++        uint32 bestSkill = (std::numeric_limits<uint32>::max)();
++        if (GameObjectTemplateContainer const* goTemplates = sObjectMgr->GetGameObjectTemplates())
++        {
++            for (auto const& [goEntry, goTemplate] : *goTemplates)
++            {
++                if (!goLootIds.count(goTemplate.GetLootId()))
++                    continue;
++                LockEntry const* lock = sLockStore.LookupEntry(goTemplate.GetLockId());
++                if (!lock)
++                    continue;
++                for (uint8 j = 0; j < MAX_LOCK_CASE; ++j)
++                {
++                    if (lock->Type[j] != LOCK_KEY_SKILL)
++                        continue;
++                    SkillType const skill = SkillByLockType(LockType(lock->Index[j]));
++                    if (skill != SKILL_HERBALISM && skill != SKILL_MINING)
++                        continue;
++                    info.nodeSourced = true;
++                    if (lock->Skill[j] < bestSkill)
++                    {
++                        bestSkill = lock->Skill[j];
++                        info.nodeSkillId = skill;
++                    }
++                }
++            }
++        }
++        if (info.nodeSourced)
++        {
++            info.nodeRequiredSkill = bestSkill;
++            return info; // node items keep the node search; no hunt data needed
++        }
++    }
++
++    if (QueryResult fish = WorldDatabase.Query("SELECT 1 FROM fishing_loot_template WHERE Item = {} LIMIT 1", itemEntry))
++    {
++        info.fishSourced = true;
++        return info;
++    }
++
++    std::unordered_set<uint32> corpseLootIds;
++    CollectLootEntries("SELECT DISTINCT Entry FROM creature_loot_template WHERE Reference = 0 AND Item = " + item, corpseLootIds);
++    CollectLootEntries("SELECT DISTINCT clt.Entry FROM creature_loot_template clt "
++        "JOIN reference_loot_template rlt ON rlt.Entry = clt.Reference "
++        "WHERE clt.Reference <> 0 AND rlt.Reference = 0 AND rlt.Item = " + item, corpseLootIds);
++
++    std::unordered_set<uint32> skinLootIds;
++    CollectLootEntries("SELECT DISTINCT Entry FROM skinning_loot_template WHERE Reference = 0 AND Item = " + item, skinLootIds);
++    CollectLootEntries("SELECT DISTINCT slt.Entry FROM skinning_loot_template slt "
++        "JOIN reference_loot_template rlt ON rlt.Entry = slt.Reference "
++        "WHERE slt.Reference <> 0 AND rlt.Reference = 0 AND rlt.Item = " + item, skinLootIds);
++
++    if (corpseLootIds.empty() && skinLootIds.empty())
++        return info;
++
++    std::unordered_map<uint32, std::pair<uint8, uint8>> levels; // creature entry -> min/max level
++    if (CreatureTemplateContainer const* templates = sObjectMgr->GetCreatureTemplates())
++    {
++        for (auto const& [entry, ct] : *templates)
++        {
++            // Normal-rank only: elites, rares and bosses are not something a lone bot should be
++            // sent to farm (and usually live in instances anyway).
++            if (ct.rank != CREATURE_ELITE_NORMAL)
++                continue;
++            bool const corpse = ct.lootid && corpseLootIds.count(ct.lootid);
++            // Skinning loot opened with Herbalism/Mining/Engineering is not something the hunt
++            // loop's Skinning cast can open, so those creatures don't count as hide sources.
++            bool const skin = ct.SkinLootId && skinLootIds.count(ct.SkinLootId) && ct.GetRequiredLootSkill() == SKILL_SKINNING;
++            if (!corpse && !skin)
++                continue;
++            if (corpse)
++                info.huntCorpseEntries.insert(entry);
++            if (skin)
++                info.huntSkinEntries.insert(entry);
++            levels[entry] = { ct.minlevel, ct.maxlevel };
++        }
++    }
++
++    uint8 minLevel = 0;
++    for (auto const& [spawnId, data] : sObjectMgr->GetAllCreatureData())
++    {
++        if (!IsOpenWorldContinent(data.mapid))
++            continue;
++        auto lv = levels.find(data.id);
++        if (lv == levels.end())
++            continue;
++        BotMgr::HuntSpawn spawn;
++        spawn.mapId = data.mapid;
++        spawn.x = data.posX;
++        spawn.y = data.posY;
++        spawn.z = data.posZ;
++        spawn.minLevel = lv->second.first;
++        spawn.maxLevel = std::max(lv->second.first, lv->second.second);
++        info.huntSpawns.push_back(spawn);
++        if (!minLevel || spawn.minLevel < minLevel)
++            minLevel = spawn.minLevel;
++    }
++    info.huntMinLevel = minLevel;
++    return info;
++}
++
++// Picks a hunting spot for a drop/skin-sourced order. Order of preference:
++//  1. same map as the bot, maxlevel <= bot level + GATHER_LEVEL_TOLERANCE -- random among the
++//     HUNT_NEAREST_CANDIDATES nearest (walkable, and a retry lands somewhere new);
++//  2. another continent, same level rule -- random (teleport);
++//  3. any level, lowest-level spawns first, same map preferred;
++// always skipping spawns within HUNT_RETRY_AVOID_RADIUS of `avoid*` when hasAvoid (a retry) and
++// at least one other spawn exists.
++bool ResolveHuntLocation(BotMgr::GatherSourceInfo const& info, Player* bot, bool hasAvoid, uint32 avoidMap,
++    float avoidX, float avoidY, uint32& mapId, float& x, float& y, float& z)
++{
++    if (info.huntSpawns.empty())
++        return false;
++
++    uint32 const level = bot->GetLevel();
++    uint32 const botMap = bot->GetMapId();
++    float const bx = bot->GetPositionX();
++    float const by = bot->GetPositionY();
++    auto avoided = [&](BotMgr::HuntSpawn const& s)
++    {
++        if (!hasAvoid || s.mapId != avoidMap)
++            return false;
++        float const dx = s.x - avoidX, dy = s.y - avoidY;
++        return dx * dx + dy * dy < HUNT_RETRY_AVOID_RADIUS * HUNT_RETRY_AVOID_RADIUS;
++    };
++    auto distSq = [&](BotMgr::HuntSpawn const& s)
++    {
++        float const dx = s.x - bx, dy = s.y - by;
++        return dx * dx + dy * dy;
++    };
++    auto pick = [&](BotMgr::HuntSpawn const& s)
++    {
++        mapId = s.mapId;
++        x = s.x;
++        y = s.y;
++        z = s.z;
++        return true;
++    };
++
++    for (int pass = 0; pass < 2; ++pass) // pass 1 drops the retry-avoid rule if it left nothing
++    {
++        bool const useAvoid = pass == 0;
++        std::vector<BotMgr::HuntSpawn const*> sameMap, otherMap, anyLevel;
++        for (BotMgr::HuntSpawn const& s : info.huntSpawns)
++        {
++            if (useAvoid && avoided(s))
++                continue;
++            anyLevel.push_back(&s);
++            if (s.maxLevel > level + GATHER_LEVEL_TOLERANCE)
++                continue;
++            (s.mapId == botMap ? sameMap : otherMap).push_back(&s);
++        }
++
++        if (!sameMap.empty())
++        {
++            std::size_t const n = std::min(HUNT_NEAREST_CANDIDATES, sameMap.size());
++            std::partial_sort(sameMap.begin(), sameMap.begin() + n, sameMap.end(),
++                [&](BotMgr::HuntSpawn const* a, BotMgr::HuntSpawn const* b) { return distSq(*a) < distSq(*b); });
++            return pick(*sameMap[urand(0, uint32(n - 1))]);
++        }
++        if (!otherMap.empty())
++            return pick(*otherMap[urand(0, uint32(otherMap.size() - 1))]);
++        if (!anyLevel.empty())
++        {
++            std::sort(anyLevel.begin(), anyLevel.end(), [&](BotMgr::HuntSpawn const* a, BotMgr::HuntSpawn const* b)
++            {
++                if (a->maxLevel != b->maxLevel)
++                    return a->maxLevel < b->maxLevel;
++                bool const aSame = a->mapId == botMap, bSame = b->mapId == botMap;
++                if (aSame != bSame)
++                    return aSame;
++                return aSame && distSq(*a) < distSq(*b);
++            });
++            return pick(*anyLevel.front());
++        }
++    }
++    return false;
++}
++
++std::string GatherItemName(uint32 itemEntry)
++{
++    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemEntry);
++    return proto ? proto->Name1 : ("item " + std::to_string(itemEntry));
++}
++
++// Human-readable text for an ORDERFAIL reason token (the token itself goes on the addon wire).
++char const* GatherFailReasonText(std::string const& reason)
++{
++    if (reason == "nosource")   return "no place to get it from was found";
++    if (reason == "stuck")      return "it kept finding nothing to gather there";
++    if (reason == "noprogress") return "it made no progress for 30 minutes";
++    if (reason == "noskinning") return "it doesn't know Skinning well enough for that hide";
++    if (reason == "leftguild")  return "it left the guild";
++    if (reason == "nobot")      return "no guild bot is online and ungrouped";
++    return "it gave up";
++}
++
+ bool CrafterHasReagentsFor(Player* crafter, SpellInfo const* spellInfo)
+ {
+     for (uint8 i = 0; i < MAX_SPELL_REAGENTS; ++i)
+@@ -1347,7 +1603,8 @@ void BotMgr::DepositLooseResourcesToGuildBank(Player* bot)
+         GuildDepositItem(bot->GetGUID().GetCounter(), itemEntry, 0, nullptr);
+ }
+ 
+-void BotMgr::GuildGather(ObjectGuid::LowType charLowGuid, uint32 itemEntry, uint32 targetCount, ChatHandler* handler)
++void BotMgr::GuildGather(ObjectGuid::LowType charLowGuid, uint32 itemEntry, uint32 targetCount, ChatHandler* handler,
++    ObjectGuid::LowType requesterLowGuid)
+ {
+     WorldSession* session = FindBotSession(charLowGuid);
+     if (!session)
+@@ -1371,6 +1628,10 @@ void BotMgr::GuildGather(ObjectGuid::LowType charLowGuid, uint32 itemEntry, uint
+         return;
+     }
+ 
++    // A GM placing the order through .botcmd is its requester too (notices, cancel rights).
++    if (!requesterLowGuid && handler && handler->GetSession() && handler->GetSession()->GetPlayer())
++        requesterLowGuid = handler->GetSession()->GetPlayer()->GetGUID().GetCounter();
++
+     EnsureBotBankRights(bot, guild);
+ 
+     // Hand out a task with clean bags: bank whatever raw materials it's already carrying (worth
+@@ -1381,6 +1642,11 @@ void BotMgr::GuildGather(ObjectGuid::LowType charLowGuid, uint32 itemEntry, uint
+     DepositLooseResourcesToGuildBank(bot);
+     BotAI::PrepareBagsForTask(bot);
+ 
++    GuildGatherOrder order;
++    order.itemEntry = itemEntry;
++    order.targetCount = targetCount;
++    order.requesterLowGuid = requesterLowGuid;
++
+     // 1. Immediately deposit any matching items already held in inventory
+     uint32 deposited = GuildDepositItem(charLowGuid, itemEntry, targetCount, nullptr);
+ 
+@@ -1391,31 +1657,51 @@ void BotMgr::GuildGather(ObjectGuid::LowType charLowGuid, uint32 itemEntry, uint
+                 bot->GetName(), deposited, itemEntry);
+         _guildGatherOrders.erase(bot->GetGUID());
+         DeleteGuildGatherOrder(bot->GetGUID());
++        order.gatheredCount = deposited;
++        NotifyGatherOrderDone(bot, order);
+         return;
+     }
+ 
+     uint32 remaining = targetCount - deposited;
+-    GuildGatherOrder order;
+-    order.itemEntry = itemEntry;
+-    order.targetCount = targetCount;
+     order.gatheredCount = deposited;
+     order.remainingCount = remaining;
++    order.lastProgressMs = getMSTime();
++
++    // A hide that only comes from skinning needs a bot that can actually skin it -- otherwise the
++    // hunt loop would kill matching beasts forever with nothing to show for it.
++    GatherSourceInfo const& info = GetGatherSourceInfo(itemEntry);
++    if (info.IsHunt() && info.SkinOnly() &&
++        (!bot->HasSkill(SKILL_SKINNING) || bot->GetSkillValue(SKILL_SKINNING) < SkinningSkillForLevel(info.huntMinLevel)))
++    {
++        if (handler)
++            handler->PSendSysMessage("BotMgr: bot '{}' can't skin anything that drops item {} (Skinning missing or too low).",
++                bot->GetName(), itemEntry);
++        NotifyGatherOrderFail(bot->GetGUID(), bot->GetName(), order, "noskinning");
++        return;
++    }
+ 
+     uint32 locMap = 0;
+     float locX = 0.0f, locY = 0.0f, locZ = 0.0f;
+-    if (ResolveGatherLocationForItem(itemEntry, bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), locMap, locX, locY, locZ))
++    if (!ResolveOrderLocation(bot, order, false, locMap, locX, locY, locZ))
+     {
+-        order.targetMapId = locMap;
+-        order.targetX = locX;
+-        order.targetY = locY;
+-        order.targetZ = locZ;
+-        order.hasTargetLocation = true;
++        // Nothing in the world DB yields this item anywhere a bot can go: say so instead of
++        // parking the bot on an order that can never progress.
++        if (handler)
++            handler->PSendSysMessage("BotMgr: no gather/hunt location found for item {} -- order not placed.", itemEntry);
++        NotifyGatherOrderFail(bot->GetGUID(), bot->GetName(), order, "nosource");
++        return;
++    }
+ 
+-        if (bot->GetMapId() != locMap)
+-        {
+-            bot->TeleportTo(locMap, locX, locY, locZ, 0.0f);
+-            QueueTeleportAck(session);
+-        }
++    order.targetMapId = locMap;
++    order.targetX = locX;
++    order.targetY = locY;
++    order.targetZ = locZ;
++    order.hasTargetLocation = true;
++
++    if (bot->GetMapId() != locMap)
++    {
++        bot->TeleportTo(locMap, locX, locY, locZ, 0.0f);
++        QueueTeleportAck(session);
+     }
+     _guildGatherOrders[bot->GetGUID()] = order;
+     SaveGuildGatherOrder(bot->GetGUID(), order);
+@@ -1423,8 +1709,87 @@ void BotMgr::GuildGather(ObjectGuid::LowType charLowGuid, uint32 itemEntry, uint
+     if (handler)
+         handler->PSendSysMessage("BotMgr: guildgather order placed for bot '{}': need {}x item {} (already deposited {}x).",
+             bot->GetName(), remaining, itemEntry, deposited);
+-    LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotMgr: guildgather order for bot '{}': item {} need {} (already deposited {}).",
+-        bot->GetName(), itemEntry, remaining, deposited);
++    if (Player* requester = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(requesterLowGuid)))
++        if (requester->GetSession() && !FindBotSession(requesterLowGuid) && (!handler || handler->GetSession() != requester->GetSession()))
++            ChatHandler(requester->GetSession()).PSendSysMessage("|cff33ff99Guild order:|r {} is {} {}x {} for the guild bank.",
++                bot->GetName(), info.IsHunt() ? "hunting for" : "gathering", targetCount, GatherItemName(itemEntry));
++    LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotMgr: guildgather order for bot '{}': item {} need {} (already deposited {}){}.",
++        bot->GetName(), itemEntry, remaining, deposited, info.IsHunt() ? ", targeted hunt" : "");
++}
++
++BotMgr::GatherSourceInfo const& BotMgr::GetGatherSourceInfo(uint32 itemEntry)
++{
++    // Entries are never erased, and unordered_map nodes don't move, so the returned reference
++    // stays valid; the lock only guards a first-time build racing a lookup.
++    static std::mutex sourceInfoMutex;
++    std::lock_guard<std::mutex> lock(sourceInfoMutex);
++    auto it = _gatherSourceInfo.find(itemEntry);
++    if (it == _gatherSourceInfo.end())
++        it = _gatherSourceInfo.emplace(itemEntry, BuildGatherSourceInfo(itemEntry)).first;
++    return it->second;
++}
++
++bool BotMgr::ResolveOrderLocation(Player* bot, GuildGatherOrder const& order, bool avoidCurrentTarget,
++    uint32& mapId, float& x, float& y, float& z)
++{
++    GatherSourceInfo const& info = GetGatherSourceInfo(order.itemEntry);
++    if (info.IsHunt() && ResolveHuntLocation(info, bot, avoidCurrentTarget && order.hasTargetLocation, order.targetMapId,
++            order.targetX, order.targetY, mapId, x, y, z))
++        return true;
++    // Nodes, fish, and anything the hunt data doesn't cover keep the original lookup.
++    return ResolveGatherLocationForItem(order.itemEntry, bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), mapId, x, y, z);
++}
++
++Player* BotMgr::PickGatherBot(uint32 guildId, uint32 itemEntry, bool allowBusy)
++{
++    GatherSourceInfo const& info = GetGatherSourceInfo(itemEntry);
++    Player* best = nullptr;
++    uint64 bestScore = (std::numeric_limits<uint64>::max)();
++    for (Player* bot : GetOnlineBots())
++    {
++        if (bot->GetGuildId() != guildId || !bot->IsInWorld())
++            continue;
++        // Grouped bots follow their player/leader.
++        if (bot->GetGroup())
++            continue;
++        bool const busy = _guildGatherOrders.count(bot->GetGUID()) || _craftOrders.count(bot->GetGUID());
++        if (busy && !allowBusy)
++            continue;
++
++        // Lower is better: busy >> unsuitable >> levels too far above the source.
++        uint64 score = busy ? 1000000 : 0;
++        uint32 const level = bot->GetLevel();
++        if (info.IsHunt())
++        {
++            uint32 const source = info.huntMinLevel;
++            if (level + GATHER_LEVEL_TOLERANCE < source)
++                score += 10000 + (source - level) * 10;
++            else if (level > source + GATHER_LEVEL_OVER_SOFT)
++                score += level - source - GATHER_LEVEL_OVER_SOFT;
++            if (info.SkinOnly())
++            {
++                uint32 const needed = SkinningSkillForLevel(source);
++                if (!bot->HasSkill(SKILL_SKINNING) || bot->GetSkillValue(SKILL_SKINNING) < needed)
++                    score += 50000;
++            }
++            else if (!info.huntSkinEntries.empty() && bot->HasSkill(SKILL_SKINNING))
++                score = score > 0 ? score - 1 : 0; // can also skin: a slightly better hide/meat source
++        }
++        else if (info.nodeSourced && info.nodeSkillId)
++        {
++            if (!bot->HasSkill(info.nodeSkillId))
++                score += 20000;
++            else if (bot->GetSkillValue(info.nodeSkillId) < info.nodeRequiredSkill)
++                score += 10000 + (info.nodeRequiredSkill - bot->GetSkillValue(info.nodeSkillId));
++        }
++
++        if (score < bestScore)
++        {
++            bestScore = score;
++            best = bot;
++        }
++    }
++    return best;
+ }
+ 
+ void BotMgr::GatherOrder(ObjectGuid::LowType requesterCharLowGuid, uint32 itemEntry, uint32 count, ChatHandler* handler)
+@@ -1445,32 +1810,70 @@ void BotMgr::GatherOrder(ObjectGuid::LowType requesterCharLowGuid, uint32 itemEn
+         return;
+     }
+ 
+-    // Pick an online guild bot that is NOT currently grouped (grouped bots follow their player/leader).
+-    Player* chosen = nullptr;
+-    for (Player* bot : GetOnlineBots())
++    // Best free, ungrouped guild bot whose level/skill suits where the item comes from; when none
++    // suits, the best free one anyway (the old "first free bot" behavior, just ranked).
++    Player* chosen = PickGatherBot(guildId, itemEntry, false);
++    if (!chosen)
+     {
+-        if (bot->GetGuildId() != guildId)
+-            continue;
+-        if (bot->GetGroup())
+-            continue;
+-        bool busy = _guildGatherOrders.count(bot->GetGUID()) || _craftOrders.count(bot->GetGUID());
+-        if (!busy)
++        GuildGatherOrder dummy;
++        dummy.itemEntry = itemEntry;
++        dummy.targetCount = count;
++        dummy.requesterLowGuid = requesterCharLowGuid;
++        if (!PickGatherBot(guildId, itemEntry, true))
+         {
+-            chosen = bot;
+-            break;
++            if (handler)
++                handler->PSendSysMessage("BotMgr: no online guild-mate bot found to gather item {}.", itemEntry);
++            NotifyGatherOrderFail(ObjectGuid::Empty, "", dummy, "nobot");
++            return;
+         }
+-        if (!chosen)
+-            chosen = bot;
+-    }
+ 
+-    if (!chosen)
+-    {
+-        if (handler)
+-            handler->PSendSysMessage("BotMgr: no online guild-mate bot found to gather item {}.", itemEntry);
++        // Every eligible bot already has an order: queue this one instead of overwriting theirs.
++        QueuedGatherOrder queued;
++        queued.queueId = _nextGatherQueueId++;
++        queued.guildId = guildId;
++        queued.requesterLowGuid = requesterCharLowGuid;
++        queued.itemEntry = itemEntry;
++        queued.count = count;
++        _gatherQueue.push_back(queued);
++        SaveGatherQueue();
++        uint32 position = 0;
++        for (QueuedGatherOrder const& q : _gatherQueue)
++            if (q.guildId == guildId)
++                ++position;
++        ChatHandler(requester->GetSession()).PSendSysMessage(
++            "|cff33ff99Guild order:|r every guild bot is busy -- {}x {} is queued (#{}). It starts when a bot frees up.",
++            count, GatherItemName(itemEntry), position);
++        CoaBotSendAddonReply(requester, "ORDERQUEUED:" + std::to_string(queued.queueId) + ":" + std::to_string(itemEntry) + ":" +
++            std::to_string(count) + ":" + std::to_string(position));
+         return;
+     }
+ 
+-    GuildGather(chosen->GetGUID().GetCounter(), itemEntry, count, handler);
++    GuildGather(chosen->GetGUID().GetCounter(), itemEntry, count, handler, requesterCharLowGuid);
++}
++
++void BotMgr::ProcessGatherQueue()
++{
++    if (_gatherQueue.empty())
++        return;
++    bool changed = false;
++    for (auto it = _gatherQueue.begin(); it != _gatherQueue.end(); )
++    {
++        Player* chosen = PickGatherBot(it->guildId, it->itemEntry, false);
++        if (!chosen)
++        {
++            ++it;
++            continue;
++        }
++        QueuedGatherOrder const queued = *it;
++        it = _gatherQueue.erase(it);
++        changed = true;
++        LOG_DEBUG("module.coa-playerbots", "BotMgr: queued gather order {} ({}x item {}) assigned to '{}'.",
++            queued.queueId, queued.count, queued.itemEntry, chosen->GetName());
++        // May erase nothing from _gatherQueue (it only touches _guildGatherOrders), so `it` stays valid.
++        GuildGather(chosen->GetGUID().GetCounter(), queued.itemEntry, queued.count, nullptr, queued.requesterLowGuid);
++    }
++    if (changed)
++        SaveGatherQueue();
+ }
+ 
+ BotMgr::GuildGatherOrder const* BotMgr::GetGuildGatherOrder(ObjectGuid const& guid) const
+@@ -1485,7 +1888,7 @@ BotMgr::CraftOrderState const* BotMgr::GetCraftOrder(ObjectGuid const& guid) con
+     return it != _craftOrders.end() ? &it->second : nullptr;
+ }
+ 
+-void BotMgr::RetryGuildGatherLocation(ObjectGuid const& guid)
++void BotMgr::RetryGuildGatherLocation(ObjectGuid const& guid, bool rush)
+ {
+     auto it = _guildGatherOrders.find(guid);
+     if (it == _guildGatherOrders.end())
+@@ -1496,10 +1899,23 @@ void BotMgr::RetryGuildGatherLocation(ObjectGuid const& guid)
+     if (!bot)
+         return;
+ 
++    if (rush)
++        it->second.stalledRetries = 0;
++    else if (++it->second.stalledRetries >= GUILD_GATHER_MAX_STALLED_RETRIES)
++    {
++        LOG_DEBUG(BotAI::BotDebugLog::LoggerName(guid), "BotMgr: guild gather order for bot '{}' (item {}) gave up after {} fruitless relocations.",
++            bot->GetName(), it->second.itemEntry, it->second.stalledRetries);
++        FailGuildGatherOrder(guid, "stuck");
++        return;
++    }
++
+     uint32 locMap = 0;
+     float locX = 0.0f, locY = 0.0f, locZ = 0.0f;
+-    if (!ResolveGatherLocationForItem(it->second.itemEntry, bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), locMap, locX, locY, locZ))
++    if (!ResolveOrderLocation(bot, it->second, true, locMap, locX, locY, locZ))
++    {
++        FailGuildGatherOrder(guid, "nosource");
+         return;
++    }
+ 
+     it->second.targetMapId = locMap;
+     it->second.targetX = locX;
+@@ -1514,21 +1930,152 @@ void BotMgr::RetryGuildGatherLocation(ObjectGuid const& guid)
+     // used for the very first assignment) carry the bot there like it would anywhere else --
+     // confirmed live 2026-09-29 as a real problem at fleet scale: every retry teleporting
+     // unconditionally had bots instantly hopping node to node / fishing hole to fishing hole with
+-    // no travel time at all, however far apart they actually were.
+-    if (bot->GetMapId() != locMap)
++    // no travel time at all, however far apart they actually were. A player's explicit
++    // PRIORITIZEORDER (rush) is the one exception: it asks for the bot to get going right now.
++    if (bot->GetMapId() != locMap || rush)
+     {
++        if (bot->IsInCombat())
++            bot->CombatStop(true);
+         bot->TeleportTo(locMap, locX, locY, locZ, 0.0f);
+         QueueTeleportAck(session);
+-        LOG_DEBUG(BotAI::BotDebugLog::LoggerName(guid), "BotMgr: guild gather order for bot '{}' found no matching node nearby -- re-teleporting to a fresh location on a different continent for item {}.",
+-            bot->GetName(), it->second.itemEntry);
++        LOG_DEBUG(BotAI::BotDebugLog::LoggerName(guid), "BotMgr: guild gather order for bot '{}' -- teleporting to a fresh location for item {}{}.",
++            bot->GetName(), it->second.itemEntry, rush ? " (prioritized by a player)" : "");
+     }
+     else
+     {
+-        LOG_DEBUG(BotAI::BotDebugLog::LoggerName(guid), "BotMgr: guild gather order for bot '{}' found no matching node nearby -- walking to a fresh location for item {}.",
++        LOG_DEBUG(BotAI::BotDebugLog::LoggerName(guid), "BotMgr: guild gather order for bot '{}' found nothing nearby -- walking to a fresh location for item {}.",
+             bot->GetName(), it->second.itemEntry);
+     }
+ }
+ 
++void BotMgr::NotifyGatherOrderDone(Player* bot, GuildGatherOrder const& order)
++{
++    if (!order.requesterLowGuid || FindBotSession(order.requesterLowGuid))
++        return;
++    Player* requester = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(order.requesterLowGuid));
++    if (!requester || !requester->GetSession())
++        return;
++    ChatHandler(requester->GetSession()).PSendSysMessage("|cff33ff99Guild order done:|r {} put {}x {} in the guild bank.",
++        bot ? bot->GetName() : std::string("A bot"), order.targetCount, GatherItemName(order.itemEntry));
++    CoaBotSendAddonReply(requester, "ORDERDONE:" + std::to_string(bot ? bot->GetGUID().GetCounter() : 0) + ":" +
++        std::to_string(order.itemEntry) + ":" + std::to_string(order.targetCount));
++}
++
++void BotMgr::NotifyGatherOrderFail(ObjectGuid const& botGuid, std::string const& botName, GuildGatherOrder const& order,
++    std::string const& reason)
++{
++    LOG_INFO("module.coa-playerbots", "BotMgr: guild gather order for {}x item {} (bot '{}') failed: {}.",
++        order.targetCount, order.itemEntry, botName, reason);
++    if (!order.requesterLowGuid || FindBotSession(order.requesterLowGuid))
++        return;
++    Player* requester = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(order.requesterLowGuid));
++    if (!requester || !requester->GetSession())
++        return;
++    std::string const who = botName.empty() ? std::string("The guild order") : botName;
++    ChatHandler(requester->GetSession()).PSendSysMessage("|cffff4040Guild order failed:|r {} gave up on {}x {} ({}/{} delivered) -- {}.",
++        who, order.targetCount, GatherItemName(order.itemEntry), order.gatheredCount, order.targetCount, GatherFailReasonText(reason));
++    CoaBotSendAddonReply(requester, "ORDERFAIL:" + std::to_string(botGuid.GetCounter()) + ":" + std::to_string(order.itemEntry) + ":" +
++        std::to_string(order.gatheredCount) + ":" + std::to_string(order.targetCount) + ":" + reason);
++}
++
++void BotMgr::FailGuildGatherOrder(ObjectGuid const& botGuid, std::string const& reason)
++{
++    auto it = _guildGatherOrders.find(botGuid);
++    if (it == _guildGatherOrders.end())
++        return;
++    GuildGatherOrder const order = it->second;
++    _guildGatherOrders.erase(it);
++    DeleteGuildGatherOrder(botGuid);
++
++    std::string name;
++    if (Player* bot = FindBotPlayer(botGuid.GetCounter()))
++        name = bot->GetName();
++    else if (!sCharacterCache->GetCharacterNameByGuid(botGuid, name))
++        name = "A bot";
++    NotifyGatherOrderFail(botGuid, name, order, reason);
++}
++
++bool BotMgr::CanManageGatherOrder(Player* commander, uint32 guildId, ObjectGuid::LowType requesterLowGuid) const
++{
++    if (!commander || !guildId || commander->GetGuildId() != guildId)
++        return false;
++    if (requesterLowGuid && commander->GetGUID().GetCounter() == requesterLowGuid)
++        return true;
++    Guild* guild = sGuildMgr->GetGuildById(guildId);
++    Guild::Member const* member = guild ? guild->GetMember(commander->GetGUID()) : nullptr;
++    return member && member->GetRankId() <= 1; // guild master or officer
++}
++
++std::string BotMgr::CancelGatherOrder(Player* commander, ObjectGuid::LowType botLowGuid)
++{
++    ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(botLowGuid);
++    auto it = _guildGatherOrders.find(guid);
++    if (it == _guildGatherOrders.end())
++        return "none";
++    Player* bot = FindBotPlayer(botLowGuid);
++    uint32 const guildId = bot ? bot->GetGuildId() : sCharacterCache->GetCharacterGuildIdByGuid(guid);
++    if (!CanManageGatherOrder(commander, guildId, it->second.requesterLowGuid))
++        return "denied";
++
++    GuildGatherOrder const order = it->second;
++    _guildGatherOrders.erase(it);
++    DeleteGuildGatherOrder(guid);
++    std::string name = bot ? bot->GetName() : std::string("the bot");
++    ChatHandler(commander->GetSession()).PSendSysMessage("|cff33ff99Guild order cancelled:|r {} stops gathering {} ({}/{} delivered).",
++        name, GatherItemName(order.itemEntry), order.gatheredCount, order.targetCount);
++    LOG_INFO("module.coa-playerbots", "BotMgr: '{}' cancelled the gather order of bot {} ({}x item {}).",
++        commander->GetName(), botLowGuid, order.targetCount, order.itemEntry);
++    // The bot's next idle tick finds no order and drops back to its own open-world life.
++    return "ok";
++}
++
++std::string BotMgr::PrioritizeGatherOrder(Player* commander, ObjectGuid::LowType botLowGuid)
++{
++    ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(botLowGuid);
++    auto it = _guildGatherOrders.find(guid);
++    if (it == _guildGatherOrders.end())
++        return "none";
++    Player* bot = FindBotPlayer(botLowGuid);
++    if (!bot || !bot->IsInWorld())
++        return "offline";
++    if (!CanManageGatherOrder(commander, bot->GetGuildId(), it->second.requesterLowGuid))
++        return "denied";
++    if (bot->IsBeingTeleported())
++        return "busy";
++    RetryGuildGatherLocation(guid, true);
++    if (!_guildGatherOrders.count(guid))
++        return "failed"; // no source left -- RetryGuildGatherLocation already sent ORDERFAIL
++    ChatHandler(commander->GetSession()).PSendSysMessage("|cff33ff99Guild order:|r {} is heading straight to a fresh spot for {}.",
++        bot->GetName(), GatherItemName(it->second.itemEntry));
++    return "ok";
++}
++
++std::string BotMgr::CancelQueuedGatherOrder(Player* commander, uint32 queueId)
++{
++    auto it = std::find_if(_gatherQueue.begin(), _gatherQueue.end(), [queueId](QueuedGatherOrder const& q) { return q.queueId == queueId; });
++    if (it == _gatherQueue.end())
++        return "none";
++    if (!CanManageGatherOrder(commander, it->guildId, it->requesterLowGuid))
++        return "denied";
++    ChatHandler(commander->GetSession()).PSendSysMessage("|cff33ff99Guild order cancelled:|r queued {}x {} removed.",
++        it->count, GatherItemName(it->itemEntry));
++    _gatherQueue.erase(it);
++    SaveGatherQueue();
++    return "ok";
++}
++
++std::string BotMgr::TopQueuedGatherOrder(Player* commander, uint32 queueId)
++{
++    auto it = std::find_if(_gatherQueue.begin(), _gatherQueue.end(), [queueId](QueuedGatherOrder const& q) { return q.queueId == queueId; });
++    if (it == _gatherQueue.end())
++        return "none";
++    if (!CanManageGatherOrder(commander, it->guildId, it->requesterLowGuid))
++        return "denied";
++    std::rotate(_gatherQueue.begin(), it, it + 1); // move to the front, everything else keeps its order
++    SaveGatherQueue();
++    return "ok";
++}
++
+ void BotMgr::LoadGuildGatherOrders()
+ {
+     // Ensure database table exists
+@@ -1543,12 +2090,21 @@ void BotMgr::LoadGuildGatherOrders()
+         "  target_x FLOAT NOT NULL,"
+         "  target_y FLOAT NOT NULL,"
+         "  target_z FLOAT NOT NULL,"
+-        "  has_target_location TINYINT UNSIGNED NOT NULL DEFAULT 0"
++        "  has_target_location TINYINT UNSIGNED NOT NULL DEFAULT 0,"
++        "  requester_guid INT UNSIGNED NOT NULL DEFAULT 0"
+         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
+     );
++    // Tables created before requester_guid existed: add it once (same change as the module's
++    // data/sql/db-characters/updates file, done here too so it works whether or not the core's
++    // DB updater applies module SQL on this server).
++    if (!CharacterDatabase.Query("SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "
++            "AND TABLE_NAME = 'mod_coa_bot_guild_gather_orders' AND COLUMN_NAME = 'requester_guid'"))
++        CharacterDatabase.DirectExecute("ALTER TABLE mod_coa_bot_guild_gather_orders ADD COLUMN requester_guid INT UNSIGNED NOT NULL DEFAULT 0");
++
++    LoadGatherQueue();
+ 
+     QueryResult result = CharacterDatabase.Query(
+-        "SELECT bot_guid, item_entry, target_count, gathered_count, remaining_count, target_map, target_x, target_y, target_z, has_target_location "
++        "SELECT bot_guid, item_entry, target_count, gathered_count, remaining_count, target_map, target_x, target_y, target_z, has_target_location, requester_guid "
+         "FROM mod_coa_bot_guild_gather_orders"
+     );
+ 
+@@ -1572,6 +2128,7 @@ void BotMgr::LoadGuildGatherOrders()
+         order.targetY = fields[7].Get<float>();
+         order.targetZ = fields[8].Get<float>();
+         order.hasTargetLocation = fields[9].Get<uint8>() != 0;
++        order.requesterLowGuid = fields[10].Get<uint32>();
+ 
+         _guildGatherOrders[botGuid] = order;
+         ++count;
+@@ -1584,10 +2141,10 @@ void BotMgr::SaveGuildGatherOrder(ObjectGuid const& guid, GuildGatherOrder const
+ {
+     CharacterDatabase.Execute(
+         "REPLACE INTO mod_coa_bot_guild_gather_orders "
+-        "(bot_guid, item_entry, target_count, gathered_count, remaining_count, target_map, target_x, target_y, target_z, has_target_location) "
+-        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
++        "(bot_guid, item_entry, target_count, gathered_count, remaining_count, target_map, target_x, target_y, target_z, has_target_location, requester_guid) "
++        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+         guid.GetCounter(), order.itemEntry, order.targetCount, order.gatheredCount, order.remainingCount,
+-        order.targetMapId, order.targetX, order.targetY, order.targetZ, order.hasTargetLocation ? 1 : 0
++        order.targetMapId, order.targetX, order.targetY, order.targetZ, order.hasTargetLocation ? 1 : 0, order.requesterLowGuid
+     );
+ }
+ 
+@@ -1596,6 +2153,50 @@ void BotMgr::DeleteGuildGatherOrder(ObjectGuid const& guid)
+     CharacterDatabase.Execute("DELETE FROM mod_coa_bot_guild_gather_orders WHERE bot_guid = {}", guid.GetCounter());
+ }
+ 
++void BotMgr::LoadGatherQueue()
++{
++    CharacterDatabase.DirectExecute(
++        "CREATE TABLE IF NOT EXISTS mod_coa_bot_guild_gather_queue ("
++        "  queue_id INT UNSIGNED NOT NULL PRIMARY KEY,"
++        "  position INT UNSIGNED NOT NULL,"
++        "  guild_id INT UNSIGNED NOT NULL,"
++        "  requester_guid INT UNSIGNED NOT NULL DEFAULT 0,"
++        "  item_entry INT UNSIGNED NOT NULL,"
++        "  item_count INT UNSIGNED NOT NULL"
++        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
++    );
++    _gatherQueue.clear();
++    QueryResult result = CharacterDatabase.Query(
++        "SELECT queue_id, guild_id, requester_guid, item_entry, item_count FROM mod_coa_bot_guild_gather_queue ORDER BY position");
++    if (!result)
++        return;
++    do
++    {
++        Field* fields = result->Fetch();
++        QueuedGatherOrder q;
++        q.queueId = fields[0].Get<uint32>();
++        q.guildId = fields[1].Get<uint32>();
++        q.requesterLowGuid = fields[2].Get<uint32>();
++        q.itemEntry = fields[3].Get<uint32>();
++        q.count = fields[4].Get<uint32>();
++        _gatherQueue.push_back(q);
++        _nextGatherQueueId = std::max(_nextGatherQueueId, q.queueId + 1);
++    } while (result->NextRow());
++    LOG_INFO("module.coa-playerbots", "BotMgr: Loaded {} queued guild gather orders from database.", uint32(_gatherQueue.size()));
++}
++
++void BotMgr::SaveGatherQueue()
++{
++    // Small (a handful of rows at most): rewrite it whole so position always matches the vector.
++    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
++    trans->Append("DELETE FROM mod_coa_bot_guild_gather_queue");
++    uint32 position = 0;
++    for (QueuedGatherOrder const& q : _gatherQueue)
++        trans->Append("INSERT INTO mod_coa_bot_guild_gather_queue (queue_id, position, guild_id, requester_guid, item_entry, item_count) "
++            "VALUES ({}, {}, {}, {}, {}, {})", q.queueId, position++, q.guildId, q.requesterLowGuid, q.itemEntry, q.count);
++    CharacterDatabase.CommitTransaction(trans);
++}
++
+ void BotMgr::CraftOrder(ObjectGuid::LowType requesterCharLowGuid, uint32 itemEntry, uint32 count, ChatHandler* handler)
+ {
+     Player* requester = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(requesterCharLowGuid));
+@@ -1700,6 +2301,10 @@ std::vector<std::string> BotMgr::GetGuildRosterInfo(Player* commander) const
+ 
+         std::string task = "idle";
+         uint32 taskItemEntry = 0; // 0 == idle, no tooltip -- see docs/addon-protocol.md's ROSTER row
++        // Appended Task Board fields (docs/addon-protocol.md): gather progress and whether the
++        // asking player may Cancel/Top this row's gather order. 0:0:0 for any other task.
++        uint32 orderGathered = 0, orderTarget = 0;
++        bool canManage = false;
+         if (auto craftItr = _craftOrders.find(bot->GetGUID()); craftItr != _craftOrders.end())
+         {
+             taskItemEntry = craftItr->second.itemEntry;
+@@ -1712,6 +2317,9 @@ std::vector<std::string> BotMgr::GetGuildRosterInfo(Player* commander) const
+             uint32 gathered = gatherItr->second.gatheredCount;
+             uint32 percent = std::min<uint32>(100, (gathered * 100) / target);
+             task = "gathering " + itemName(taskItemEntry) + " (" + std::to_string(gathered) + "/" + std::to_string(target) + " - " + std::to_string(percent) + "%)";
++            orderGathered = gathered;
++            orderTarget = gatherItr->second.targetCount;
++            canManage = CanManageGatherOrder(commander, guildId, gatherItr->second.requesterLowGuid);
+         }
+         else if (std::string goldTask = BotEconomy::GoldOrderTask(bot); !goldTask.empty())
+             task = goldTask;
+@@ -1721,7 +2329,23 @@ std::vector<std::string> BotMgr::GetGuildRosterInfo(Player* commander) const
+         // but a real GameTooltip needs the id, not just the name, to show icon/stats.
+         lines.push_back("ROSTER:" + std::to_string(bot->GetGUID().GetCounter()) + ":" + bot->GetName() + ":" +
+             std::to_string(uint32(bot->getClass())) + ":" + std::to_string(bot->GetLevel()) + ":" + task + ":" +
+-            professions + ":" + std::to_string(taskItemEntry));
++            professions + ":" + std::to_string(taskItemEntry) + ":" + std::to_string(orderGathered) + ":" +
++            std::to_string(orderTarget) + ":" + (canManage ? "1" : "0"));
++    }
++
++    // Queued gather orders (all eligible bots were busy when they were placed), front first:
++    // "QUEUED:<queueId>:<itemEntry>:<count>:<position>:<canManage 0/1>:<requesterName>:<itemName>".
++    uint32 position = 0;
++    for (QueuedGatherOrder const& q : _gatherQueue)
++    {
++        if (q.guildId != guildId)
++            continue;
++        std::string requesterName;
++        if (!q.requesterLowGuid || !sCharacterCache->GetCharacterNameByGuid(ObjectGuid::Create<HighGuid::Player>(q.requesterLowGuid), requesterName))
++            requesterName = "?";
++        lines.push_back("QUEUED:" + std::to_string(q.queueId) + ":" + std::to_string(q.itemEntry) + ":" + std::to_string(q.count) + ":" +
++            std::to_string(++position) + ":" + (CanManageGatherOrder(commander, guildId, q.requesterLowGuid) ? "1" : "0") + ":" +
++            requesterName + ":" + GatherItemName(q.itemEntry));
+     }
+     return lines;
+ }
+@@ -3734,14 +4358,31 @@ void BotMgr::Update(uint32 diff)
+             if (!bot || !bot->IsInWorld())
+             {
+                 // Bot might be offline, loading, or mid-teleport -- NEVER erase the persistent order!
++                if (!bot)
++                    itr->second.lastProgressMs = 0; // the no-progress clock restarts when it is back
+                 ++itr;
+                 continue;
+             }
+ 
+             if (!bot->GetGuild())
+             {
++                GuildGatherOrder const order = itr->second;
+                 DeleteGuildGatherOrder(itr->first);
+                 itr = _guildGatherOrders.erase(itr);
++                NotifyGatherOrderFail(bot->GetGUID(), bot->GetName(), order, "leftguild");
++                continue;
++            }
++
++            // No-progress watchdog, only counted while the bot is actually online and in the world.
++            uint32 const nowMs = getMSTime();
++            if (!itr->second.lastProgressMs)
++                itr->second.lastProgressMs = nowMs ? nowMs : 1;
++            else if (getMSTimeDiff(itr->second.lastProgressMs, nowMs) >= GUILD_GATHER_NO_PROGRESS_MS)
++            {
++                GuildGatherOrder const order = itr->second;
++                DeleteGuildGatherOrder(itr->first);
++                itr = _guildGatherOrders.erase(itr);
++                NotifyGatherOrderFail(bot->GetGUID(), bot->GetName(), order, "noprogress");
+                 continue;
+             }
+ 
+@@ -3755,12 +4396,16 @@ void BotMgr::Update(uint32 diff)
+                 if (deposited > 0)
+                 {
+                     itr->second.gatheredCount += deposited;
++                    itr->second.stalledRetries = 0;
++                    itr->second.lastProgressMs = nowMs ? nowMs : 1;
+                     if (deposited >= remaining)
+                     {
+                         LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotMgr: guildgather order completed for bot '{}' (item {}).",
+                             bot->GetName(), itemEntry);
++                        GuildGatherOrder const order = itr->second;
+                         DeleteGuildGatherOrder(itr->first);
+                         itr = _guildGatherOrders.erase(itr);
++                        NotifyGatherOrderDone(bot, order);
+                         continue;
+                     }
+                     else
+@@ -3781,6 +4426,9 @@ void BotMgr::Update(uint32 diff)
+         return;
+     _heartbeatTimer = 0;
+ 
++    // Queued gather orders start as soon as a suitable guild bot is free.
++    ProcessGatherQueue();
++
+     // Auto-deposit excess gold (> 500g) into guild bank for active bots
+     for (WorldSession* session : _botSessions)
+     {
+diff --git a/module/src/BotMgr.h b/module/src/BotMgr.h
+index bf489e9..d17fa53 100644
+--- a/module/src/BotMgr.h
++++ b/module/src/BotMgr.h
+@@ -91,7 +91,10 @@ public:
+     void GuildWithdrawMoney(ObjectGuid::LowType charLowGuid, uint32 copper, ChatHandler* handler);
+ 
+     // Orders bot to gather itemEntry up to targetCount and deposit into guild bank.
+-    void GuildGather(ObjectGuid::LowType charLowGuid, uint32 itemEntry, uint32 targetCount, ChatHandler* handler);
++    // requesterLowGuid: the player who asked (gets ORDERDONE/ORDERFAIL notices and may cancel
++    // the order without being a guild officer). 0 == take it from handler's session, if any.
++    void GuildGather(ObjectGuid::LowType charLowGuid, uint32 itemEntry, uint32 targetCount, ChatHandler* handler,
++        ObjectGuid::LowType requesterLowGuid = 0);
+ 
+     // Finds an online guild-mate bot of `requesterCharLowGuid` that knows a recipe spell
+     // producing itemEntry (any learned spell with a SPELL_EFFECT_CREATE_ITEM effect targeting
+@@ -123,9 +126,69 @@ public:
+         float targetY = 0.0f;
+         float targetZ = 0.0f;
+         bool hasTargetLocation = false;
++        // Player who placed the order (0 for a GM .botcmd order with no player session, or a row
++        // saved before the requester_guid column existed). Notified on completion/failure and
++        // allowed to cancel it even without officer rank.
++        ObjectGuid::LowType requesterLowGuid = 0;
++        // RetryGuildGatherLocation calls since the last deposit; GUILD_GATHER_MAX_STALLED_RETRIES
++        // of them in a row gives the order up (ORDERFAIL). Not persisted -- a restart starts over.
++        uint32 stalledRetries = 0;
++        // getMSTime() of the last deposit (or of the bot coming online with the order); drives
++        // GUILD_GATHER_NO_PROGRESS_MS. 0 == not started yet. Not persisted.
++        uint32 lastProgressMs = 0;
+     };
+     GuildGatherOrder const* GetGuildGatherOrder(ObjectGuid const& guid) const;
+ 
++    // Where an ordered item can come from, computed once per item from the world DB loot tables
++    // and the in-memory spawn/template stores (see BuildGatherSourceInfo in BotMgr.cpp).
++    // huntCorpseEntries: creature entries whose corpse loot (creature_loot_template, directly or
++    // through one level of reference_loot_template) can yield the item; huntSkinEntries: entries
++    // whose skinning loot (skinning_loot_template via creature_template.skinloot, Skinning skill
++    // only) can. Only normal-rank creatures with at least one spawn on an open-world continent
++    // (maps 0, 1, 530, 571) are listed.
++    struct HuntSpawn
++    {
++        uint16 mapId = 0;
++        float x = 0.0f, y = 0.0f, z = 0.0f;
++        uint8 minLevel = 1, maxLevel = 1;
++    };
++    struct GatherSourceInfo
++    {
++        bool nodeSourced = false;      // loot of a Herbalism/Mining-locked gameobject (chests don't count)
++        uint32 nodeSkillId = 0;        // SKILL_HERBALISM / SKILL_MINING
++        uint32 nodeRequiredSkill = 0;  // lowest skill value any of those nodes needs
++        bool fishSourced = false;      // in fishing_loot_template
++        std::unordered_set<uint32> huntCorpseEntries;
++        std::unordered_set<uint32> huntSkinEntries;
++        std::vector<HuntSpawn> huntSpawns;
++        uint8 huntMinLevel = 0;        // lowest minlevel among hunt sources with a spawn (0 = none)
++        // Targeted hunting applies: not a node or fish item, and at least one spawned creature drops it.
++        bool IsHunt() const { return !nodeSourced && !fishSourced && !huntSpawns.empty(); }
++        bool SkinOnly() const { return huntCorpseEntries.empty() && !huntSkinEntries.empty(); }
++    };
++    GatherSourceInfo const& GetGatherSourceInfo(uint32 itemEntry);
++
++    // Task Board management (docs/addon-protocol.md CANCELORDER / PRIORITIZEORDER / CANCELQUEUED /
++    // TOPQUEUED). Each returns a short result token for the addon reply ("ok", "denied", "none").
++    // Allowed when `commander` is in the bot's (or queued order's) guild and is either a guild
++    // master/officer (rank 0/1) or the player who placed the order.
++    std::string CancelGatherOrder(Player* commander, ObjectGuid::LowType botLowGuid);
++    std::string PrioritizeGatherOrder(Player* commander, ObjectGuid::LowType botLowGuid);
++    std::string CancelQueuedGatherOrder(Player* commander, uint32 queueId);
++    std::string TopQueuedGatherOrder(Player* commander, uint32 queueId);
++
++    // Gather orders placed while every eligible guild bot is busy wait here instead of
++    // overwriting a running order; the front of the vector is assigned first (TOPQUEUED moves an
++    // entry there). Persisted in mod_coa_bot_guild_gather_queue.
++    struct QueuedGatherOrder
++    {
++        uint32 queueId = 0;
++        uint32 guildId = 0;
++        ObjectGuid::LowType requesterLowGuid = 0;
++        uint32 itemEntry = 0;
++        uint32 count = 0;
++    };
++
+     struct CraftOrderState
+     {
+         ObjectGuid requesterGuid;
+@@ -142,8 +205,14 @@ public:
+     // empty nearby for too long (GUILD_GATHER_RETELEPORT_MS) -- the original spot's node was
+     // already consumed (respawn pending) or claimed by someone else first. No-op if the bot has no
+     // such order, no active session, or the item has no resolvable gather location at all.
+-    void RetryGuildGatherLocation(ObjectGuid const& guid);
++    // Every GUILD_GATHER_MAX_STALLED_RETRIES-th call without a deposit in between, or a call
++    // that finds no source at all, gives the order up instead (FailGuildGatherOrder).
++    // `rush` (PRIORITIZEORDER) teleports straight to the new spot even on the same map and does
++    // not count as a stalled retry.
++    void RetryGuildGatherLocation(ObjectGuid const& guid, bool rush = false);
+     void LoadGuildGatherOrders();
++    // Erases the order (memory + DB) and tells its requester why (ORDERFAIL:...:<reason>).
++    void FailGuildGatherOrder(ObjectGuid const& botGuid, std::string const& reason);
+     void SaveGuildGatherOrder(ObjectGuid const& guid, GuildGatherOrder const& order);
+     void DeleteGuildGatherOrder(ObjectGuid const& guid);
+ 
+@@ -556,6 +625,21 @@ private:
+     void EnsureBotBankRights(Player* bot, Guild* guild);
+ 
+     std::unordered_map<ObjectGuid, GuildGatherOrder> _guildGatherOrders;
++    std::unordered_map<uint32, GatherSourceInfo> _gatherSourceInfo;
++    std::vector<QueuedGatherOrder> _gatherQueue;
++    uint32 _nextGatherQueueId = 1;
++    void LoadGatherQueue();
++    void SaveGatherQueue();
++    void ProcessGatherQueue();
++    // Picks the best online, ungrouped guild bot for itemEntry (level/skill fit, then not busy).
++    // allowBusy=false returns nullptr when every candidate already has a gather/craft order.
++    Player* PickGatherBot(uint32 guildId, uint32 itemEntry, bool allowBusy);
++    bool ResolveOrderLocation(Player* bot, GuildGatherOrder const& order, bool avoidCurrentTarget,
++        uint32& mapId, float& x, float& y, float& z);
++    void NotifyGatherOrderDone(Player* bot, GuildGatherOrder const& order);
++    void NotifyGatherOrderFail(ObjectGuid const& botGuid, std::string const& botName, GuildGatherOrder const& order,
++        std::string const& reason);
++    bool CanManageGatherOrder(Player* commander, uint32 guildId, ObjectGuid::LowType requesterLowGuid) const;
+ 
+     std::unordered_map<ObjectGuid, CraftOrderState> _craftOrders;
+     void ProcessCraftOrders();
+@@ -614,4 +698,8 @@ public:
+ 
+ #define sBotMgr BotMgr::instance()
+ 
++// Server -> addon reply on the COABOT channel (defined in BotAddonChat.cpp), so BotMgr can push
++// unsolicited notices such as ORDERDONE / ORDERFAIL to a player running the addon.
++void CoaBotSendAddonReply(Player* recipient, std::string const& body);
++
+ #endif // COA_PLAYERBOTS_BOT_MGR_H

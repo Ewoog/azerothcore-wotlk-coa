@@ -1,0 +1,1258 @@
+diff --git a/module/conf/mod_coa_playerbots.conf.dist b/module/conf/mod_coa_playerbots.conf.dist
+index 42c7412..ebe1d0a 100644
+--- a/module/conf/mod_coa_playerbots.conf.dist
++++ b/module/conf/mod_coa_playerbots.conf.dist
+@@ -306,6 +306,80 @@ CoaBots.Inventory.SellWhenNearVendor = 1
+ CoaBots.Inventory.SellOnLeaderVendor = 1
+ CoaBots.Inventory.KeepQuality = 3
+ 
++#
++# REPAIR AND AMMO
++#
++#    CoaBots.Maintenance.RepairOnLeaderVendor
++#        Description: When a real player in the group talks to a repair-capable NPC, grouped bots
++#                     on the same map and within ShareRange repair all of their damaged gear with
++#                     their own gold (what they cannot afford is left, and custom items whose
++#                     repair cost cannot be looked up are still mended). 0 turns this off.
++#        Default:     1
++#
++#    CoaBots.Maintenance.BuyAmmoOnLeaderVendor
++#        Description: When a real player in the group opens a vendor that sells arrows or bullets,
++#                     grouped bots on the same map and within ShareRange who have a bow, gun, or
++#                     crossbow equipped buy the best ammo that vendor sells which they can use,
++#                     up to AmmoFill, and equip it. 0 turns this off.
++#        Default:     1
++#
++#    CoaBots.Maintenance.ShareRange
++#        Description: How far a grouped bot may be from the commander (same map) to repair or
++#                     restock when the commander opens a repairer or ammo vendor, in yards.
++#        Default:     80
++#
++#    CoaBots.Maintenance.AutoTravel
++#        Description: Ungrouped bots (including alts working a gather order, and random world
++#                     bots) travel to the nearest same-map, same-faction repairer when their
++#                     gear is worn, or to a vendor that sells the right ammo when their quiver
++#                     is low. The trip pauses a gather order and the order resumes afterwards.
++#                     0 leaves only the opportunistic "already standing next to the NPC" path.
++#        Default:     1
++#
++#    CoaBots.Maintenance.TravelSearchYards
++#        Description: How far an ungrouped bot looks for a repairer or ammo vendor when AutoTravel
++#                     is on, in yards. The search stays on the bot's current map.
++#        Default:     30000
++#
++#    CoaBots.Maintenance.NearbyServiceYards
++#        Description: Once the bot has arrived, how far it will look for a live repairer or ammo
++#                     vendor around the destination, in yards.
++#        Default:     80
++#
++#    CoaBots.Maintenance.RepairItemPct
++#        Description: Start a repair trip (or opportunistic repair) when any equipped piece is
++#                     below this percent of its maximum durability.
++#        Default:     30
++#
++#    CoaBots.Maintenance.RepairAveragePct
++#        Description: Also start a repair trip when the average durability of all equipped pieces
++#                     that have durability is below this percent, even if no single piece is
++#                     under RepairItemPct.
++#        Default:     50
++#
++#    CoaBots.Maintenance.AmmoLow
++#        Description: Start an ammo trip when a bot with a bow, gun, or crossbow has fewer than
++#                     this many matching arrows or bullets in its bags and quiver.
++#        Default:     200
++#
++#    CoaBots.Maintenance.AmmoFill
++#        Description: Buy enough ammo to reach this count when restocking (at a vendor the
++#                     commander opened, after a trip, or when already standing next to one).
++#        Default:     1000
++#
++
++CoaBots.Maintenance.RepairOnLeaderVendor = 1
++CoaBots.Maintenance.BuyAmmoOnLeaderVendor = 1
++CoaBots.Maintenance.ShareRange = 80
++CoaBots.Maintenance.AutoTravel = 1
++CoaBots.Maintenance.TravelSearchYards = 30000
++CoaBots.Maintenance.NearbyServiceYards = 80
++CoaBots.Maintenance.RepairItemPct = 30
++CoaBots.Maintenance.RepairAveragePct = 50
++CoaBots.Maintenance.AmmoLow = 200
++CoaBots.Maintenance.AmmoFill = 1000
++
++
+ #
+ # QUEST SHARING
+ #
+diff --git a/module/src/BotAI.cpp b/module/src/BotAI.cpp
+index 8a01d91..b08793c 100644
+--- a/module/src/BotAI.cpp
++++ b/module/src/BotAI.cpp
+@@ -94,6 +94,7 @@
+ #include "BotTaxi.h"
+ #include "BotEconomy.h"
+ #include "BotWorldBehavior.h"
++#include "BotMaintenance.h"
+ #include "BotZoneProgression.h"
+ #include "BotSpawnRandom.h"
+ #include "WorldBrain.h"
+@@ -1546,6 +1547,7 @@ void TryMaintainProgression(Player* bot, uint32 diff, BotAIState& state)
+     }
+     TryUpgradeGearOnce(bot, state.role);
+     TryMaintainEquipment(bot, state.role, false);
++    BotMaintenance::ServiceNearby(bot, false, false, nullptr);
+     TryAutoSignLeaderPetition(bot);
+ }
+ 
+@@ -4402,10 +4404,12 @@ WorldPersona MakeWorldPersona(Player* bot, BotAIState& state)
+ }
+ 
+ // The idle-solo tick of an ungrouped bot with no fight, no loot and no rest to do. Order:
+-//  1. an explicit guild gather order from a player;
+-//  2. the ambient layer's needs (repair, selling) and any errand or flight already in flight --
++//  1. repair and ammo need-trips (and any such trip already underway) -- these also preempt an
++//     active guild gather order; the order stays assigned and resumes when the trip finishes;
++//  2. an explicit guild gather order from a player;
++//  3. the ambient layer's other needs (selling) and any errand or flight already in flight --
+ //     they pause the brain's task while they have the bot;
+-//  3. the open-world brain (world/WorldBrain.h), which either acts itself (quests, travel) or
++//  4. the open-world brain (world/WorldBrain.h), which either acts itself (quests, travel) or
+ //     names the one activity -- gather, fish, grind, ambient life -- that gets this tick.
+ // Before the brain existed, SoloIntent's scan order, the quest scans, the long-distance quest walk,
+ // the grind anchor and the ambient errands each decided on their own to move the bot; now exactly
+@@ -4415,6 +4419,24 @@ void UpdateSoloWorld(Player* bot, uint32 diff, BotAIState& state)
+     CoaBotPerf::Scope perfScope(CoaBotPerf::Metric::SoloWorld);
+     // Active guild gather order: travel to target area and gather the requested resource
+     BotMgr::GuildGatherOrder const* gatherOrder = sBotMgr->GetGuildGatherOrder(bot->GetGUID());
++
++    // Repair and ammo need-trips (and any such trip already underway) preempt gather-order
++    // work. The order stays assigned; when the trip finishes this function runs the gather
++    // branch again and the bot walks or teleports back to its source spot.
++    if (!WorldEncounterDirector::IsBotInEncounter(bot->GetGUID()))
++    {
++        AmbientTick const needTick = BotWorldBehavior::UpdateBeforeSolo(bot, MakeAmbientProfile(bot, state));
++        if (needTick == AmbientTick::Busy)
++        {
++            if (gatherOrder)
++                sBotMgr->PauseGuildGatherWatchdog(bot->GetGUID());
++            WorldBrain::NotifyAmbientBusy(bot);
++            return;
++        }
++        if (needTick == AmbientTick::Relocated)
++            state.hasGrindAnchor = false;
++    }
++
+     if (gatherOrder && gatherOrder->remainingCount > 0)
+     {
+         // An explicit instruction owns the bot: the open-world task steps back with its clocks
+@@ -6223,7 +6245,7 @@ bool IsQuestOnlyGameObjectLoot(uint32 lootId)
+ 
+ bool NeedsRepair(Player* bot)
+ {
+-    return HasGearBelowRepairThreshold(bot);
++    return BotMaintenance::NeedsRepair(bot);
+ }
+ 
+ bool NeedsVendor(Player* bot)
+diff --git a/module/src/BotMaintenance.cpp b/module/src/BotMaintenance.cpp
+new file mode 100644
+index 0000000..23580be
+--- /dev/null
++++ b/module/src/BotMaintenance.cpp
+@@ -0,0 +1,660 @@
++#include "BotMaintenance.h"
++#include "BotAI.h"
++#include "BotMgr.h"
++#include "Bag.h"
++#include "CellImpl.h"
++#include "Chat.h"
++#include "Config.h"
++#include "Creature.h"
++#include "CreatureData.h"
++#include "DBCStores.h"
++#include "GridNotifiers.h"
++#include "GridNotifiersImpl.h"
++#include "Group.h"
++#include "Item.h"
++#include "ItemTemplate.h"
++#include "Log.h"
++#include "ObjectAccessor.h"
++#include "ObjectMgr.h"
++#include "Player.h"
++#include "StringFormat.h"
++#include "World.h"
++#include "WorldSession.h"
++#include <algorithm>
++#include <cstring>
++#include <unordered_map>
++
++namespace
++{
++    struct Settings
++    {
++        bool repairOnLeaderVendor = true;
++        bool buyAmmoOnLeaderVendor = true;
++        bool autoTravel = true;
++        float shareRange = 80.0f;
++        float travelSearchYards = 30000.0f;
++        float nearbyServiceYards = 80.0f;
++        uint32 repairItemPct = 30;
++        uint32 repairAveragePct = 50;
++        uint32 ammoLow = 200;
++        uint32 ammoFill = 1000;
++    } _settings;
++
++    std::string FormatCopperLocal(uint32 copper)
++    {
++        uint32 gold = copper / 10000;
++        uint32 silver = (copper / 100) % 100;
++        uint32 coppers = copper % 100;
++        if (gold)
++            return Acore::StringFormat("{}g {}s", gold, silver);
++        if (silver)
++            return Acore::StringFormat("{}s {}c", silver, coppers);
++        return Acore::StringFormat("{}c", coppers);
++    }
++
++    void SendAltBots(Player* player, std::string const& text)
++    {
++        if (player && player->GetSession())
++            ChatHandler(player->GetSession()).SendSysMessage("AltBots: " + text);
++    }
++
++    Player* GatherRequesterOf(Player* bot)
++    {
++        if (!bot || !sBotMgr)
++            return nullptr;
++        BotMgr::GuildGatherOrder const* order = sBotMgr->GetGuildGatherOrder(bot->GetGUID());
++        if (!order || !order->requesterLowGuid)
++            return nullptr;
++        return ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(order->requesterLowGuid));
++    }
++
++    bool UsableAmmoProto(Player const* bot, ItemTemplate const* proto, uint32 subClass)
++    {
++        if (!bot || !proto)
++            return false;
++        if (proto->Class != ITEM_CLASS_PROJECTILE || proto->SubClass != subClass)
++            return false;
++        if (proto->RequiredLevel && bot->GetLevel() < proto->RequiredLevel)
++            return false;
++        return bot->CanUseItem(proto) == EQUIP_ERR_OK;
++    }
++
++    VendorItemData const* VendorItemsOf(uint32 vendorEntry)
++    {
++        return sObjectMgr->GetNpcVendorItemList(vendorEntry);
++    }
++
++    // Best (highest item level, then quality, then midpoint damage) unlimited gold-priced
++    // ammo this vendor sells that the bot can use.
++    ItemTemplate const* BestVendorAmmo(uint32 vendorEntry, Player const* bot, uint32 subClass)
++    {
++        VendorItemData const* items = VendorItemsOf(vendorEntry);
++        if (!items || items->Empty())
++            return nullptr;
++
++        ItemTemplate const* best = nullptr;
++        float bestDamage = -1.0f;
++        for (uint8 slot = 0; slot < items->GetItemCount(); ++slot)
++        {
++            VendorItem const* vItem = items->GetItem(slot);
++            if (!vItem || vItem->maxcount || vItem->ExtendedCost)
++                continue;
++            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(vItem->item);
++            if (!proto || !vItem->IsGoldRequired(proto) || !proto->BuyPrice)
++                continue;
++            if (!UsableAmmoProto(bot, proto, subClass))
++                continue;
++            float damage = (proto->Damage[0].DamageMin + proto->Damage[0].DamageMax) * 0.5f;
++            if (!best || proto->ItemLevel > best->ItemLevel ||
++                (proto->ItemLevel == best->ItemLevel && proto->Quality > best->Quality) ||
++                (proto->ItemLevel == best->ItemLevel && proto->Quality == best->Quality && damage > bestDamage))
++            {
++                best = proto;
++                bestDamage = damage;
++            }
++        }
++        return best;
++    }
++
++    void ForEachInventoryItem(Player const* bot, auto const& fn)
++    {
++        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
++            fn(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
++        for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
++            if (Bag const* pBag = bot->GetBagByPos(bag))
++                for (uint32 i = 0; i < pBag->GetBagSize(); ++i)
++                    fn(pBag->GetItemByPos(i));
++    }
++
++    enum class RepairCostKind : uint8
++    {
++        None,
++        MissingTable,
++        Affordable,
++    };
++
++    struct RepairCost
++    {
++        RepairCostKind kind = RepairCostKind::None;
++        uint32 copper = 0;
++    };
++
++    RepairCost ComputeRepairCost(Item const* item, float discountMod)
++    {
++        RepairCost result;
++        if (!item)
++            return result;
++        uint32 maxDurability = item->GetUInt32Value(ITEM_FIELD_MAXDURABILITY);
++        uint32 curDurability = item->GetUInt32Value(ITEM_FIELD_DURABILITY);
++        if (!maxDurability || curDurability >= maxDurability)
++            return result;
++
++        ItemTemplate const* proto = item->GetTemplate();
++        if (!proto)
++            return result;
++
++        DurabilityCostsEntry const* dcost = sDurabilityCostsStore.LookupEntry(proto->ItemLevel);
++        uint32 qualityModId = (proto->Quality + 1) * 2;
++        DurabilityQualityEntry const* qualityMod = sDurabilityQualityStore.LookupEntry(qualityModId);
++        if (!dcost || !qualityMod)
++        {
++            result.kind = RepairCostKind::MissingTable;
++            return result;
++        }
++
++        uint32 multiplierId = ItemSubClassToDurabilityMultiplierId(proto->Class, proto->SubClass);
++        if (multiplierId >= 29)
++        {
++            result.kind = RepairCostKind::MissingTable;
++            return result;
++        }
++
++        uint32 lost = maxDurability - curDurability;
++        uint32 costs = uint32(lost * dcost->multiplier[multiplierId] * double(qualityMod->quality_mod));
++        costs = uint32(costs * discountMod * sWorld->getRate(RATE_REPAIRCOST));
++        if (!costs)
++            costs = 1;
++        result.kind = RepairCostKind::Affordable;
++        result.copper = costs;
++        return result;
++    }
++
++    void VisitRepairPositions(Player* bot, auto const& fn)
++    {
++        for (uint8 i = EQUIPMENT_SLOT_START; i < INVENTORY_SLOT_ITEM_END; ++i)
++            fn(uint16((INVENTORY_SLOT_BAG_0 << 8) | i));
++        for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
++            for (uint8 i = 0; i < MAX_BAG_SIZE; ++i)
++                fn(uint16((bag << 8) | i));
++    }
++
++    struct DurabilitySnapshot
++    {
++        uint32 pieces = 0;
++        uint32 curSum = 0;
++        uint32 maxSum = 0;
++        bool anyBelowItemPct = false;
++        bool anyDamaged = false;
++    };
++
++    DurabilitySnapshot SnapshotDurability(Player const* bot)
++    {
++        DurabilitySnapshot snap;
++        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
++        {
++            Item const* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
++            if (!item)
++                continue;
++            uint32 maxDurability = item->GetUInt32Value(ITEM_FIELD_MAXDURABILITY);
++            if (!maxDurability)
++                continue;
++            uint32 curDurability = item->GetUInt32Value(ITEM_FIELD_DURABILITY);
++            ++snap.pieces;
++            snap.curSum += curDurability;
++            snap.maxSum += maxDurability;
++            if (curDurability < maxDurability)
++                snap.anyDamaged = true;
++            if (curDurability * 100 < maxDurability * _settings.repairItemPct)
++                snap.anyBelowItemPct = true;
++        }
++        return snap;
++    }
++
++    class ArmorerCheck
++    {
++    public:
++        ArmorerCheck(Player* bot, float range) : _bot(bot), _range(range) { }
++        bool operator()(Creature* creature)
++        {
++            if (!creature->IsAlive() || !creature->IsArmorer())
++                return false;
++            if (!_bot->IsWithinDistInMap(creature, _range))
++                return false;
++            _range = _bot->GetDistance(creature);
++            return true;
++        }
++    private:
++        Player* _bot;
++        float _range;
++    };
++
++    class AmmoVendorCheck
++    {
++    public:
++        AmmoVendorCheck(Player* bot, float range, uint32 subClass)
++            : _bot(bot), _range(range), _subClass(subClass) { }
++        bool operator()(Creature* creature)
++        {
++            if (!creature->IsAlive() || !creature->IsVendor())
++                return false;
++            if (!_bot->IsWithinDistInMap(creature, _range))
++                return false;
++            if (!BotMaintenance::VendorSellsUsableAmmo(creature->GetEntry(), _bot, _subClass))
++                return false;
++            _range = _bot->GetDistance(creature);
++            return true;
++        }
++    private:
++        Player* _bot;
++        float _range;
++        uint32 _subClass;
++    };
++
++    Creature* FindArmorer(Player* bot, float range)
++    {
++        Creature* found = nullptr;
++        ArmorerCheck check(bot, range);
++        Acore::CreatureLastSearcher<ArmorerCheck> searcher(bot, found, check);
++        Cell::VisitObjects(bot, searcher, range);
++        return found;
++    }
++
++    Creature* FindAmmoVendor(Player* bot, float range, uint32 subClass)
++    {
++        Creature* found = nullptr;
++        AmmoVendorCheck check(bot, range, subClass);
++        Acore::CreatureLastSearcher<AmmoVendorCheck> searcher(bot, found, check);
++        Cell::VisitObjects(bot, searcher, range);
++        return found;
++    }
++
++    void ReportRepair(Player* tellPlayer, Player* bot, BotMaintenance::RepairOutcome const& result)
++    {
++        if (!result.piecesRepaired)
++            return;
++        std::string text;
++        if (result.copperSpent)
++            text = Acore::StringFormat("{} repaired gear ({}).", bot->GetName(), FormatCopperLocal(result.copperSpent));
++        else
++            text = Acore::StringFormat("{} repaired gear.", bot->GetName());
++        if (result.piecesSkipped)
++            text += " Could not afford the rest.";
++        if (tellPlayer)
++            SendAltBots(tellPlayer, text);
++        LOG_INFO("module.coa-playerbots", "BotMaintenance: {}", text);
++    }
++
++    void ReportAmmo(Player* tellPlayer, Player* bot, BotMaintenance::AmmoOutcome const& result)
++    {
++        std::string text;
++        if (result.bought)
++        {
++            char const* name = result.itemName && result.itemName[0] ? result.itemName : "ammo";
++            if (result.copperSpent)
++                text = Acore::StringFormat("{} bought {} {} ({}).", bot->GetName(), result.bought, name,
++                    FormatCopperLocal(result.copperSpent));
++            else
++                text = Acore::StringFormat("{} bought {} {}.", bot->GetName(), result.bought, name);
++        }
++        else if (result.fail && !strcmp(result.fail, "gold"))
++            text = Acore::StringFormat("{} could not afford ammo.", bot->GetName());
++        else if (result.fail && !strcmp(result.fail, "bags"))
++            text = Acore::StringFormat("{} has no bag space for ammo.", bot->GetName());
++        else
++            return;
++        if (tellPlayer)
++            SendAltBots(tellPlayer, text);
++        LOG_INFO("module.coa-playerbots", "BotMaintenance: {}", text);
++    }
++}
++
++namespace BotMaintenance
++{
++    void LoadConfig()
++    {
++        _settings.repairOnLeaderVendor = sConfigMgr->GetOption<bool>("CoaBots.Maintenance.RepairOnLeaderVendor", true);
++        _settings.buyAmmoOnLeaderVendor = sConfigMgr->GetOption<bool>("CoaBots.Maintenance.BuyAmmoOnLeaderVendor", true);
++        _settings.autoTravel = sConfigMgr->GetOption<bool>("CoaBots.Maintenance.AutoTravel", true);
++        _settings.shareRange = sConfigMgr->GetOption<float>("CoaBots.Maintenance.ShareRange", 80.0f);
++        _settings.travelSearchYards = sConfigMgr->GetOption<float>("CoaBots.Maintenance.TravelSearchYards", 30000.0f);
++        _settings.nearbyServiceYards = sConfigMgr->GetOption<float>("CoaBots.Maintenance.NearbyServiceYards", 80.0f);
++        _settings.repairItemPct = sConfigMgr->GetOption<uint32>("CoaBots.Maintenance.RepairItemPct", 30);
++        _settings.repairAveragePct = sConfigMgr->GetOption<uint32>("CoaBots.Maintenance.RepairAveragePct", 50);
++        _settings.ammoLow = sConfigMgr->GetOption<uint32>("CoaBots.Maintenance.AmmoLow", 200);
++        _settings.ammoFill = sConfigMgr->GetOption<uint32>("CoaBots.Maintenance.AmmoFill", 1000);
++
++        if (_settings.shareRange < 5.0f)
++            _settings.shareRange = 5.0f;
++        if (_settings.travelSearchYards < 20.0f)
++            _settings.travelSearchYards = 20.0f;
++        if (_settings.nearbyServiceYards < 10.0f)
++            _settings.nearbyServiceYards = 10.0f;
++        if (_settings.repairItemPct > 100)
++            _settings.repairItemPct = 100;
++        if (_settings.repairAveragePct > 100)
++            _settings.repairAveragePct = 100;
++        if (_settings.ammoFill < _settings.ammoLow)
++            _settings.ammoFill = _settings.ammoLow;
++    }
++
++    bool AutoTravelEnabled()
++    {
++        return _settings.autoTravel;
++    }
++
++    float TravelSearchYards()
++    {
++        return _settings.travelSearchYards;
++    }
++
++    bool HasDamagedGear(Player* bot)
++    {
++        return bot && SnapshotDurability(bot).anyDamaged;
++    }
++
++    bool NeedsRepair(Player* bot)
++    {
++        if (!bot)
++            return false;
++        DurabilitySnapshot snap = SnapshotDurability(bot);
++        if (!snap.pieces)
++            return false;
++        if (snap.anyBelowItemPct)
++            return true;
++        return snap.maxSum && snap.curSum * 100 < snap.maxSum * _settings.repairAveragePct;
++    }
++
++    uint32 RequiredAmmoSubClass(Player const* bot)
++    {
++        if (!bot)
++            return 0;
++        Item const* weapon = bot->GetWeaponForAttack(RANGED_ATTACK);
++        if (!weapon || weapon->IsBroken())
++            return 0;
++        ItemTemplate const* proto = weapon->GetTemplate();
++        if (!proto || proto->Class != ITEM_CLASS_WEAPON)
++            return 0;
++        switch (proto->SubClass)
++        {
++            case ITEM_SUBCLASS_WEAPON_BOW:
++            case ITEM_SUBCLASS_WEAPON_CROSSBOW:
++                return ITEM_SUBCLASS_ARROW;
++            case ITEM_SUBCLASS_WEAPON_GUN:
++                return ITEM_SUBCLASS_BULLET;
++            default:
++                return 0;
++        }
++    }
++
++    uint32 CountAmmo(Player const* bot, uint32 subClass)
++    {
++        if (!bot || !subClass)
++            return 0;
++        uint32 total = 0;
++        ForEachInventoryItem(bot, [&](Item const* item)
++        {
++            if (!item)
++                return;
++            ItemTemplate const* proto = item->GetTemplate();
++            if (proto && proto->Class == ITEM_CLASS_PROJECTILE && proto->SubClass == subClass)
++                total += item->GetCount();
++        });
++        return total;
++    }
++
++    bool NeedsAmmo(Player* bot)
++    {
++        uint32 subClass = RequiredAmmoSubClass(bot);
++        if (!subClass)
++            return false;
++        return CountAmmo(bot, subClass) < _settings.ammoLow;
++    }
++
++    bool VendorSellsUsableAmmo(uint32 vendorEntry, Player const* bot, uint32 subClass)
++    {
++        return BestVendorAmmo(vendorEntry, bot, subClass) != nullptr;
++    }
++
++    RepairOutcome RepairGear(Player* bot, Creature* repairNpc)
++    {
++        RepairOutcome result;
++        if (!bot)
++            return result;
++
++        float discountMod = repairNpc ? bot->GetReputationPriceDiscount(repairNpc) : 1.0f;
++
++        VisitRepairPositions(bot, [&](uint16 pos)
++        {
++            Item* item = bot->GetItemByPos(pos);
++            RepairCost cost = ComputeRepairCost(item, discountMod);
++            if (cost.kind == RepairCostKind::None)
++                return;
++            if (cost.kind == RepairCostKind::MissingTable)
++            {
++                // Paid Player::DurabilityRepair returns without mending when ItemLevel has no
++                // DurabilityCosts.dbc row -- typical of custom CoA gear. Mend those anyway.
++                bot->DurabilityRepair(pos, false, 1.0f, false);
++                ++result.piecesRepaired;
++                ++result.freeMends;
++                return;
++            }
++            if (!bot->HasEnoughMoney(cost.copper))
++            {
++                ++result.piecesSkipped;
++                return;
++            }
++            uint32 charged = bot->DurabilityRepair(pos, true, discountMod, false);
++            result.copperSpent += charged;
++            ++result.piecesRepaired;
++        });
++        return result;
++    }
++
++    AmmoOutcome BuyAmmoFromVendorEntry(Player* bot, uint32 vendorEntry, Creature* discountNpc)
++    {
++        AmmoOutcome result;
++        if (!bot || !vendorEntry)
++            return result;
++
++        uint32 subClass = RequiredAmmoSubClass(bot);
++        if (!subClass)
++            return result;
++
++        ItemTemplate const* proto = BestVendorAmmo(vendorEntry, bot, subClass);
++        if (!proto)
++            return result;
++
++        uint32 have = CountAmmo(bot, subClass);
++        if (have >= _settings.ammoFill)
++        {
++            if (bot->HasItemCount(proto->ItemId) && bot->GetUInt32Value(PLAYER_AMMO_ID) != proto->ItemId)
++                bot->SetAmmo(proto->ItemId);
++            return result;
++        }
++
++        uint32 buyCount = proto->BuyCount ? proto->BuyCount : 1;
++        uint32 want = _settings.ammoFill - have;
++        uint32 purchases = (want + buyCount - 1) / buyCount;
++
++        float discount = discountNpc ? bot->GetReputationPriceDiscount(discountNpc) : 1.0f;
++        uint32 unitPrice = uint32(std::floor(proto->BuyPrice * discount));
++        if (!unitPrice)
++            unitPrice = 1;
++
++        uint32 money = bot->GetMoney();
++        if (unitPrice * purchases > money)
++            purchases = money / unitPrice;
++        if (!purchases)
++        {
++            result.fail = "gold";
++            result.itemName = proto->Name1.c_str();
++            return result;
++        }
++
++        uint32 items = purchases * buyCount;
++        while (purchases)
++        {
++            items = purchases * buyCount;
++            ItemPosCountVec dest;
++            if (bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, proto->ItemId, items) == EQUIP_ERR_OK)
++            {
++                uint32 price = unitPrice * purchases;
++                if (price)
++                    bot->ModifyMoney(-int32(price));
++                bot->StoreNewItem(dest, proto->ItemId, true);
++                result.itemId = proto->ItemId;
++                result.bought = items;
++                result.copperSpent = price;
++                result.itemName = proto->Name1.c_str();
++                if (bot->HasItemCount(proto->ItemId))
++                    bot->SetAmmo(proto->ItemId);
++                return result;
++            }
++            --purchases;
++        }
++
++        result.fail = "bags";
++        result.itemName = proto->Name1.c_str();
++        return result;
++    }
++
++    AmmoOutcome BuyAmmo(Player* bot, Creature* vendor)
++    {
++        if (!bot || !vendor)
++            return {};
++        return BuyAmmoFromVendorEntry(bot, vendor->GetEntry(), vendor);
++    }
++
++    std::string FormatCopper(uint32 copper)
++    {
++        return FormatCopperLocal(copper);
++    }
++
++    void Tell(Player* player, std::string const& text)
++    {
++        SendAltBots(player, text);
++    }
++
++    void ServiceNearby(Player* bot, bool arrivedForRepair, bool arrivedForVendor, Player* tellPlayer)
++    {
++        if (!bot || !bot->IsAlive() || !bot->IsInWorld() || bot->IsBeingTeleported())
++            return;
++
++        Player* listener = tellPlayer ? tellPlayer : GatherRequesterOf(bot);
++        float const serviceRange = arrivedForRepair || arrivedForVendor ? _settings.nearbyServiceYards : 20.0f;
++
++        if (HasDamagedGear(bot))
++        {
++            Creature* armorer = FindArmorer(bot, serviceRange);
++            if (arrivedForRepair || armorer)
++            {
++                RepairOutcome repaired = RepairGear(bot, armorer);
++                ReportRepair(listener, bot, repaired);
++            }
++        }
++
++        uint32 subClass = RequiredAmmoSubClass(bot);
++        if (subClass && CountAmmo(bot, subClass) < _settings.ammoFill)
++        {
++            Creature* vendor = FindAmmoVendor(bot, serviceRange, subClass);
++            if (vendor)
++            {
++                AmmoOutcome bought = BuyAmmo(bot, vendor);
++                ReportAmmo(listener, bot, bought);
++            }
++            else if (arrivedForVendor)
++            {
++                // Arrived at a vendor POI that may not be loaded in this grid: still buy from its entry
++                // if the trip saved one... handled by the caller passing a live vendor when possible.
++            }
++        }
++    }
++
++    void OnPlayerOpenedNpc(Player* player, Creature* npc)
++    {
++        if (!player || !npc || !player->GetSession())
++            return;
++        if (BotMgr::IsBotAccountId(player->GetSession()->GetAccountId()))
++            return;
++        if (!npc->IsAlive())
++            return;
++
++        bool const canRepair = npc->IsArmorer();
++        bool const canSell = npc->IsVendor();
++        if (!canRepair && !canSell)
++            return;
++
++        Group* group = player->GetGroup();
++        if (!group)
++            return;
++
++        uint32 const now = getMSTime();
++        static std::unordered_map<ObjectGuid, uint32> lastServiceAt;
++
++        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
++        {
++            Player* member = ref->GetSource();
++            if (!member || member == player || !member->IsAlive() || !member->IsInWorld())
++                continue;
++            if (member->IsBeingTeleported() || !sBotMgr->FindBotPlayer(member->GetGUID().GetCounter()))
++                continue;
++            if (member->GetMap() != player->GetMap() || !member->IsWithinDistInMap(player, _settings.shareRange))
++                continue;
++
++            uint32& lastAt = lastServiceAt[member->GetGUID()];
++            if (lastAt && getMSTimeDiff(lastAt, now) < 2000)
++                continue;
++            lastAt = now;
++
++            if (_settings.repairOnLeaderVendor && canRepair && HasDamagedGear(member))
++            {
++                RepairOutcome repaired = RepairGear(member, npc);
++                ReportRepair(player, member, repaired);
++            }
++
++            uint32 subClass = RequiredAmmoSubClass(member);
++            if (_settings.buyAmmoOnLeaderVendor && canSell && subClass &&
++                CountAmmo(member, subClass) < _settings.ammoFill &&
++                VendorSellsUsableAmmo(npc->GetEntry(), member, subClass))
++            {
++                AmmoOutcome bought = BuyAmmo(member, npc);
++                ReportAmmo(player, member, bought);
++            }
++        }
++    }
++}
++
++void BotMaintenance::ServiceAfterNeedTrip(Player* bot, bool arrivedForRepair, uint32 vendorEntry)
++{
++    if (!bot || !bot->IsAlive() || !bot->IsInWorld() || bot->IsBeingTeleported())
++        return;
++
++    Player* listener = GatherRequesterOf(bot);
++
++    if (arrivedForRepair || HasDamagedGear(bot))
++    {
++        Creature* armorer = FindArmorer(bot, _settings.nearbyServiceYards);
++        if (arrivedForRepair || armorer)
++            ReportRepair(listener, bot, RepairGear(bot, armorer));
++    }
++
++    uint32 subClass = RequiredAmmoSubClass(bot);
++    if (subClass && CountAmmo(bot, subClass) < _settings.ammoFill)
++    {
++        Creature* vendor = FindAmmoVendor(bot, _settings.nearbyServiceYards, subClass);
++        if (vendor)
++            ReportAmmo(listener, bot, BuyAmmo(bot, vendor));
++        else if (vendorEntry && VendorSellsUsableAmmo(vendorEntry, bot, subClass))
++            ReportAmmo(listener, bot, BuyAmmoFromVendorEntry(bot, vendorEntry, nullptr));
++    }
++}
+diff --git a/module/src/BotMaintenance.h b/module/src/BotMaintenance.h
+new file mode 100644
+index 0000000..798cd8f
+--- /dev/null
++++ b/module/src/BotMaintenance.h
+@@ -0,0 +1,78 @@
++/*
++ * Grouped bots repair and restock ammo when the commander opens a suitable NPC.
++ * Ungrouped bots (including those on a gather order) travel to the nearest
++ * repairer or ammo vendor when durability or ammo is low, then resume what
++ * they were doing. The gather-order assignment is left in place so work
++ * continues after the trip.
++ */
++
++#ifndef COA_PLAYERBOTS_BOT_MAINTENANCE_H
++#define COA_PLAYERBOTS_BOT_MAINTENANCE_H
++
++#include "Define.h"
++#include <string>
++
++class Creature;
++class Player;
++
++namespace BotMaintenance
++{
++    void LoadConfig();
++
++    bool AutoTravelEnabled();
++    float TravelSearchYards();
++
++    // Travel when any equipped piece is below the item-percent setting, or the
++    // average of all equipped durability is below the average-percent setting.
++    bool NeedsRepair(Player* bot);
++    bool HasDamagedGear(Player* bot);
++
++    // 0 if the bot has no bow, gun, or crossbow equipped.
++    uint32 RequiredAmmoSubClass(Player const* bot);
++    uint32 CountAmmo(Player const* bot, uint32 subClass);
++    bool NeedsAmmo(Player* bot);
++    bool VendorSellsUsableAmmo(uint32 vendorEntry, Player const* bot, uint32 subClass);
++
++    struct RepairOutcome
++    {
++        uint32 piecesRepaired = 0;
++        uint32 piecesSkipped = 0;
++        uint32 copperSpent = 0;
++        uint32 freeMends = 0;
++    };
++    // Mends every damaged piece the bot can afford. Items with no durability-cost
++    // table entry (common on this server for custom gear) are still mended without
++    // a charge. guild bank is never used. repairNpc may be null (no reputation discount).
++    RepairOutcome RepairGear(Player* bot, Creature* repairNpc);
++
++    struct AmmoOutcome
++    {
++        uint32 itemId = 0;
++        uint32 bought = 0;
++        uint32 copperSpent = 0;
++        char const* fail = nullptr;
++        char const* itemName = "";
++    };
++    AmmoOutcome BuyAmmo(Player* bot, Creature* vendor);
++    AmmoOutcome BuyAmmoFromVendorEntry(Player* bot, uint32 vendorEntry, Creature* discountNpc);
++
++    // A real (non-bot) player opened a repair-capable NPC or a vendor. Grouped bots
++    // on the same map and within the configured share range repair and/or restock,
++    // and the commander is told in chat (prefix "AltBots:").
++    void OnPlayerOpenedNpc(Player* player, Creature* npc);
++
++    // Act on whatever service is already at hand: an armorer / ammo vendor standing
++    // next to the bot, or a need-trip arrival (arrivedForRepair / arrivedForVendor
++    // skip the live-NPC search for that service). tellPlayer receives chat; if null,
++    // a gather-order requester is notified instead, and random world bots stay quiet.
++    void ServiceNearby(Player* bot, bool arrivedForRepair, bool arrivedForVendor, Player* tellPlayer);
++
++    // Called when an ungrouped bot arrives at a repairer or ammo vendor it travelled to.
++    // vendorEntry is the destination NPC's template id (0 if unknown).
++    void ServiceAfterNeedTrip(Player* bot, bool arrivedForRepair, uint32 vendorEntry);
++
++    std::string FormatCopper(uint32 copper);
++    void Tell(Player* player, std::string const& text);
++}
++
++#endif // COA_PLAYERBOTS_BOT_MAINTENANCE_H
+diff --git a/module/src/BotMgr.cpp b/module/src/BotMgr.cpp
+index 68431e8..5f7172c 100644
+--- a/module/src/BotMgr.cpp
++++ b/module/src/BotMgr.cpp
+@@ -1883,6 +1883,15 @@ BotMgr::GuildGatherOrder const* BotMgr::GetGuildGatherOrder(ObjectGuid const& gu
+     return it != _guildGatherOrders.end() ? &it->second : nullptr;
+ }
+ 
++void BotMgr::PauseGuildGatherWatchdog(ObjectGuid const& guid)
++{
++    auto it = _guildGatherOrders.find(guid);
++    if (it == _guildGatherOrders.end())
++        return;
++    uint32 const nowMs = getMSTime();
++    it->second.lastProgressMs = nowMs ? nowMs : 1;
++}
++
+ BotMgr::CraftOrderState const* BotMgr::GetCraftOrder(ObjectGuid const& guid) const
+ {
+     auto it = _craftOrders.find(guid);
+diff --git a/module/src/BotMgr.h b/module/src/BotMgr.h
+index 9aeb5f7..e056d6c 100644
+--- a/module/src/BotMgr.h
++++ b/module/src/BotMgr.h
+@@ -177,6 +177,9 @@ public:
+     std::string CancelQueuedGatherOrder(Player* commander, uint32 queueId);
+     std::string TopQueuedGatherOrder(Player* commander, uint32 queueId);
+ 
++    // Restarts the 30-minute no-progress clock so a repair or ammo trip does not fail the order.
++    void PauseGuildGatherWatchdog(ObjectGuid const& guid);
++
+     // Gather orders placed while every eligible guild bot is busy wait here instead of
+     // overwriting a running order; the front of the vector is assigned first (TOPQUEUED moves an
+     // entry there). Persisted in mod_coa_bot_guild_gather_queue.
+diff --git a/module/src/BotWorldScript.cpp b/module/src/BotWorldScript.cpp
+index 8dfc3c6..857e24c 100644
+--- a/module/src/BotWorldScript.cpp
++++ b/module/src/BotWorldScript.cpp
+@@ -9,6 +9,7 @@
+ #include "BotMgr.h"
+ #include "BotTalentBuilds.h"
+ #include "BotWorldBehavior.h"
++#include "BotMaintenance.h"
+ #include "WorldBrain.h"
+ #include "DangerMap.h"
+ #include "world/encounters/WorldEncounterDirector.h"
+@@ -85,6 +86,7 @@ public:
+         sBotMgr->LoadGuildGatherOrders();
+         BotAI::LoadGatherLootData();
+         BotWorldBehavior::LoadConfig();
++        BotMaintenance::LoadConfig();
+         // Quest knowledge base, objective handlers' config: built once, after the world loaded.
+         WorldBrain::Initialize();
+         DangerMap::Initialize();
+@@ -105,7 +107,10 @@ public:
+         if (!player || vendorGuid.IsEmpty())
+             return;
+         if (Creature* vendor = ObjectAccessor::GetCreature(*player, vendorGuid))
++        {
+             BotAI::OnPlayerOpenedVendor(player, vendor);
++            BotMaintenance::OnPlayerOpenedNpc(player, vendor);
++        }
+     }
+ 
+     void OnPlayerQuestAccept(Player* player, Quest const* quest) override
+@@ -250,6 +255,8 @@ public:
+     {
+         if (creature && creature->IsVendor())
+             BotAI::OnPlayerOpenedVendor(player, creature);
++        if (creature && (creature->IsArmorer() || creature->IsVendor()))
++            BotMaintenance::OnPlayerOpenedNpc(player, creature);
+         // Quest givers reach this hook through both CMSG_GOSSIP_HELLO and CMSG_QUESTGIVER_HELLO.
+         if (player && creature && creature->IsQuestGiver())
+             QuestInteraction::OnCompanionLeaderTalkedTo(player, creature);
+diff --git a/module/src/world/BotWorldBehavior.cpp b/module/src/world/BotWorldBehavior.cpp
+index 6cb0401..bc54a6f 100644
+--- a/module/src/world/BotWorldBehavior.cpp
++++ b/module/src/world/BotWorldBehavior.cpp
+@@ -1,6 +1,7 @@
+ #include "engine/BotDebugLog.h"
+ #include "BotWorldBehavior.h"
+ #include "BotAI.h"
++#include "BotMaintenance.h"
+ #include "BotMovement.h"
+ #include "BotTaxi.h"
+ #include "BotZoneProgression.h"
+@@ -29,6 +30,7 @@ namespace
+         None,
+         Repair,
+         Vendor,
++        Ammo,
+         Errand,
+         GatherArea,
+         GrindArea,
+@@ -125,7 +127,9 @@ namespace
+         float arriveRadius = 4.0f;
+         PoiKind poiKind = PoiKind::Count;
+         uint32 poiSpawnId = 0;
++        uint32 poiEntry = 0;
+         uint32 lastPoiSpawnId = 0;
++        WorldIntent pendingAfterTravel = WorldIntent::None;
+         float poiX = 0.0f;
+         float poiY = 0.0f;
+         uint32 deadlineMs = 0;
+@@ -187,6 +191,7 @@ namespace
+         {
+             case WorldIntent::Repair:     return "Repair";
+             case WorldIntent::Vendor:     return "Vendor";
++            case WorldIntent::Ammo:       return "Ammo";
+             case WorldIntent::Errand:     return "Errand";
+             case WorldIntent::GatherArea: return "GatherArea";
+             case WorldIntent::GrindArea:  return "GrindArea";
+@@ -334,6 +339,7 @@ namespace
+ 
+         state.poiKind = poi.kind;
+         state.poiSpawnId = poi.spawnId;
++        state.poiEntry = poi.entry;
+         state.poiX = poi.x;
+         state.poiY = poi.y;
+         state.lingerMs = lingerMs;
+@@ -362,6 +368,8 @@ namespace
+         state.intent = WorldIntent::None;
+         state.poiKind = PoiKind::Count;
+         state.poiSpawnId = 0;
++        state.poiEntry = 0;
++        state.pendingAfterTravel = WorldIntent::None;
+         state.idleSinceMs = now;
+     }
+ 
+@@ -427,51 +435,117 @@ namespace
+         }
+     }
+ 
+-    bool TryStartNeed(Player* bot, WorldState& state, uint32 now)
++    bool KnowsNodeNear(Player* bot, float x, float y, float z);
++    bool StartTravel(Player* bot, WorldState& state, uint32 now);
++
++    uint32 NeedLifetimeMs(float dist)
+     {
+-        static constexpr std::pair<WorldIntent, PoiKind> needs[] =
+-        {
+-            { WorldIntent::Repair, PoiKind::Repair },
+-            { WorldIntent::Vendor, PoiKind::Vendor },
+-        };
++        uint32 const cap = 15 * MINUTE * IN_MILLISECONDS;
++        uint32 lifetime = LIFETIME_NEED_MS + uint32(dist * 2000.0f);
++        return lifetime > cap ? cap : lifetime;
++    }
+ 
+-        for (auto const& [intent, kind] : needs)
++    Poi const* NearestUsablePoi(Player* bot, PoiKind kind, float radius, uint32 ammoSubClass)
++    {
++        std::vector<Poi const*> candidates;
++        BotWorldPoi::Query(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), radius, kind, candidates);
++
++        Poi const* nearest = nullptr;
++        float nearestDist = 0.0f;
++        for (Poi const* poi : candidates)
+         {
+-            if (OnCooldown(state, intent, now))
++            if (!IsUsableService(bot, *poi))
+                 continue;
+-
+-            bool needed = intent == WorldIntent::Repair ? BotAI::NeedsRepair(bot) : BotAI::NeedsVendor(bot);
+-            if (!needed)
++            if (ammoSubClass && !BotMaintenance::VendorSellsUsableAmmo(poi->entry, bot, ammoSubClass))
+                 continue;
++            float d = Dist2d(poi->x, poi->y, bot->GetPositionX(), bot->GetPositionY());
++            if (!nearest || d < nearestDist)
++            {
++                nearest = poi;
++                nearestDist = d;
++            }
++        }
++        return nearest;
++    }
+ 
+-            std::vector<Poi const*> candidates;
+-            BotWorldPoi::Query(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), _config.serviceRadius, kind,
+-                candidates);
++    bool LaunchNeedTrip(Player* bot, WorldState& state, WorldIntent intent, Poi const& poi, uint32 now)
++    {
++        // Ambient movement is lower priority than a gather/fish/grind walk, and a repair trip
++        // can start while a gather order still holds the bot. Release those so the trip can move.
++        BotMovement::ForceReleaseOwner(bot, MoveOwner::Gather);
++        BotMovement::ForceReleaseOwner(bot, MoveOwner::Fish);
++        BotMovement::ForceReleaseOwner(bot, MoveOwner::Grind);
+ 
+-            Poi const* nearest = nullptr;
+-            float nearestDist = 0.0f;
+-            for (Poi const* poi : candidates)
++        float dist = Dist2d(poi.x, poi.y, bot->GetPositionX(), bot->GetPositionY());
++        uint32 lifetime = NeedLifetimeMs(dist);
++        constexpr float FLIGHT_MIN_YARDS = 900.0f;
++
++        if (dist > FLIGHT_MIN_YARDS && KnowsNodeNear(bot, poi.x, poi.y, poi.z))
++        {
++            state.travelX = poi.x;
++            state.travelY = poi.y;
++            state.travelZ = poi.z;
++            state.travelTeleportFallback = false;
++            state.pendingAfterTravel = intent;
++            state.poiKind = poi.kind;
++            state.poiSpawnId = poi.spawnId;
++            state.poiEntry = poi.entry;
++            state.lingerMs = 3000;
++            if (StartTravel(bot, state, now))
+             {
+-                if (!IsUsableService(bot, *poi))
+-                    continue;
+-                float d = Dist2d(poi->x, poi->y, bot->GetPositionX(), bot->GetPositionY());
+-                if (!nearest || d < nearestDist)
+-                {
+-                    nearest = poi;
+-                    nearestDist = d;
+-                }
++                Trace(bot, "chose WorldIntent::{} (need), flying toward {} {} ({:.0f} yd).", IntentName(intent),
++                    BotWorldPoi::KindName(poi.kind), poi.entry, dist);
++                return true;
+             }
++            state.pendingAfterTravel = WorldIntent::None;
++        }
++
++        BeginAtPoi(bot, state, intent, poi, 3000, lifetime, now);
++        Trace(bot, "chose WorldIntent::{} (need), travelling to {} {} ({:.0f} yd).", IntentName(intent),
++            BotWorldPoi::KindName(poi.kind), poi.entry, dist);
++        return true;
++    }
+ 
++    bool TryStartNeed(Player* bot, WorldState& state, uint32 now)
++    {
++        float radius = _config.serviceRadius;
++        if (BotMaintenance::AutoTravelEnabled())
++        {
++            float travelYards = BotMaintenance::TravelSearchYards();
++            if (travelYards > radius)
++                radius = travelYards;
++        }
++
++        struct Need
++        {
++            WorldIntent intent;
++            PoiKind kind;
++            bool wanted;
++            uint32 ammoSubClass;
++        };
++
++        uint32 ammoSubClass = BotMaintenance::RequiredAmmoSubClass(bot);
++        Need needs[] = {
++            { WorldIntent::Repair, PoiKind::Repair, BotMaintenance::NeedsRepair(bot), 0 },
++            { WorldIntent::Ammo,   PoiKind::Vendor, BotMaintenance::NeedsAmmo(bot), ammoSubClass },
++            { WorldIntent::Vendor, PoiKind::Vendor, BotAI::NeedsVendor(bot), 0 },
++        };
++
++        for (Need const& need : needs)
++        {
++            if (!need.wanted || OnCooldown(state, need.intent, now))
++                continue;
++            if (need.intent == WorldIntent::Ammo && !need.ammoSubClass)
++                continue;
++
++            Poi const* nearest = NearestUsablePoi(bot, need.kind, radius, need.ammoSubClass);
+             if (!nearest)
+             {
+-                SetCooldown(state, intent, now, NO_CANDIDATE_COOLDOWN_MS);
++                SetCooldown(state, need.intent, now, NO_CANDIDATE_COOLDOWN_MS);
+                 continue;
+             }
+ 
+-            BeginAtPoi(bot, state, intent, *nearest, 3000, LIFETIME_NEED_MS, now);
+-            Trace(bot, "chose WorldIntent::{} (need), travelling to {} {} ({:.0f} yd).", IntentName(intent),
+-                BotWorldPoi::KindName(kind), nearest->entry, nearestDist);
+-            return true;
++            return LaunchNeedTrip(bot, state, need.intent, *nearest, now);
+         }
+         return false;
+     }
+@@ -723,6 +797,17 @@ namespace
+             // needs a node the bot has never been to). Zone progression falls back to the old
+             // teleport; a quest trip just walks on from here (WorldBrain resumes it).
+             state.travelStage = TravelStage::None;
++            if (state.pendingAfterTravel != WorldIntent::None)
++            {
++                WorldIntent const need = state.pendingAfterTravel;
++                state.pendingAfterTravel = WorldIntent::None;
++                float dist = Dist2d(state.travelX, state.travelY, bot->GetPositionX(), bot->GetPositionY());
++                Begin(bot, state, need, state.travelX, state.travelY, state.travelZ, 4.0f, NeedLifetimeMs(dist), now);
++                if (!state.lingerMs)
++                    state.lingerMs = 3000;
++                Trace(bot, "no flight route, walking the rest of the {} trip ({:.0f} yd).", IntentName(need), dist);
++                return AmbientTick::Busy;
++            }
+             if (!state.travelTeleportFallback)
+             {
+                 Finish(bot, state, "no flight route, walking instead", FAIL_COOLDOWN_MS, now);
+@@ -733,6 +818,17 @@ namespace
+             return AmbientTick::Relocated;
+         }
+ 
++        if (state.pendingAfterTravel != WorldIntent::None)
++        {
++            bool const forRepair = state.pendingAfterTravel == WorldIntent::Repair;
++            uint32 const vendorEntry = state.poiEntry;
++            state.pendingAfterTravel = WorldIntent::None;
++            Finish(bot, state, "completed need flight", 0, now);
++            state.travelStage = TravelStage::None;
++            BotMaintenance::ServiceAfterNeedTrip(bot, forRepair, vendorEntry);
++            return AmbientTick::Relocated;
++        }
++
+         Finish(bot, state, "completed", 0, now);
+         state.travelStage = TravelStage::None;
+         return AmbientTick::Relocated;
+@@ -844,13 +940,16 @@ namespace
+     {
+         BotMovement::Stop(bot, state.travelToken);
+ 
+-        if (state.intent == WorldIntent::Repair || state.intent == WorldIntent::Vendor)
++        if (state.intent == WorldIntent::Repair || state.intent == WorldIntent::Vendor
++            || state.intent == WorldIntent::Ammo)
+         {
+             BotAI::MaintainEquipmentNow(bot);
++            BotMaintenance::ServiceAfterNeedTrip(bot, state.intent == WorldIntent::Repair, state.poiEntry);
+ 
+             // The errand achieved nothing (the vendor the index pointed at does not repair or buy, or cannot be reached):
+             // do not make the same trip again a minute later -- one bot made 62 in ten minutes, never repairing once.
+-            if ((state.intent == WorldIntent::Repair && BotAI::NeedsRepair(bot)) ||
++            if ((state.intent == WorldIntent::Repair && BotMaintenance::NeedsRepair(bot)) ||
++                (state.intent == WorldIntent::Ammo && BotMaintenance::NeedsAmmo(bot)) ||
+                 (state.intent == WorldIntent::Vendor && BotAI::NeedsVendor(bot)))
+             {
+                 SetCooldown(state, state.intent, now, UNSERVED_COOLDOWN_MS);
+@@ -859,7 +958,7 @@ namespace
+         }
+ 
+         if (state.intent == WorldIntent::Errand || state.intent == WorldIntent::Repair
+-            || state.intent == WorldIntent::Vendor)
++            || state.intent == WorldIntent::Vendor || state.intent == WorldIntent::Ammo)
+             ArriveAtPoi(bot, state, profile);
+ 
+         state.phase = Phase::Linger;
+@@ -884,9 +983,10 @@ namespace BotWorldBehavior
+ 
+     AmbientTick UpdateBeforeSolo(Player* bot, AmbientProfile const& profile)
+     {
+-        if (!_config.enabled)
++        if (!_config.enabled && !BotMaintenance::AutoTravelEnabled())
+             return AmbientTick::Idle;
+ 
++
+         uint32 now = NowMs();
+         WorldState& state = _states[bot->GetGUID()];
+ 

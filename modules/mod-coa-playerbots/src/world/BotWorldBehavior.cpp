@@ -1,0 +1,1269 @@
+#include "engine/BotDebugLog.h"
+#include "BotWorldBehavior.h"
+#include "BotAI.h"
+#include "BotMaintenance.h"
+#include "BotMgr.h"
+#include "BotMovement.h"
+#include "BotTaxi.h"
+#include "BotZoneProgression.h"
+#include "BotWorldPoi.h"
+#include "Config.h"
+#include "DBCStores.h"
+#include "GameObject.h"
+#include "ObjectMgr.h"
+#include "GameTime.h"
+#include "Log.h"
+#include "Player.h"
+#include "SharedDefines.h"
+#include "StringFormat.h"
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <iterator>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace
+{
+    enum class WorldIntent : uint8
+    {
+        None,
+        Repair,
+        Vendor,
+        Ammo,
+        Errand,
+        GatherArea,
+        GrindArea,
+        Explore,
+        LeaveCity,
+        TravelHub,
+        Count,
+    };
+
+    enum class Phase : uint8
+    {
+        Travel,
+        Linger,
+    };
+
+    struct Config
+    {
+        bool enabled = true;
+        bool verbose = true;
+        uint32 thinkIntervalMs = 2000;
+        uint32 idleBeforeErrandMs = 10000;
+        float serviceRadius = 200.0f;
+        float areaRadius = 350.0f;
+    } _config;
+
+    // How long an errand may take end to end before it is abandoned as expired. Travel is the
+    // part that can blow up (a long detour, a blocked path), so these are generous travel budgets
+    // rather than activity durations; lingering has its own, much shorter, timer.
+    constexpr uint32 LIFETIME_NEED_MS = 180000;
+    constexpr uint32 LIFETIME_ERRAND_MS = 120000;
+    constexpr uint32 LIFETIME_AREA_MS = 150000;
+    constexpr uint32 LIFETIME_EXPLORE_MS = 90000;
+
+
+    // Area destinations must be past what the bot's own local scans could already see, or the
+    // trip would be pointless: grinding scans ~30 yards, gathering 30.
+    constexpr float MIN_AREA_TRAVEL = 45.0f;
+
+    // Leaving a city on foot: the destination has to be far enough to actually be outside the
+    // walls, and the search wide enough to reach past them -- a capital's nearest wolves can be a
+    // few hundred yards from its bank.
+    constexpr float CITY_EXIT_RADIUS = 700.0f;
+    constexpr float CITY_EXIT_MIN_TRAVEL = 250.0f;
+
+    // How long a bot stays in a city before it decides to head out, scaled by sociability: a
+    // sociable bot lingers around the bank and the inn, a loner is gone after a few errands.
+    constexpr uint32 EXIT_RETRY_MS = 30000;
+
+    // Travel by flight path. The walk to a flight master is searched this far out; a destination is
+    // only worth flying to when a known node lies within the second radius of it; and a flight is
+    // given a generous budget, since a multi-hop route across a continent takes minutes.
+    constexpr float FLIGHT_MASTER_SEARCH = 800.0f;
+    constexpr float NODE_NEAR_DESTINATION = 700.0f;
+    constexpr uint32 LIFETIME_FLIGHT_MS = 20 * MINUTE * IN_MILLISECONDS;
+
+    enum class TravelStage : uint8
+    {
+        None,
+        ToFlightMaster,
+        Flying,
+        ToDestination,
+    };
+
+    constexpr uint32 CITY_STAY_MIN_MS = 5 * MINUTE * IN_MILLISECONDS;
+    constexpr uint32 CITY_STAY_MAX_MS = 20 * MINUTE * IN_MILLISECONDS;
+
+    // Cities that no road leaves: the exit is an object the bot uses, exactly as a player clicks it.
+    // Dalaran floats above Crystalsong Forest, and its own "Teleport to Violet Stand" crystal is the
+    // way down. More entries (a portal, a boat) follow the same shape.
+    struct CityExit
+    {
+        uint32 zoneId;
+        uint32 gameObjectEntry;
+    };
+
+    constexpr std::array<CityExit, 1> CITY_EXITS = {{
+        { 4395, 191229 }, // Dalaran -> Teleport to Violet Stand Crystal
+    }};
+
+    // After a failed errand the same kind is not retried for a while, so one unreachable vendor or
+    // an empty zone can't turn into a retry loop -- the lesson from the gathering loops.
+    constexpr uint32 FAIL_COOLDOWN_MS = 90000;
+    constexpr uint32 NO_CANDIDATE_COOLDOWN_MS = 60000;
+    constexpr uint32 UNSERVED_COOLDOWN_MS = 10 * MINUTE * IN_MILLISECONDS;
+
+    struct WorldState
+    {
+        WorldIntent intent = WorldIntent::None;
+        Phase phase = Phase::Travel;
+        uint32 mapId = 0;
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        float arriveRadius = 4.0f;
+        PoiKind poiKind = PoiKind::Count;
+        uint32 poiSpawnId = 0;
+        uint32 poiEntry = 0;
+        uint32 lastPoiSpawnId = 0;
+        WorldIntent pendingAfterTravel = WorldIntent::None;
+        float poiX = 0.0f;
+        float poiY = 0.0f;
+        uint32 deadlineMs = 0;
+        uint32 lingerUntilMs = 0;
+        uint32 lingerMs = 0;
+        uint32 nextThinkMs = 0;
+        uint32 idleSinceMs = 0;
+        uint32 lastSeenMs = 0;
+        float bestDistance = 0.0f;
+        uint32 lastProgressMs = 0;
+        uint32 generation = 0;
+        bool sat = false;
+        uint32 cityEnteredMs = 0;
+        uint32 cityStayMs = 0;
+        uint32 exitObjectEntry = 0;
+        bool travelRequested = false;
+        bool travelTeleportFallback = true;
+        TravelStage travelStage = TravelStage::None;
+        float travelX = 0.0f;
+        float travelY = 0.0f;
+        float travelZ = 0.0f;
+        std::array<uint32, size_t(WorldIntent::Count)> cooldownUntilMs{};
+        LocomotionToken travelToken;
+    };
+
+    std::unordered_map<ObjectGuid, WorldState> _states;
+
+    uint32 NowMs()
+    {
+        return uint32(GameTime::GetGameTimeMS().count());
+    }
+
+    uint32 Mix(uint32 x)
+    {
+        x ^= x >> 16;
+        x *= 0x7feb352dU;
+        x ^= x >> 15;
+        x *= 0x846ca68bU;
+        x ^= x >> 16;
+        return x;
+    }
+
+    // Deterministic per bot and per decision: the personality seed keeps a bot's choices stable
+    // and different from its neighbours', the generation makes successive decisions differ, so
+    // thousands of bots in one city neither move in lockstep nor all pick the same vendor.
+    uint32 Roll(WorldState& state, AmbientProfile const& profile, uint32 salt)
+    {
+        return Mix(profile.seed ^ Mix(++state.generation * 2654435761U) ^ salt);
+    }
+
+    uint32 RollRange(WorldState& state, AmbientProfile const& profile, uint32 salt, uint32 lo, uint32 hi)
+    {
+        return lo + Roll(state, profile, salt) % (hi - lo + 1);
+    }
+
+    char const* IntentName(WorldIntent intent)
+    {
+        switch (intent)
+        {
+            case WorldIntent::Repair:     return "Repair";
+            case WorldIntent::Vendor:     return "Vendor";
+            case WorldIntent::Ammo:       return "Ammo";
+            case WorldIntent::Errand:     return "Errand";
+            case WorldIntent::GatherArea: return "GatherArea";
+            case WorldIntent::GrindArea:  return "GrindArea";
+            case WorldIntent::Explore:    return "Explore";
+            case WorldIntent::LeaveCity:  return "LeaveCity";
+            case WorldIntent::TravelHub:  return "TravelHub";
+            default:                      return "None";
+        }
+    }
+
+    template <typename... Args>
+    void Trace(Player const* bot, std::string_view fmt, Args&&... args)
+    {
+        if (!_config.verbose)
+            return;
+        LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "Bot '{}' {}", bot->GetName(),
+            Acore::StringFormat(fmt, std::forward<Args>(args)...));
+    }
+
+    float Dist2d(float ax, float ay, float bx, float by)
+    {
+        return std::hypot(ax - bx, ay - by);
+    }
+
+    FactionTemplateEntry const* FactionOf(uint32 faction)
+    {
+        return faction ? sFactionTemplateStore.LookupEntry(faction) : nullptr;
+    }
+
+    // Services a real player of this faction could actually use: an Alliance bot has no business
+    // walking up to a Horde banker in a neutral town.
+    bool IsUsableService(Player const* bot, Poi const& poi)
+    {
+        if (!poi.faction)
+            return true;
+        FactionTemplateEntry const* mine = bot->GetFactionTemplateEntry();
+        FactionTemplateEntry const* theirs = FactionOf(poi.faction);
+        return mine && theirs && !mine->IsHostileTo(*theirs) && !theirs->IsHostileTo(*mine);
+    }
+
+    // Anything the bot could attack and that is in a sane solo level band. Neutral mobs count,
+    // exactly as they do for a real player and for GrindHostileUnitCheck.
+    bool IsGrindableFor(Player const* bot, Poi const& poi)
+    {
+        FactionTemplateEntry const* mine = bot->GetFactionTemplateEntry();
+        FactionTemplateEntry const* theirs = FactionOf(poi.faction);
+        if (!mine || !theirs || theirs->IsFriendlyTo(*mine))
+            return false;
+        uint8 level = bot->GetLevel();
+        return poi.maxLevel + 4 >= level && poi.minLevel <= level + 2;
+    }
+
+    // Weighted pick that favours nearer candidates without always taking the nearest one; always
+    // taking the nearest is exactly how dozens of bots ended up casting on the same herb.
+    Poi const* PickWeighted(std::vector<Poi const*> const& candidates, Player const* bot, WorldState& state,
+        AmbientProfile const& profile, float falloff)
+    {
+        if (candidates.empty())
+            return nullptr;
+
+        std::vector<float> weights;
+        weights.reserve(candidates.size());
+        float total = 0.0f;
+        for (Poi const* poi : candidates)
+        {
+            float d = Dist2d(poi->x, poi->y, bot->GetPositionX(), bot->GetPositionY());
+            float w = 1.0f / (1.0f + d / falloff);
+            if (poi->spawnId == state.lastPoiSpawnId)
+                w *= 0.05f;
+            weights.push_back(w);
+            total += w;
+        }
+
+        float roll = (Roll(state, profile, 0x5eed) % 100000) / 100000.0f * total;
+        for (size_t i = 0; i < candidates.size(); ++i)
+        {
+            roll -= weights[i];
+            if (roll <= 0.0f)
+                return candidates[i];
+        }
+        return candidates.back();
+    }
+
+    bool OnCooldown(WorldState const& state, WorldIntent intent, uint32 now)
+    {
+        return state.cooldownUntilMs[size_t(intent)] > now;
+    }
+
+    void SetCooldown(WorldState& state, WorldIntent intent, uint32 now, uint32 ms)
+    {
+        state.cooldownUntilMs[size_t(intent)] = now + ms;
+    }
+
+    void StandUp(Player* bot, WorldState& state)
+    {
+        if (state.sat)
+        {
+            bot->SetStandState(UNIT_STAND_STATE_STAND);
+            state.sat = false;
+        }
+    }
+
+    uint32 MakeAmbientGoalId(WorldState const& state)
+    {
+        uint32 h = 2166136261u;
+        auto hashVal = [&h](uint32 v) {
+            h = (h ^ v) * 16777619u;
+        };
+        hashVal(static_cast<uint32>(state.intent));
+        hashVal(state.mapId);
+        hashVal(static_cast<uint32>(std::floor(state.x * 10.0f)));
+        hashVal(static_cast<uint32>(std::floor(state.y * 10.0f)));
+        hashVal(static_cast<uint32>(std::floor(state.z * 10.0f)));
+        return (h == 0) ? 1 : h;
+    }
+
+    void Begin(Player* bot, WorldState& state, WorldIntent intent, float x, float y, float z, float arriveRadius,
+        uint32 lifetimeMs, uint32 now)
+    {
+        state.intent = intent;
+        state.phase = Phase::Travel;
+        state.mapId = bot->GetMapId();
+        state.x = x;
+        state.y = y;
+        state.z = z;
+        state.arriveRadius = arriveRadius;
+        state.deadlineMs = now + lifetimeMs;
+        state.bestDistance = Dist2d(bot->GetPositionX(), bot->GetPositionY(), x, y);
+        state.lastProgressMs = now;
+        StandUp(bot, state);
+
+        uint32 const goalId = MakeAmbientGoalId(state);
+        BotMovement::Navigate(bot, MoveOwner::Ambient, goalId, state.x, state.y, state.z, state.arriveRadius, &state.travelToken);
+    }
+
+    // Stops a little short of the NPC on the side the bot approaches from, so it ends up
+    // standing in front of the counter rather than inside the NPC's model.
+    void BeginAtPoi(Player* bot, WorldState& state, WorldIntent intent, Poi const& poi, uint32 lingerMs,
+        uint32 lifetimeMs, uint32 now)
+    {
+        float dx = bot->GetPositionX() - poi.x;
+        float dy = bot->GetPositionY() - poi.y;
+        float len = std::max(0.001f, std::hypot(dx, dy));
+        float standOff = std::min(2.5f, len);
+
+        state.poiKind = poi.kind;
+        state.poiSpawnId = poi.spawnId;
+        state.poiEntry = poi.entry;
+        state.poiX = poi.x;
+        state.poiY = poi.y;
+        state.lingerMs = lingerMs;
+        Begin(bot, state, intent, poi.x + dx / len * standOff, poi.y + dy / len * standOff, poi.z, 3.0f,
+            lifetimeMs, now);
+    }
+
+    void Finish(Player* bot, WorldState& state, char const* outcome, uint32 cooldownMs, uint32 now)
+    {
+        Trace(bot, "{} WorldIntent::{}.", outcome, IntentName(state.intent));
+        if (cooldownMs)
+            SetCooldown(state, state.intent, now, cooldownMs);
+
+        if (state.travelToken.IsValid())
+        {
+            BotMovement::Release(bot, state.travelToken);
+            state.travelToken = {};
+        }
+        else
+        {
+            BotMovement::ForceReleaseOwner(bot, MoveOwner::Ambient);
+        }
+        StandUp(bot, state);
+        if (state.poiSpawnId)
+            state.lastPoiSpawnId = state.poiSpawnId;
+        state.intent = WorldIntent::None;
+        state.poiKind = PoiKind::Count;
+        state.poiSpawnId = 0;
+        state.poiEntry = 0;
+        state.pendingAfterTravel = WorldIntent::None;
+        state.idleSinceMs = now;
+    }
+
+    uint32 LingerFor(PoiKind kind, WorldState& state, AmbientProfile const& profile)
+    {
+        uint32 lo = 4000;
+        uint32 hi = 12000;
+        switch (kind)
+        {
+            case PoiKind::Innkeeper:
+                lo = 20000;
+                hi = 60000;
+                break;
+            case PoiKind::Banker:
+            case PoiKind::Auctioneer:
+                lo = 8000;
+                hi = 25000;
+                break;
+            case PoiKind::Mailbox:
+                lo = 4000;
+                hi = 12000;
+                break;
+            case PoiKind::ProfessionTrainer:
+                lo = 6000;
+                hi = 15000;
+                break;
+            case PoiKind::FlightMaster:
+                lo = 3000;
+                hi = 8000;
+                break;
+            default:
+                break;
+        }
+        uint32 base = RollRange(state, profile, 0x11a6, lo, hi);
+        return base * (50 + profile.patience) / 100;
+    }
+
+    // The small human touches on arriving somewhere: face what you walked up to, and now and then
+    // sit down or gesture. Cosmetic only -- nothing here ever runs in combat.
+    void ArriveAtPoi(Player* bot, WorldState& state, AmbientProfile const& profile)
+    {
+        if (bot->IsMounted())
+            BotMovement::RequestDismount(bot, MoveOwner::Ambient, DismountReason::Arrival);
+
+        bot->SetFacingTo(std::atan2(state.poiY - bot->GetPositionY(), state.poiX - bot->GetPositionX()));
+
+        uint32 roll = Roll(state, profile, 0xa771) % 100;
+        uint32 sitChance = state.poiKind == PoiKind::Innkeeper ? 55 : 8;
+        uint32 emoteChance = 15 + profile.sociability / 4;
+        if (roll < sitChance)
+        {
+            bot->SetStandState(UNIT_STAND_STATE_SIT);
+            state.sat = true;
+        }
+        else if (roll < sitChance + emoteChance)
+        {
+            static constexpr uint32 emotes[] =
+            {
+                EMOTE_ONESHOT_TALK, EMOTE_ONESHOT_BOW, EMOTE_ONESHOT_WAVE, EMOTE_ONESHOT_POINT,
+                EMOTE_ONESHOT_QUESTION, EMOTE_ONESHOT_YES, EMOTE_ONESHOT_LAUGH,
+            };
+            bot->HandleEmoteCommand(emotes[Roll(state, profile, 0xe307) % std::size(emotes)]);
+        }
+    }
+
+    bool KnowsNodeNear(Player* bot, float x, float y, float z);
+    bool StartTravel(Player* bot, WorldState& state, uint32 now);
+
+    uint32 NeedLifetimeMs(float dist)
+    {
+        uint32 const cap = 15 * MINUTE * IN_MILLISECONDS;
+        uint32 lifetime = LIFETIME_NEED_MS + uint32(dist * 2000.0f);
+        return lifetime > cap ? cap : lifetime;
+    }
+
+    Poi const* NearestUsablePoi(Player* bot, PoiKind kind, float radius, uint32 ammoSubClass)
+    {
+        std::vector<Poi const*> candidates;
+        BotWorldPoi::Query(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), radius, kind, candidates);
+
+        Poi const* nearest = nullptr;
+        float nearestDist = 0.0f;
+        for (Poi const* poi : candidates)
+        {
+            if (!IsUsableService(bot, *poi))
+                continue;
+            if (ammoSubClass && !BotMaintenance::VendorSellsUsableAmmo(poi->entry, bot, ammoSubClass))
+                continue;
+            float d = Dist2d(poi->x, poi->y, bot->GetPositionX(), bot->GetPositionY());
+            if (!nearest || d < nearestDist)
+            {
+                nearest = poi;
+                nearestDist = d;
+            }
+        }
+        return nearest;
+    }
+
+    bool LaunchNeedTrip(Player* bot, WorldState& state, WorldIntent intent, Poi const& poi, uint32 now)
+    {
+        // Ambient movement is lower priority than a gather/fish/grind walk, and a repair trip
+        // can start while a gather order still holds the bot. Release those so the trip can move.
+        BotMovement::ForceReleaseOwner(bot, MoveOwner::Gather);
+        BotMovement::ForceReleaseOwner(bot, MoveOwner::Fish);
+        BotMovement::ForceReleaseOwner(bot, MoveOwner::Grind);
+
+        float dist = Dist2d(poi.x, poi.y, bot->GetPositionX(), bot->GetPositionY());
+        uint32 lifetime = NeedLifetimeMs(dist);
+        constexpr float FLIGHT_MIN_YARDS = 900.0f;
+        constexpr float NEED_TELEPORT_YARDS = 400.0f;
+
+        auto teleportToPoi = [&]()
+        {
+            if (bot->IsBeingTeleported())
+                return;
+            if (bot->IsInCombat())
+                bot->CombatStop(true);
+            float dx = bot->GetPositionX() - poi.x;
+            float dy = bot->GetPositionY() - poi.y;
+            float len = std::max(0.001f, std::hypot(dx, dy));
+            float standOff = std::min(2.5f, len);
+            bot->TeleportTo(bot->GetMapId(), poi.x + dx / len * standOff, poi.y + dy / len * standOff,
+                poi.z + 1.0f, 0.0f);
+            sBotMgr->QueueTeleportAck(bot->GetSession());
+        };
+
+        if (dist > FLIGHT_MIN_YARDS && KnowsNodeNear(bot, poi.x, poi.y, poi.z))
+        {
+            state.travelX = poi.x;
+            state.travelY = poi.y;
+            state.travelZ = poi.z;
+            state.travelTeleportFallback = false;
+            state.pendingAfterTravel = intent;
+            state.poiKind = poi.kind;
+            state.poiSpawnId = poi.spawnId;
+            state.poiEntry = poi.entry;
+            state.lingerMs = 3000;
+            if (StartTravel(bot, state, now))
+            {
+                Trace(bot, "chose WorldIntent::{} (need), flying toward {} {} ({:.0f} yd).", IntentName(intent),
+                    BotWorldPoi::KindName(poi.kind), poi.entry, dist);
+                return true;
+            }
+            state.pendingAfterTravel = WorldIntent::None;
+            teleportToPoi();
+            BeginAtPoi(bot, state, intent, poi, 3000, lifetime, now);
+            Trace(bot, "chose WorldIntent::{} (need), teleporting to {} {} ({:.0f} yd, no flight).", IntentName(intent),
+                BotWorldPoi::KindName(poi.kind), poi.entry, dist);
+            return true;
+        }
+
+        if (dist > NEED_TELEPORT_YARDS)
+        {
+            teleportToPoi();
+            BeginAtPoi(bot, state, intent, poi, 3000, lifetime, now);
+            Trace(bot, "chose WorldIntent::{} (need), teleporting to {} {} ({:.0f} yd).", IntentName(intent),
+                BotWorldPoi::KindName(poi.kind), poi.entry, dist);
+            return true;
+        }
+
+        BeginAtPoi(bot, state, intent, poi, 3000, lifetime, now);
+        Trace(bot, "chose WorldIntent::{} (need), travelling to {} {} ({:.0f} yd).", IntentName(intent),
+            BotWorldPoi::KindName(poi.kind), poi.entry, dist);
+        return true;
+    }
+
+    bool TryStartNeed(Player* bot, WorldState& state, uint32 now)
+    {
+        float radius = _config.serviceRadius;
+        if (BotMaintenance::AutoTravelEnabled())
+        {
+            float travelYards = BotMaintenance::TravelSearchYards();
+            if (travelYards > radius)
+                radius = travelYards;
+        }
+
+        struct Need
+        {
+            WorldIntent intent;
+            PoiKind kind;
+            bool wanted;
+            uint32 ammoSubClass;
+        };
+
+        uint32 ammoSubClass = BotMaintenance::RequiredAmmoSubClass(bot);
+        Need needs[] = {
+            { WorldIntent::Repair, PoiKind::Repair, BotMaintenance::NeedsRepair(bot), 0 },
+            { WorldIntent::Ammo,   PoiKind::Vendor, BotMaintenance::NeedsAmmo(bot), ammoSubClass },
+            { WorldIntent::Vendor, PoiKind::Vendor, BotAI::NeedsVendor(bot), 0 },
+        };
+
+        for (Need const& need : needs)
+        {
+            if (!need.wanted || OnCooldown(state, need.intent, now))
+                continue;
+            if (need.intent == WorldIntent::Ammo && !need.ammoSubClass)
+                continue;
+
+            Poi const* nearest = NearestUsablePoi(bot, need.kind, radius, need.ammoSubClass);
+            if (!nearest)
+            {
+                SetCooldown(state, need.intent, now, NO_CANDIDATE_COOLDOWN_MS);
+                continue;
+            }
+
+            return LaunchNeedTrip(bot, state, need.intent, *nearest, now);
+        }
+        return false;
+    }
+
+    bool StartErrand(Player* bot, WorldState& state, AmbientProfile const& profile, bool inCity, uint32 now)
+    {
+        static constexpr std::pair<PoiKind, uint32> kinds[] =
+        {
+            { PoiKind::Vendor, 30 },
+            { PoiKind::Mailbox, 25 },
+            { PoiKind::Banker, 18 },
+            { PoiKind::Auctioneer, 18 },
+            { PoiKind::Innkeeper, 14 },
+            { PoiKind::ProfessionTrainer, 10 },
+            { PoiKind::Repair, 8 },
+            { PoiKind::FlightMaster, 6 },
+        };
+
+        uint32 total = 0;
+        for (auto const& [kind, weight] : kinds)
+            total += weight;
+
+        // Try the rolled kind first, then the rest in order, so a town without an auction house
+        // still gets a vendor visit instead of nothing.
+        uint32 roll = Roll(state, profile, 0xe44a) % total;
+        size_t first = 0;
+        for (size_t i = 0; i < std::size(kinds); ++i)
+        {
+            if (roll < kinds[i].second)
+            {
+                first = i;
+                break;
+            }
+            roll -= kinds[i].second;
+        }
+
+        float radius = inCity ? _config.serviceRadius : _config.serviceRadius * 0.6f;
+        for (size_t n = 0; n < std::size(kinds); ++n)
+        {
+            PoiKind kind = kinds[(first + n) % std::size(kinds)].first;
+
+            std::vector<Poi const*> candidates;
+            BotWorldPoi::Query(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), radius, kind, candidates);
+            candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                [bot](Poi const* poi) { return !IsUsableService(bot, *poi); }), candidates.end());
+
+            Poi const* poi = PickWeighted(candidates, bot, state, profile, 60.0f);
+            if (!poi)
+                continue;
+
+            BeginAtPoi(bot, state, WorldIntent::Errand, *poi, LingerFor(kind, state, profile), LIFETIME_ERRAND_MS, now);
+            Trace(bot, "chose WorldIntent::Errand, travelling to {} {} ({:.0f} yd).", BotWorldPoi::KindName(kind),
+                poi->entry, Dist2d(poi->x, poi->y, bot->GetPositionX(), bot->GetPositionY()));
+            return true;
+        }
+        return false;
+    }
+
+    bool StartGatherArea(Player* bot, WorldState& state, AmbientProfile const& profile, uint32 now,
+        float radius = _config.areaRadius, float minTravel = MIN_AREA_TRAVEL)
+    {
+        uint16 herb = bot->GetSkillValue(SKILL_HERBALISM);
+        uint16 ore = bot->GetSkillValue(SKILL_MINING);
+        if (!herb && !ore)
+            return false;
+
+        std::vector<Poi const*> raw;
+        if (herb)
+            BotWorldPoi::Query(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), radius, PoiKind::Herb, raw);
+        if (ore)
+            BotWorldPoi::Query(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), radius, PoiKind::Ore, raw);
+
+        std::vector<Poi const*> candidates;
+        for (Poi const* poi : raw)
+        {
+            uint16 skill = poi->kind == PoiKind::Herb ? herb : ore;
+            if (poi->requiredSkill > skill)
+                continue;
+            if (Dist2d(poi->x, poi->y, bot->GetPositionX(), bot->GetPositionY()) < minTravel)
+                continue;
+            candidates.push_back(poi);
+        }
+
+        Poi const* poi = PickWeighted(candidates, bot, state, profile, 120.0f);
+        if (!poi)
+            return false;
+
+        state.poiKind = poi->kind;
+        state.poiSpawnId = poi->spawnId;
+        Begin(bot, state, WorldIntent::GatherArea, poi->x, poi->y, poi->z, 15.0f, LIFETIME_AREA_MS, now);
+        Trace(bot, "chose WorldIntent::GatherArea, travelling to {} node {} ({:.0f} yd).",
+            BotWorldPoi::KindName(poi->kind), poi->entry,
+            Dist2d(poi->x, poi->y, bot->GetPositionX(), bot->GetPositionY()));
+        return true;
+    }
+
+    bool StartGrindArea(Player* bot, WorldState& state, AmbientProfile const& profile, uint32 now,
+        float radius = _config.areaRadius, float minTravel = MIN_AREA_TRAVEL)
+    {
+        std::vector<Poi const*> raw;
+        BotWorldPoi::Query(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), radius, PoiKind::Hostile, raw);
+
+        std::vector<Poi const*> candidates;
+        for (Poi const* poi : raw)
+        {
+            if (!IsGrindableFor(bot, *poi))
+                continue;
+            if (Dist2d(poi->x, poi->y, bot->GetPositionX(), bot->GetPositionY()) < minTravel)
+                continue;
+            candidates.push_back(poi);
+        }
+
+        Poi const* poi = PickWeighted(candidates, bot, state, profile, 150.0f);
+        if (!poi)
+            return false;
+
+        // Arrive at the edge of the camp rather than on top of the mob, the way a player walks up
+        // to a pull; the local grind scan takes over from there.
+        float dx = bot->GetPositionX() - poi->x;
+        float dy = bot->GetPositionY() - poi->y;
+        float len = std::max(0.001f, std::hypot(dx, dy));
+        state.poiKind = poi->kind;
+        state.poiSpawnId = poi->spawnId;
+        Begin(bot, state, WorldIntent::GrindArea, poi->x + dx / len * 15.0f, poi->y + dy / len * 15.0f, poi->z, 10.0f,
+            LIFETIME_AREA_MS, now);
+        Trace(bot, "chose WorldIntent::GrindArea, travelling toward creature {} (level {}-{}, {:.0f} yd).", poi->entry,
+            poi->minLevel, poi->maxLevel, len);
+        return true;
+    }
+
+    // Wandering to a random known spawn point rather than to a random coordinate: spawn points
+    // sit on walkable, pathable ground, a random coordinate is as likely to be inside a hill.
+    bool StartExplore(Player* bot, WorldState& state, AmbientProfile const& profile, bool inCity, uint32 now)
+    {
+        float minD = inCity ? 30.0f : 60.0f;
+        float maxD = inCity ? 120.0f : 220.0f;
+
+        std::vector<Poi const*> raw;
+        static constexpr PoiKind kinds[] = { PoiKind::Vendor, PoiKind::Mailbox, PoiKind::Innkeeper, PoiKind::Herb,
+            PoiKind::Ore, PoiKind::Hostile };
+        for (PoiKind kind : kinds)
+            BotWorldPoi::Query(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), maxD, kind, raw);
+
+        std::vector<Poi const*> candidates;
+        for (Poi const* poi : raw)
+        {
+            float d = Dist2d(poi->x, poi->y, bot->GetPositionX(), bot->GetPositionY());
+            if (d < minD)
+                continue;
+            if (poi->kind == PoiKind::Hostile && poi->minLevel > bot->GetLevel() + 2)
+                continue;
+            if (poi->faction && poi->kind != PoiKind::Hostile && !IsUsableService(bot, *poi))
+                continue;
+            candidates.push_back(poi);
+        }
+
+        if (candidates.empty())
+            return false;
+
+        Poi const* poi = candidates[Roll(state, profile, 0xe8a1) % candidates.size()];
+        state.poiKind = poi->kind;
+        state.poiSpawnId = poi->spawnId;
+        state.poiX = poi->x;
+        state.poiY = poi->y;
+        state.lingerMs = RollRange(state, profile, 0x1dd1, 2000, 9000);
+        Begin(bot, state, WorldIntent::Explore, poi->x, poi->y, poi->z, 8.0f, LIFETIME_EXPLORE_MS, now);
+        Trace(bot, "chose WorldIntent::Explore, wandering {:.0f} yd.",
+            Dist2d(poi->x, poi->y, bot->GetPositionX(), bot->GetPositionY()));
+        return true;
+    }
+
+    // Position of the exit object for the city the bot stands in, or nullptr for a city that is simply
+    // walked out of. Resolved once per entry from the in-memory spawn data.
+    Position const* CityExitPosition(Player const* bot, uint32& entry)
+    {
+        static std::unordered_map<uint32, Position> positions;
+        for (CityExit const& exit : CITY_EXITS)
+        {
+            if (exit.zoneId != bot->GetZoneId())
+                continue;
+
+            auto itr = positions.find(exit.gameObjectEntry);
+            if (itr == positions.end())
+            {
+                for (auto const& [spawnId, data] : sObjectMgr->GetAllGOData())
+                {
+                    if (data.id != exit.gameObjectEntry || data.mapid != bot->GetMapId())
+                        continue;
+                    itr = positions.emplace(exit.gameObjectEntry, Position(data.posX, data.posY, data.posZ)).first;
+                    break;
+                }
+            }
+
+            if (itr == positions.end())
+                return nullptr;
+            entry = exit.gameObjectEntry;
+            return &itr->second;
+        }
+        return nullptr;
+    }
+
+    bool KnowsNodeNear(Player* bot, float x, float y, float z)
+    {
+        for (uint32 nodeId = 1; nodeId < sTaxiNodesStore.GetNumRows(); ++nodeId)
+        {
+            TaxiNodesEntry const* node = sTaxiNodesStore.LookupEntry(nodeId);
+            if (!node || node->map_id != bot->GetMapId() || !bot->m_taxi.IsTaximaskNodeKnown(nodeId))
+                continue;
+            if (std::hypot(node->x - x, node->y - y) <= NODE_NEAR_DESTINATION)
+                return true;
+        }
+        return false;
+    }
+
+    bool StartTravel(Player* bot, WorldState& state, uint32 now)
+    {
+        float fx = 0.0f;
+        float fy = 0.0f;
+        float fz = 0.0f;
+        if (!BotTaxi::FindFlightMaster(bot, FLIGHT_MASTER_SEARCH, fx, fy, fz) ||
+            !BotTaxi::WorthFlying(bot, fx, fy, fz, state.travelX, state.travelY, state.travelZ))
+            return false;
+
+        state.travelRequested = false;
+        state.travelStage = TravelStage::ToFlightMaster;
+        state.poiX = fx;
+        state.poiY = fy;
+        Begin(bot, state, WorldIntent::TravelHub, fx, fy, fz, 4.0f, LIFETIME_ERRAND_MS, now);
+        Trace(bot, "chose WorldIntent::TravelHub, walking to a flight master ({:.0f} yd).",
+            Dist2d(fx, fy, bot->GetPositionX(), bot->GetPositionY()));
+        return true;
+    }
+
+    // What happens when a TravelHub leg is reached. Returns the tick result, or Idle when the
+    // intent carries on (a new leg has been started).
+    AmbientTick AdvanceTravel(Player* bot, WorldState& state, uint32 now)
+    {
+        if (state.travelStage == TravelStage::ToFlightMaster)
+        {
+            BotMovement::Release(bot, state.travelToken);
+            if (BotTaxi::FlyToward(bot, state.travelX, state.travelY, state.travelZ))
+            {
+                state.travelStage = TravelStage::Flying;
+                state.deadlineMs = now + LIFETIME_FLIGHT_MS;
+                return AmbientTick::Busy;
+            }
+
+            // No route after all (the flight master's own node was the nearest one, or the route
+            // needs a node the bot has never been to). Zone progression falls back to the old
+            // teleport; a quest trip just walks on from here (WorldBrain resumes it).
+            state.travelStage = TravelStage::None;
+            if (state.pendingAfterTravel != WorldIntent::None)
+            {
+                WorldIntent const need = state.pendingAfterTravel;
+                state.pendingAfterTravel = WorldIntent::None;
+                float dist = Dist2d(state.travelX, state.travelY, bot->GetPositionX(), bot->GetPositionY());
+                Begin(bot, state, need, state.travelX, state.travelY, state.travelZ, 4.0f, NeedLifetimeMs(dist), now);
+                if (!state.lingerMs)
+                    state.lingerMs = 3000;
+                Trace(bot, "no flight route, walking the rest of the {} trip ({:.0f} yd).", IntentName(need), dist);
+                return AmbientTick::Busy;
+            }
+            if (!state.travelTeleportFallback)
+            {
+                Finish(bot, state, "no flight route, walking instead", FAIL_COOLDOWN_MS, now);
+                return AmbientTick::Relocated;
+            }
+            Finish(bot, state, "fell back to teleport", FAIL_COOLDOWN_MS, now);
+            BotZoneProgression::RelocateBot(bot, true);
+            return AmbientTick::Relocated;
+        }
+
+        if (state.pendingAfterTravel != WorldIntent::None)
+        {
+            bool const forRepair = state.pendingAfterTravel == WorldIntent::Repair;
+            uint32 const vendorEntry = state.poiEntry;
+            state.pendingAfterTravel = WorldIntent::None;
+            Finish(bot, state, "completed need flight", 0, now);
+            state.travelStage = TravelStage::None;
+            BotMaintenance::ServiceAfterNeedTrip(bot, forRepair, vendorEntry);
+            return AmbientTick::Relocated;
+        }
+
+        Finish(bot, state, "completed", 0, now);
+        state.travelStage = TravelStage::None;
+        return AmbientTick::Relocated;
+    }
+
+    bool StartLeaveCity(Player* bot, WorldState& state, AmbientProfile const& profile, uint32 now)
+    {
+        // Flying out to where this bot's level belongs is what a player would do from a city with a
+        // flight master; the exit object or a walk out is for when no known route leads anywhere.
+        if (BotZoneProgression::ZoneHub const* hub =
+                BotZoneProgression::GetRandomHubForLevel(bot->GetLevel(), bot->GetTeamId()))
+        {
+            if (hub->zoneId != bot->GetZoneId() && hub->mapId == bot->GetMapId() &&
+                KnowsNodeNear(bot, hub->x, hub->y, hub->z))
+            {
+                state.travelX = hub->x;
+                state.travelY = hub->y;
+                state.travelZ = hub->z;
+                if (StartTravel(bot, state, now))
+                    return true;
+            }
+        }
+
+        uint32 entry = 0;
+        if (Position const* exit = CityExitPosition(bot, entry))
+        {
+            state.exitObjectEntry = entry;
+            Begin(bot, state, WorldIntent::LeaveCity, exit->GetPositionX(), exit->GetPositionY(),
+                exit->GetPositionZ(), 4.0f, LIFETIME_ERRAND_MS, now);
+            Trace(bot, "chose WorldIntent::LeaveCity, heading for the exit object {} ({:.0f} yd).", entry,
+                Dist2d(exit->GetPositionX(), exit->GetPositionY(), bot->GetPositionX(), bot->GetPositionY()));
+            return true;
+        }
+
+        // A city on the ground is left on foot: pick somewhere worth going that lies past its walls.
+        return StartGrindArea(bot, state, profile, now, CITY_EXIT_RADIUS, CITY_EXIT_MIN_TRAVEL) ||
+            StartGatherArea(bot, state, profile, now, CITY_EXIT_RADIUS, CITY_EXIT_MIN_TRAVEL);
+    }
+
+    // Uses the exit object the way a player's click does. The object's own spell does the teleport;
+    // BotMgr's teleport-ack safety net then settles it for the socketless session.
+    bool UseCityExit(Player* bot, WorldState& state)
+    {
+        GameObject* exit = bot->FindNearestGameObject(state.exitObjectEntry, 15.0f);
+        if (!exit)
+            return false;
+
+        if (bot->IsMounted())
+            BotMovement::RequestDismount(bot, MoveOwner::Travel, DismountReason::ActionForbidden);
+        exit->Use(bot);
+        return true;
+    }
+
+    int32 Jitter(WorldState& state, AmbientProfile const& profile)
+    {
+        return int32(Roll(state, profile, 0x717e) % 61);
+    }
+
+    void TryStartAmbient(Player* bot, WorldState& state, AmbientProfile const& profile, bool inCity,
+        bool wantsToLeaveCity, uint32 now)
+    {
+        std::vector<std::pair<WorldIntent, int32>> options;
+        auto offer = [&](WorldIntent intent, int32 score)
+        {
+            if (!OnCooldown(state, intent, now))
+                options.emplace_back(intent, score + Jitter(state, profile));
+        };
+
+        if (inCity)
+        {
+            if (wantsToLeaveCity)
+                offer(WorldIntent::LeaveCity, 300);
+            offer(WorldIntent::Errand, 70 + profile.sociability / 2);
+            offer(WorldIntent::Explore, 30 + (100 - profile.patience) / 4);
+        }
+        else
+        {
+            offer(WorldIntent::GatherArea, profile.gathering + (profile.lean == AmbientLean::Gather ? 80 : 0));
+            offer(WorldIntent::GrindArea, profile.grinding + (profile.lean == AmbientLean::Grind ? 80 : 0)
+                + (profile.lean == AmbientLean::Quest ? 30 : 0));
+            offer(WorldIntent::Explore, (profile.questing + profile.gathering) / 4 + 20
+                + (profile.lean == AmbientLean::Explore ? 80 : 0));
+            offer(WorldIntent::Errand, 15 + profile.sociability / 5);
+        }
+
+        std::sort(options.begin(), options.end(), [](auto const& a, auto const& b) { return a.second > b.second; });
+
+        for (auto const& [intent, score] : options)
+        {
+            bool started = false;
+            switch (intent)
+            {
+                case WorldIntent::Errand:     started = StartErrand(bot, state, profile, inCity, now); break;
+                case WorldIntent::GatherArea: started = StartGatherArea(bot, state, profile, now); break;
+                case WorldIntent::GrindArea:  started = StartGrindArea(bot, state, profile, now); break;
+                case WorldIntent::Explore:    started = StartExplore(bot, state, profile, inCity, now); break;
+                case WorldIntent::LeaveCity:  started = StartLeaveCity(bot, state, profile, now); break;
+                default: break;
+            }
+
+            if (started)
+                return;
+
+            SetCooldown(state, intent, now, NO_CANDIDATE_COOLDOWN_MS);
+        }
+    }
+
+    void Arrive(Player* bot, WorldState& state, AmbientProfile const& profile, uint32 now)
+    {
+        BotMovement::Stop(bot, state.travelToken);
+
+        if (state.intent == WorldIntent::Repair || state.intent == WorldIntent::Vendor
+            || state.intent == WorldIntent::Ammo)
+        {
+            BotAI::MaintainEquipmentNow(bot);
+            BotMaintenance::ServiceAfterNeedTrip(bot, state.intent == WorldIntent::Repair, state.poiEntry);
+
+            // The errand achieved nothing (the vendor the index pointed at does not repair or buy, or cannot be reached):
+            // do not make the same trip again a minute later -- one bot made 62 in ten minutes, never repairing once.
+            if ((state.intent == WorldIntent::Repair && BotMaintenance::NeedsRepair(bot)) ||
+                (state.intent == WorldIntent::Ammo && BotMaintenance::NeedsAmmo(bot)) ||
+                (state.intent == WorldIntent::Vendor && BotAI::NeedsVendor(bot)))
+            {
+                SetCooldown(state, state.intent, now, UNSERVED_COOLDOWN_MS);
+                Trace(bot, "the {} errand achieved nothing, not trying again for {}s.", IntentName(state.intent), UNSERVED_COOLDOWN_MS / IN_MILLISECONDS);
+            }
+        }
+
+        if (state.intent == WorldIntent::Errand || state.intent == WorldIntent::Repair
+            || state.intent == WorldIntent::Vendor || state.intent == WorldIntent::Ammo)
+            ArriveAtPoi(bot, state, profile);
+
+        state.phase = Phase::Linger;
+        state.lingerUntilMs = now + state.lingerMs;
+        Trace(bot, "arrived for WorldIntent::{}, lingering {}s.", IntentName(state.intent),
+            state.lingerMs / IN_MILLISECONDS);
+    }
+}
+
+namespace BotWorldBehavior
+{
+    void LoadConfig()
+    {
+        _config.enabled = sConfigMgr->GetOption<bool>("CoaBots.World.Enable", true);
+        _config.verbose = sConfigMgr->GetOption<bool>("CoaBots.World.VerboseLog", true);
+        _config.thinkIntervalMs =
+            std::max<uint32>(250, sConfigMgr->GetOption<uint32>("CoaBots.World.ThinkIntervalMs", 2000));
+        _config.idleBeforeErrandMs = sConfigMgr->GetOption<uint32>("CoaBots.World.IdleBeforeErrandMs", 10000);
+        _config.serviceRadius = sConfigMgr->GetOption<float>("CoaBots.World.ServiceRadius", 200.0f);
+        _config.areaRadius = sConfigMgr->GetOption<float>("CoaBots.World.AreaRadius", 350.0f);
+    }
+
+    AmbientTick UpdateBeforeSolo(Player* bot, AmbientProfile const& profile)
+    {
+        if (!_config.enabled && !BotMaintenance::AutoTravelEnabled())
+            return AmbientTick::Idle;
+
+
+        uint32 now = NowMs();
+        WorldState& state = _states[bot->GetGUID()];
+
+        if (!state.nextThinkMs)
+            state.nextThinkMs = now + bot->GetGUID().GetCounter() % _config.thinkIntervalMs;
+
+        bool resumed = state.lastSeenMs && now - state.lastSeenMs > 3000;
+        state.lastSeenMs = now;
+
+        if (now >= state.nextThinkMs)
+            BotTaxi::DiscoverNearbyNode(bot);
+
+        if (state.intent == WorldIntent::None)
+        {
+            if (state.travelRequested && StartTravel(bot, state, now))
+                return AmbientTick::Busy;
+            state.travelRequested = false;
+
+            if (now >= state.nextThinkMs && TryStartNeed(bot, state, now))
+                return AmbientTick::Busy;
+            return AmbientTick::Idle;
+        }
+
+        if (bot->GetMapId() != state.mapId)
+        {
+            Finish(bot, state, "dropped (map changed)", 0, now);
+            return AmbientTick::Idle;
+        }
+
+        if (resumed)
+        {
+            Trace(bot, "resuming WorldIntent::{} after an interruption (combat or other work).",
+                IntentName(state.intent));
+            state.lastProgressMs = now;
+            if (state.phase == Phase::Travel)
+            {
+                uint32 const goalId = MakeAmbientGoalId(state);
+                BotMovement::Navigate(bot, MoveOwner::Ambient, goalId, state.x, state.y, state.z, state.arriveRadius, &state.travelToken);
+            }
+        }
+
+        if (now >= state.deadlineMs)
+        {
+            Finish(bot, state, "expired", FAIL_COOLDOWN_MS, now);
+            return AmbientTick::Relocated;
+        }
+
+        if (state.intent == WorldIntent::TravelHub && state.travelStage == TravelStage::Flying)
+        {
+            if (bot->IsInFlight())
+                return AmbientTick::Busy;
+
+            // Landed: walk the rest of the way from the node to the destination itself.
+            state.travelStage = TravelStage::ToDestination;
+            Begin(bot, state, WorldIntent::TravelHub, state.travelX, state.travelY, state.travelZ, 25.0f,
+                LIFETIME_AREA_MS, now);
+            Trace(bot, "landed, walking the last {:.0f} yd.",
+                Dist2d(state.travelX, state.travelY, bot->GetPositionX(), bot->GetPositionY()));
+            return AmbientTick::Busy;
+        }
+
+        if (state.phase == Phase::Linger)
+        {
+            if (now < state.lingerUntilMs)
+                return AmbientTick::Busy;
+
+            Finish(bot, state, "completed", 0, now);
+            // A short, varying pause before the next decision, so a bot doesn't turn on its heel
+            // the instant it finishes something.
+            state.nextThinkMs = now + RollRange(state, profile, 0x9a05, 1000, 6000);
+            return AmbientTick::Relocated;
+        }
+
+        if (state.phase == Phase::Travel)
+        {
+            float dist = Dist2d(bot->GetPositionX(), bot->GetPositionY(), state.x, state.y);
+            if (dist <= state.arriveRadius)
+            {
+                if (state.intent == WorldIntent::TravelHub)
+                    return AdvanceTravel(bot, state, now);
+
+                if (state.intent == WorldIntent::LeaveCity)
+                {
+                    if (UseCityExit(bot, state))
+                    {
+                        // The exit's spell has a cast time, so for a few seconds the bot is still standing
+                        // in the city; without this pause the next think chose LeaveCity again and clicked
+                        // the crystal a second time. If the teleport never happens, it simply retries.
+                        Finish(bot, state, "completed", EXIT_RETRY_MS, now);
+                        return AmbientTick::Relocated;
+                    }
+                    Finish(bot, state, "abandoned (exit object not found)", FAIL_COOLDOWN_MS, now);
+                    return AmbientTick::Relocated;
+                }
+
+                if (state.intent == WorldIntent::GatherArea || state.intent == WorldIntent::GrindArea)
+                {
+                    // The trip was the whole errand: hand the bot straight back to its own local scans,
+                    // which can now see what it came here for.
+                    Finish(bot, state, "completed", 0, now);
+                    return AmbientTick::Relocated;
+                }
+
+                Arrive(bot, state, profile, now);
+                return AmbientTick::Busy;
+            }
+
+            if (now < state.nextThinkMs)
+                return AmbientTick::Busy;
+            state.nextThinkMs = now + _config.thinkIntervalMs;
+
+            uint32 const goalId = MakeAmbientGoalId(state);
+            NavStatus status = BotMovement::Navigate(bot, MoveOwner::Ambient, goalId, state.x, state.y, state.z, state.arriveRadius, &state.travelToken);
+            if (status == NavStatus::Arrived)
+            {
+                if (state.intent == WorldIntent::TravelHub)
+                    return AdvanceTravel(bot, state, now);
+
+                if (state.intent == WorldIntent::LeaveCity)
+                {
+                    if (UseCityExit(bot, state))
+                    {
+                        Finish(bot, state, "completed", EXIT_RETRY_MS, now);
+                        return AmbientTick::Relocated;
+                    }
+                    Finish(bot, state, "abandoned (exit object not found)", FAIL_COOLDOWN_MS, now);
+                    return AmbientTick::Relocated;
+                }
+
+                if (state.intent == WorldIntent::GatherArea || state.intent == WorldIntent::GrindArea)
+                {
+                    Finish(bot, state, "completed", 0, now);
+                    return AmbientTick::Relocated;
+                }
+
+                Arrive(bot, state, profile, now);
+                return AmbientTick::Busy;
+            }
+            if (status == NavStatus::Stuck)
+            {
+                if ((state.intent == WorldIntent::Repair || state.intent == WorldIntent::Vendor
+                    || state.intent == WorldIntent::Ammo) && !bot->IsBeingTeleported())
+                {
+                    if (bot->IsInCombat())
+                        bot->CombatStop(true);
+                    bot->TeleportTo(bot->GetMapId(), state.x, state.y, state.z + 1.0f, 0.0f);
+                    sBotMgr->QueueTeleportAck(bot->GetSession());
+                    Trace(bot, "stuck on WorldIntent::{}, teleporting the rest of the way.", IntentName(state.intent));
+                    return AmbientTick::Busy;
+                }
+                Finish(bot, state, "abandoned (stuck)", FAIL_COOLDOWN_MS, now);
+                return AmbientTick::Relocated;
+            }
+        }
+
+        return AmbientTick::Busy;
+    }
+
+    void UpdateAfterSolo(Player* bot, AmbientProfile const& profile, bool soloStartedSomething)
+    {
+        if (!_config.enabled)
+            return;
+
+        WorldState& state = _states[bot->GetGUID()];
+        if (state.intent != WorldIntent::None)
+            return;
+
+        uint32 now = NowMs();
+        if (soloStartedSomething)
+        {
+            state.idleSinceMs = 0;
+            return;
+        }
+
+        if (!state.idleSinceMs)
+            state.idleSinceMs = now;
+
+        if (now < state.nextThinkMs)
+            return;
+        state.nextThinkMs = now + _config.thinkIntervalMs;
+
+        // In a city there's no solo activity to wait for (grinding and gathering don't happen
+        // there), so errands start right away; outside, the solo scans get a fair few cycles first.
+        bool inCity = BotAI::IsInCity(bot);
+        if (!inCity && now - state.idleSinceMs < _config.idleBeforeErrandMs)
+            return;
+
+        // A city is a stop, not a home: before this, a bot relocated to Dalaran at 80 stayed there
+        // for good, since nothing in a city ever offers grinding or gathering and it never levels
+        // again to trigger a relocation.
+        if (!inCity)
+            state.cityEnteredMs = 0;
+        else if (!state.cityEnteredMs)
+        {
+            state.cityEnteredMs = now;
+            uint32 stay = CITY_STAY_MIN_MS + (CITY_STAY_MAX_MS - CITY_STAY_MIN_MS) / 100 * profile.sociability;
+            state.cityStayMs = stay / 2 + RollRange(state, profile, 0xc17e, 0, stay);
+        }
+        bool wantsToLeaveCity = inCity && now - state.cityEnteredMs >= state.cityStayMs;
+
+        TryStartAmbient(bot, state, profile, inCity, wantsToLeaveCity, now);
+    }
+
+    bool RequestTravel(Player* bot, uint32 mapId, float x, float y, float z, bool teleportFallback)
+    {
+        if (!_config.enabled || !bot || bot->GetMapId() != mapId || !KnowsNodeNear(bot, x, y, z))
+            return false;
+
+        float fx = 0.0f;
+        float fy = 0.0f;
+        float fz = 0.0f;
+        if (!BotTaxi::FindFlightMaster(bot, FLIGHT_MASTER_SEARCH, fx, fy, fz) ||
+            !BotTaxi::WorthFlying(bot, fx, fy, fz, x, y, z))
+            return false;
+
+        WorldState& state = _states[bot->GetGUID()];
+        state.travelRequested = true;
+        state.travelTeleportFallback = teleportFallback;
+        state.travelX = x;
+        state.travelY = y;
+        state.travelZ = z;
+        return true;
+    }
+
+    bool HasActiveErrand(ObjectGuid botGuid)
+    {
+        auto itr = _states.find(botGuid);
+        return itr != _states.end() && (itr->second.travelRequested || itr->second.intent != WorldIntent::None);
+    }
+
+    std::string Describe(ObjectGuid botGuid)
+    {
+        auto itr = _states.find(botGuid);
+        if (itr == _states.end() || itr->second.intent == WorldIntent::None)
+            return "world intent: none";
+
+        WorldState const& state = itr->second;
+        uint32 now = NowMs();
+        return Acore::StringFormat("world intent: {} ({}), {}, {}s left", IntentName(state.intent),
+            state.poiKind == PoiKind::Count ? "-" : BotWorldPoi::KindName(state.poiKind),
+            state.phase == Phase::Travel ? "travelling" : "lingering",
+            state.deadlineMs > now ? (state.deadlineMs - now) / IN_MILLISECONDS : 0);
+    }
+
+    void Forget(ObjectGuid botGuid)
+    {
+        _states.erase(botGuid);
+    }
+}

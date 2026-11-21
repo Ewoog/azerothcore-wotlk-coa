@@ -1,0 +1,1050 @@
+/*
+ * mod-coa-playerbots
+ *
+ * Data-Driven Combat AI Framework: Bloodmage Profiles & Spec Strategies
+ *
+ * Specializations:
+ *   - Spec 99: Eternal (Blood Protection Heavy Tank)
+ *   - Spec 25: Fleshweaver (Blood & Vitality Support / Hybrid Healer)
+ *   - Spec 26: Sanguine (Ranged Blood Caster DPS)
+ *   - Spec 27: Accursed (Accursed Werewolf Melee DPS)
+ */
+
+#include "profiles/ProfileBloodmage.h"
+#include "profiles/ProfileRegistry.h"
+#include "engine/SpecStrategyRegistry.h"
+#include "engine/CombatContext.h"
+#include "Player.h"
+
+namespace BotAI
+{
+    void RegisterBloodmageProfiles()
+    {
+        // =========================================================================
+        // 1. SPEC 99: ETERNAL (BLOOD PROTECTION HEAVY TANK)
+        // =========================================================================
+        // Contract:
+        // - Canonical Role: Tank
+        // - Baseline State: Caster/Physical
+        // - Resource: Health + Rage economy (prevent self-damage suicide)
+        // - Defensives: Liquify (<25% HP), Bloody Sacrifice (<45% HP), Fleshcraft (<65% HP)
+        // - Buffs: Aortic Aegis & Blood Veil throttled to 30s
+        // - TankReady: Aortic Aegis active + HP > 75%
+        // =========================================================================
+        {
+            CombatProfile p;
+            p.classId = 20; // Bloodmage
+            p.specId = 99;  // Eternal
+            p.role = BotRole::Tank;
+            p.profileName = "Bloodmage_Eternal_Tank";
+
+            // Mandatory form. Eternal Curse (800157, MOD_SHAPESHIFT form 57) is what makes the native
+            // Cursed Form markers 525031/524861 (AscensionBloodmageTalents SyncCursedFormRequirement)
+            // and the tank stance appear; Bare Fangs, Ravenous Strike, Bloodfang Bite, Claw Sweep and
+            // Rotclaw all list those markers as CasterAuraSpell. The profile never cast it (I17: 8
+            // "missing spell-defined caster aura" rejections, taunt/strikes unusable, aggroMs 1991/15000).
+            {
+                AbilityDescriptor d;
+                d.name = "Eternal Curse (Tank form)";
+                d.rootSpellId = 800157;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 800157;
+                d.internalThrottleMs = 4000;
+                d.baseScore = 500.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Primary Taunt: Bare Fangs (effect ATTACK_ME, 8 s cooldown, needs Cursed Form)
+            {
+                AbilityDescriptor d;
+                d.name = "Bare Fangs (Taunt)";
+                d.rootSpellId = 801957;
+                d.tags = AbilityTag::Taunt;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 460.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Taunt";
+                d.rootSpellId = 355;
+                d.tags = AbilityTag::Taunt;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 450.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Emergency Survival
+            {
+                AbilityDescriptor d;
+                d.name = "Liquify";
+                d.rootSpellId = 806310;
+                d.tags = AbilityTag::DefensiveCD;
+                d.targetType = TargetType::Self;
+                d.maxSelfHpPct = 25.0f;
+                d.internalThrottleMs = 90000;
+                d.baseScore = 420.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Active Mitigation
+            {
+                AbilityDescriptor d;
+                d.name = "Bloody Sacrifice";
+                d.rootSpellId = 705742;
+                d.tags = AbilityTag::DefensiveCD;
+                d.targetType = TargetType::Self;
+                d.maxSelfHpPct = 45.0f;
+                d.minSelfHpPct = 20.0f; // Prevent suicide
+                d.internalThrottleMs = 30000;
+                d.baseScore = 340.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Fleshcraft";
+                d.rootSpellId = 801952;
+                d.tags = AbilityTag::DefensiveCD | AbilityTag::Shield;
+                d.targetType = TargetType::Self;
+                d.maxSelfHpPct = 65.0f;
+                d.missingAuraOnCaster = 801952;
+                d.internalThrottleMs = 15000;
+                d.baseScore = 310.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Stance / Auras
+            {
+                AbilityDescriptor d;
+                d.name = "Aortic Aegis";
+                d.rootSpellId = 806274;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 806274;
+                d.internalThrottleMs = 30000;
+                d.baseScore = 220.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Blood Veil";
+                d.rootSpellId = 504263;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 504263;
+                d.internalThrottleMs = 30000;
+                d.baseScore = 200.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Threat / Leech
+            {
+                AbilityDescriptor d;
+                d.name = "Vampyr's Kiss";
+                d.rootSpellId = 504275;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.requireAuraMissingOnTarget = true;
+                d.baseScore = 230.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Crimson Tide";
+                d.rootSpellId = 504282;
+                d.tags = AbilityTag::AoEDamage;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 220.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Heavy Threat Spenders (Health-aware)
+            {
+                AbilityDescriptor d;
+                d.name = "Heartbreak";
+                d.rootSpellId = 520314;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.minSelfHpPct = 25.0f;
+                d.baseScore = 210.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Veinburst";
+                d.rootSpellId = 504260;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.minSelfHpPct = 20.0f;
+                d.baseScore = 200.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Vampiric Fang";
+                d.rootSpellId = 804726;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 190.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Cursed Form melee strikes (rage spenders, native weapon-style damage)
+            {
+                AbilityDescriptor d;
+                d.name = "Bloodfang Bite";
+                d.rootSpellId = 501695;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 235.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Rotclaw";
+                d.rootSpellId = 503476;
+                d.tags = AbilityTag::MeleeAttack | AbilityTag::PeriodicDamage;
+                d.targetType = TargetType::CurrentTarget;
+                d.requireAuraMissingOnTarget = true;
+                d.internalThrottleMs = 6000;
+                d.baseScore = 240.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Blood Pact";
+                d.rootSpellId = 801955;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 801955;
+                d.internalThrottleMs = 120000;
+                d.baseScore = 225.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Claw Sweep";
+                d.rootSpellId = 500169;
+                d.tags = AbilityTag::MeleeAttack | AbilityTag::AoEDamage;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 215.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Builders
+            {
+                AbilityDescriptor d;
+                d.name = "Ravenous Bite";
+                d.rootSpellId = 500123;
+                d.tags = AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 170.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Bloodbolt";
+                d.rootSpellId = 804685;
+                d.tags = AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 150.0f;
+                p.abilities.push_back(d);
+            }
+
+            ProfileRegistry::RegisterProfile(std::move(p));
+
+            // Strategy Registration
+            SpecStrategy s;
+            s.classId = 20;
+            s.specId = 99;
+            s.role = BotRole::Tank;
+            s.strategyName = "Eternal_Tank_Strategy";
+            s.requiredState.formSpellId = 800157; // Eternal Curse
+            s.requiredState.formAuraId = 800157;
+
+            s.isReadyToPull = [](Player* bot, CombatContext const&) -> bool
+            {
+                return bot->HasAura(800157) && bot->GetHealthPct() >= 75.0f;
+            };
+
+            s.phaseModifiers[CombatPhase::Emergency] = {
+                { AbilityTag::DefensiveCD, 2.5f, 100.0f },
+                { AbilityTag::Shield,      2.0f,  80.0f }
+            };
+            s.phaseModifiers[CombatPhase::AoE] = {
+                { AbilityTag::AoEDamage,   1.8f,  50.0f }
+            };
+
+            // ResourcePolicy for Bloodmage resource (680687)
+            {
+                ResourcePolicy pol;
+                pol.key = CombatResourceKey{ CombatResourceKind::AuraStack, 0, 680687 };
+                pol.overcapThreshold = 8;
+                s.resourcePolicies.push_back(pol);
+            }
+
+            SpecStrategyRegistry::RegisterStrategy(std::move(s));
+        }
+
+        // =========================================================================
+        // 2. SPEC 25: FLESHWEAVER (SUPPORT / HYBRID HEALER)
+        // =========================================================================
+        // Contract:
+        // - Canonical Role: Support (registered for Support & Healer lookup)
+        // - Baseline State: Caster
+        // - Resource: Vitality pooling through damage weaving
+        // =========================================================================
+        auto registerFleshweaver = [](BotRole role)
+        {
+            CombatProfile p;
+            p.classId = 20;
+            p.specId = 25;
+            p.role = role;
+            p.profileName = (role == BotRole::Support) ? "Bloodmage_Fleshweaver_Support" : "Bloodmage_Fleshweaver_Healer";
+
+            // Emergency Direct Heal
+            {
+                AbilityDescriptor d;
+                d.name = "Transfusion";
+                d.rootSpellId = 705734;
+                d.tags = AbilityTag::EmergencyHeal | AbilityTag::DirectHeal;
+                d.targetType = TargetType::LowestHealthAlly;
+                d.maxTargetHpPct = 40.0f;
+                d.internalThrottleMs = 3000;
+                d.baseScore = 400.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Shield
+            {
+                AbilityDescriptor d;
+                d.name = "Fleshcraft";
+                d.rootSpellId = 801952;
+                d.tags = AbilityTag::Shield;
+                d.targetType = TargetType::LowestHealthAlly;
+                d.maxTargetHpPct = 50.0f;
+                d.missingAuraOnCaster = 801952;
+                d.internalThrottleMs = 12000;
+                d.baseScore = 340.0f;
+                p.abilities.push_back(d);
+            }
+
+            // AoE Blood Wave
+            {
+                AbilityDescriptor d;
+                d.name = "Waves of Blood";
+                d.rootSpellId = 681427;
+                d.tags = AbilityTag::AoEHeal;
+                d.targetType = TargetType::Self;
+                d.minInjuredAllies = 2;
+                d.injuredAllyHpPctThreshold = 80.0f;
+                d.internalThrottleMs = 6000;
+                d.baseScore = 310.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Primary Heal
+            {
+                AbilityDescriptor d;
+                d.name = "Sanguine Mend";
+                d.rootSpellId = 802310;
+                d.tags = AbilityTag::DirectHeal;
+                d.targetType = TargetType::LowestHealthAlly;
+                d.maxTargetHpPct = 80.0f;
+                d.baseScore = 270.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Blood Redistribution";
+                d.rootSpellId = 706256;
+                d.tags = AbilityTag::PeriodicHeal;
+                d.targetType = TargetType::LowestHealthAlly;
+                d.maxTargetHpPct = 85.0f;
+                d.requireAuraMissingOnTarget = true;
+                d.internalThrottleMs = 4000;
+                d.baseScore = 250.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Support Buff
+            {
+                AbilityDescriptor d;
+                d.name = "Universal Donor";
+                d.rootSpellId = 806428;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.casterAuraId = 806428;
+                d.missingAuraOnCaster = 806428;
+                d.internalThrottleMs = 30000;
+                d.baseScore = 210.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Offensive Vitality Weaving
+            {
+                AbilityDescriptor d;
+                d.name = "Vampyr's Kiss";
+                d.rootSpellId = 504275;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.requireAuraMissingOnTarget = true;
+                d.baseScore = 180.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Crimson Tide";
+                d.rootSpellId = 504282;
+                d.tags = AbilityTag::AoEDamage;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 160.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Bloodbolt";
+                d.rootSpellId = 804685;
+                d.tags = AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 140.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // the real main filler (47% of casts); pays health, cannot be cast in a Cursed Form
+                d.name = "Sanguine Rupture";
+                d.rootSpellId = 800774;
+                d.tags = AbilityTag::AoEDamage | AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.minAoETargets = 1;
+                d.minSelfHpPct = 40.0f;
+                d.baseScore = 110.0f; // deals no damage in the support kit (0 of 137 casts); as a filler it must not displace the heals and damage spells
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // needs the native Cursed Form requirement aura
+                d.name = "Ravenous Strike";
+                d.rootSpellId = 500123;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 185.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Taldaram's Torment (damage)";
+                d.rootSpellId = 800772;
+                d.tags = AbilityTag::PeriodicDamage | AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 6000;
+                d.requireAuraMissingOnTarget = true;
+                d.minSelfHpPct = 40.0f;
+                d.baseScore = 190.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // health-paid damage spell the legacy rotation used (66 casts in the baseline)
+                d.name = "Bloodmoon Blast";
+                d.rootSpellId = 500125;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.minSelfHpPct = 40.0f;
+                d.baseScore = 150.0f;
+                p.abilities.push_back(d);
+            }
+
+            ProfileRegistry::RegisterProfile(std::move(p));
+
+            SpecStrategy s;
+            s.classId = 20;
+            s.specId = 25;
+            s.role = role;
+            s.strategyName = (role == BotRole::Support) ? "Fleshweaver_Support_Strategy" : "Fleshweaver_Healer_Strategy";
+            s.minResourceToEngage = 50.0f;
+
+            s.isReadyToPull = [](Player* bot, CombatContext const&) -> bool
+            {
+                return bot->GetHealthPct() >= 70.0f;
+            };
+
+            s.phaseModifiers[CombatPhase::Emergency] = {
+                { AbilityTag::EmergencyHeal, 2.5f, 100.0f },
+                { AbilityTag::Shield,        2.0f,  80.0f }
+            };
+
+            SpecStrategyRegistry::RegisterStrategy(std::move(s));
+        };
+
+        registerFleshweaver(BotRole::Support);
+        registerFleshweaver(BotRole::Healer);
+
+        // =========================================================================
+        // 3. SPEC 26: SANGUINE (RANGED BLOOD CASTER DPS)
+        // =========================================================================
+        // Contract:
+        // - Canonical Role: Dps
+        // - Baseline State: Caster
+        // - Resource: Health + Rage + Thirst (minSelfHpPct on health-spending nukes)
+        // =========================================================================
+        {
+            CombatProfile p;
+            p.classId = 20;
+            p.specId = 26; // Sanguine
+            p.role = BotRole::Dps;
+            p.profileName = "Bloodmage_Sanguine_Dps";
+
+            // Learned native Blood Tap restores 50% maximum Rage (ENERGIZE_PCT).
+            // Use it before affordable Bloodbolt actions collapse into low-output filler.
+            {
+                AbilityDescriptor d;
+                d.name = "Blood Tap";
+                d.rootSpellId = 707900;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.minSelfHpPct = 50.0f;
+                d.internalThrottleMs = 30000;
+                d.baseScore = 350.0f;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float
+                {
+                    return ctx.botPowerPct < 40.0f ? 0.0f : -1.0f;
+                };
+                p.abilities.push_back(d);
+            }
+
+            // Emergency Defense
+            {
+                AbilityDescriptor d;
+                d.name = "Liquify";
+                d.rootSpellId = 806310;
+                d.tags = AbilityTag::DefensiveCD;
+                d.targetType = TargetType::Self;
+                d.maxSelfHpPct = 20.0f;
+                d.internalThrottleMs = 90000;
+                d.baseScore = 400.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Fleshcraft";
+                d.rootSpellId = 801952;
+                d.tags = AbilityTag::DefensiveCD | AbilityTag::Shield;
+                d.targetType = TargetType::Self;
+                d.maxSelfHpPct = 35.0f;
+                d.missingAuraOnCaster = 801952;
+                d.internalThrottleMs = 15000;
+                d.baseScore = 320.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Major Burst Cooldowns
+            {
+                AbilityDescriptor d;
+                d.name = "Apotheosis";
+                d.rootSpellId = 804203; // Native class-granted Apotheosis
+                d.tags = AbilityTag::OffensiveCD;
+                d.targetType = TargetType::Self;
+                d.internalThrottleMs = 90000;
+                d.baseScore = 280.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Blood Moon";
+                d.rootSpellId = 804199;
+                d.tags = AbilityTag::OffensiveCD;
+                d.targetType = TargetType::Self;
+                d.internalThrottleMs = 60000;
+                d.baseScore = 270.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Core Blood DoTs
+            // Blood Thirst (706613, max 10) spenders. Sanguine's real kit (Zyth45 reference order
+            // cross-checked against the learned book): Vampiric Fang at 10 stacks, Atherann's
+            // Anguish / Malediction at 7, Valanar's Vengeance at 5. The Vampyr's Kiss / Heartbreak /
+            // Veinburst / Hemoburst / Crimson Tide roots below are not in this spec's book at all
+            // (I17: "not known/resolvable" every decision), so Thirst was never spent.
+            {
+                AbilityDescriptor d;
+                d.name = "Vampiric Fang (Thirst 10)";
+                d.rootSpellId = 804726;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 310.0f;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float
+                {
+                    Aura const* thirst = ctx.bot->GetAura(706613);
+                    return thirst && thirst->GetStackAmount() >= 10 ? 310.0f : -1.0f;
+                };
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Atherann's Anguish (Thirst 7)";
+                d.rootSpellId = 680680;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 300.0f;
+                d.internalThrottleMs = 90000;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float
+                {
+                    Aura const* thirst = ctx.bot->GetAura(706613);
+                    return thirst && thirst->GetStackAmount() >= 7 ? 300.0f : -1.0f;
+                };
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Malediction (Thirst 7)";
+                d.rootSpellId = 800776;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 295.0f;
+                d.internalThrottleMs = 30000;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float
+                {
+                    Aura const* thirst = ctx.bot->GetAura(706613);
+                    return thirst && thirst->GetStackAmount() >= 7 ? 295.0f : -1.0f;
+                };
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Valanar's Vengeance (Thirst 5)";
+                d.rootSpellId = 572795;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 290.0f;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float
+                {
+                    Aura const* thirst = ctx.bot->GetAura(706613);
+                    return thirst && thirst->GetStackAmount() >= 5 ? 290.0f : -1.0f;
+                };
+                d.minSelfHpPct = 40.0f; // pays health: below 40% it bled Sanguine to 1% with no incoming damage and sent it fleeing for ~30 s
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Taldaram's Torment";
+                d.rootSpellId = 802580;
+                d.tags = AbilityTag::PeriodicDamage | AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.requireAuraMissingOnTarget = true;
+                d.internalThrottleMs = 6000;
+                d.baseScore = 275.0f;
+                d.minSelfHpPct = 40.0f; // pays health: below 40% it bled Sanguine to 1% with no incoming damage and sent it fleeing for ~30 s
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Transgression";
+                d.rootSpellId = 801076;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 801076;
+                d.internalThrottleMs = 60000;
+                d.baseScore = 265.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Keleseth's Calamity";
+                d.rootSpellId = 561179;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 150.0f;
+                d.minSelfHpPct = 40.0f; // pays health: below 40% it bled Sanguine to 1% with no incoming damage and sent it fleeing for ~30 s
+                p.abilities.push_back(d);
+            }
+
+            {
+                AbilityDescriptor d;
+                d.name = "Crimson Tide";
+                d.rootSpellId = 504282;
+                d.tags = AbilityTag::RangedAttack | AbilityTag::PeriodicDamage;
+                d.targetType = TargetType::CurrentTarget;
+                d.requireAuraMissingOnTarget = true;
+                d.internalThrottleMs = 6000;
+                d.baseScore = 250.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Vampyr's Kiss";
+                d.rootSpellId = 504275;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.requireAuraMissingOnTarget = true;
+                d.baseScore = 240.0f;
+                d.minSelfHpPct = 40.0f; // pays health: below 40% it bled Sanguine to 1% with no incoming damage and sent it fleeing for ~30 s
+                p.abilities.push_back(d);
+            }
+
+            // Heavy Spenders (Health-protected)
+            {
+                AbilityDescriptor d;
+                d.name = "Heartbreak";
+                d.rootSpellId = 520314;
+                d.tags = AbilityTag::RangedAttack | AbilityTag::Execute;
+                d.targetType = TargetType::CurrentTarget;
+                d.minSelfHpPct = 25.0f;
+                d.baseScore = 230.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Veinburst";
+                d.rootSpellId = 504260;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.minSelfHpPct = 20.0f;
+                d.baseScore = 220.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Hemoburst";
+                d.rootSpellId = 572855;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.minSelfHpPct = 20.0f;
+                d.baseScore = 210.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Pet / Summon
+            {
+                AbilityDescriptor d;
+                d.name = "Animated Blood";
+                d.rootSpellId = 573299;
+                d.tags = AbilityTag::OffensiveCD;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 60000;
+                d.baseScore = 200.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Fillers
+            {
+                AbilityDescriptor d;
+                d.name = "Bloodbolt";
+                d.rootSpellId = 804685;
+                d.tags = AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 170.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Bloodmoon Blast";
+                d.rootSpellId = 500125;
+                d.tags = AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 160.0f;
+                d.minSelfHpPct = 40.0f; // pays health: below 40% it bled Sanguine to 1% with no incoming damage and sent it fleeing for ~30 s
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // 65% of real casts: the filler between the Thirst spenders; pays health
+                d.name = "Sanguine Rupture";
+                d.rootSpellId = 800774;
+                d.tags = AbilityTag::AoEDamage | AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.minAoETargets = 1;
+                d.minSelfHpPct = 40.0f;
+                d.baseScore = 140.0f; // free filler between the Thirst spenders
+                p.abilities.push_back(d);
+            }
+
+            ProfileRegistry::RegisterProfile(std::move(p));
+
+            SpecStrategy s;
+            s.classId = 20;
+            s.specId = 26;
+            s.role = BotRole::Dps;
+            s.strategyName = "Sanguine_Dps_Strategy";
+
+            s.isReadyToPull = [](Player* bot, CombatContext const&) -> bool
+            {
+                return bot->GetHealthPct() >= 70.0f;
+            };
+
+            s.phaseModifiers[CombatPhase::Burst] = {
+                { AbilityTag::OffensiveCD,  1.8f, 50.0f },
+                { AbilityTag::RangedAttack, 1.3f, 30.0f }
+            };
+            s.phaseModifiers[CombatPhase::Execute] = {
+                { AbilityTag::Execute,      1.8f, 60.0f }
+            };
+
+            SpecStrategyRegistry::RegisterStrategy(std::move(s));
+        }
+
+        // =========================================================================
+        // 4. SPEC 27: ACCURSED (ACCURSED WEREWOLF MELEE DPS)
+        // =========================================================================
+        // Contract:
+        // - Canonical Role: Dps
+        // - Mandatory Baseline State: Accursed Form (spell 562572, aura 562572)
+        // - Resource: Rage / Ferocity in Werewolf Form
+        // - Tactical Policy: Close gap with Bloodleaper, howl buffs, claw and bite
+        // =========================================================================
+        {
+            CombatProfile p;
+            p.classId = 20;
+            p.specId = 27; // Accursed
+            p.role = BotRole::Dps;
+            p.profileName = "Bloodmage_Accursed_Dps";
+
+            // Mandatory Form: Accursed Form
+            {
+                AbilityDescriptor d;
+                d.name = "Accursed Form";
+                d.rootSpellId = 562572;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 562572;
+                d.internalThrottleMs = 4000;
+                d.baseScore = 500.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Lunge (25 s cooldown): leaps behind the enemy, which is one of Reave's three bonus conditions, and generates Rage.
+            // Zyth45's CoA rotations list it for Accursed; the learned book has it but the profile only had Bloodleaper (not in the book).
+            {
+                AbilityDescriptor d;
+                d.name = "Lunge";
+                d.rootSpellId = 500126;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 252.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Gap Closer: Bloodleaper
+            {
+                AbilityDescriptor d;
+                d.name = "Bloodleaper";
+                d.rootSpellId = 806423;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 240.0f;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float
+                {
+                    if (!ctx.victim) return -1.0f;
+                    float dist = ctx.bot->GetDistance(ctx.victim);
+                    return (dist >= 8.0f && dist <= 25.0f) ? 100.0f : -1.0f;
+                };
+                p.abilities.push_back(d);
+            }
+
+            // Offensive Howls
+            {
+                AbilityDescriptor d;
+                d.name = "Night Hunter's Howl";
+                d.rootSpellId = 500124;
+                d.tags = AbilityTag::OffensiveCD;
+                d.targetType = TargetType::Self;
+                d.internalThrottleMs = 45000;
+                d.baseScore = 260.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Wicked Howl";
+                d.rootSpellId = 804207;
+                d.tags = AbilityTag::OffensiveCD;
+                d.targetType = TargetType::Self;
+                d.internalThrottleMs = 45000;
+                d.baseScore = 250.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Execute Strike: Reave
+            // Learned Accursed kit that the profile never listed (Zyth45 order cross-checked with the learned
+            // book; Rotclaw/Vampiric Fang/Night Hunter's Howl roots below are not in this spec's book).
+            {
+                AbilityDescriptor d;
+                d.name = "Taldaram's Torment";
+                d.rootSpellId = 800772;
+                d.tags = AbilityTag::PeriodicDamage | AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 275.0f;
+                d.requireAuraMissingOnTarget = true;
+                d.internalThrottleMs = 6000;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Blood Curse";
+                d.rootSpellId = 562720;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.baseScore = 262.0f;
+                d.missingAuraOnCaster = 562720;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Aortic Assault";
+                d.rootSpellId = 806212;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 255.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Bloodfang Bite";
+                d.rootSpellId = 572551;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 235.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Reave";
+                d.rootSpellId = 800490;
+                d.tags = AbilityTag::MeleeAttack | AbilityTag::Execute;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 240.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Primary Claw Strikes
+            {
+                AbilityDescriptor d;
+                d.name = "Rotclaw";
+                d.rootSpellId = 804197;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 230.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Vampiric Fang";
+                d.rootSpellId = 804726;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 220.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Ravenous Bite";
+                d.rootSpellId = 500123;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 210.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Filler / Spender
+            {
+                AbilityDescriptor d;
+                d.name = "Blood Shards";
+                d.rootSpellId = 804849;
+                d.tags = AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 170.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // rage cleave inside the form, 12% of real casts
+                d.name = "Claw Sweep";
+                d.rootSpellId = 500169;
+                d.tags = AbilityTag::AoEDamage;
+                d.targetType = TargetType::CurrentTarget;
+                d.minAoETargets = 1;
+                d.baseScore = 175.0f; // 180 damage per cast on one target for 300 rage
+                p.abilities.push_back(d);
+            }
+            {
+                // Mortal-form nuke (0.85 SP + 0.25 AP, 15 s cooldown, +25% on bleeding targets): the Accursed bot spent its
+                // ~30 s mortal windows on 544-damage Bloodbolts and never cast it.
+                AbilityDescriptor d;
+                d.name = "Veinburst";
+                d.rootSpellId = 504819;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 245.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                // Mortal-form burst: +Shadow damage and spell haste for 20 s, 180 s cooldown.
+                AbilityDescriptor d;
+                d.name = "Bloodsurge";
+                d.rootSpellId = 553267;
+                d.tags = AbilityTag::OffensiveCD;
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 553267;
+                d.internalThrottleMs = 60000;
+                d.baseScore = 265.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Bloodbolt";
+                d.rootSpellId = 804685;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 215.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // usable only outside the form (native exclusion)
+                d.name = "Sanguine Rupture";
+                d.rootSpellId = 800774;
+                d.tags = AbilityTag::AoEDamage | AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.minAoETargets = 1;
+                d.minSelfHpPct = 40.0f;
+                d.baseScore = 140.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Animated Blood";
+                d.rootSpellId = 573299;
+                d.tags = AbilityTag::TotemOrWard;
+                d.targetType = TargetType::Self;
+                d.internalThrottleMs = 30000;
+                d.baseScore = 200.0f;
+                p.abilities.push_back(d);
+            }
+
+            ProfileRegistry::RegisterProfile(std::move(p));
+
+            SpecStrategy s;
+            s.classId = 20;
+            s.specId = 27;
+            s.role = BotRole::Dps;
+            s.strategyName = "Accursed_Dps_Strategy";
+            s.requiredState.formSpellId = 562572; // Accursed Form
+            s.requiredState.formAuraId = 562572;
+
+            s.isReadyToPull = [](Player* bot, CombatContext const&) -> bool
+            {
+                return bot->HasAura(562572) && bot->GetHealthPct() >= 70.0f;
+            };
+
+            s.phaseModifiers[CombatPhase::Burst] = {
+                { AbilityTag::OffensiveCD, 1.8f, 50.0f }
+            };
+            s.phaseModifiers[CombatPhase::Execute] = {
+                { AbilityTag::Execute,     2.0f, 60.0f }
+            };
+
+            SpecStrategyRegistry::RegisterStrategy(std::move(s));
+        }
+    }
+}

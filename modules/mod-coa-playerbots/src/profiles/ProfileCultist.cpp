@@ -1,0 +1,783 @@
+/*
+ * mod-coa-playerbots
+ *
+ * Data-Driven Combat AI Framework: Cultist Profiles & Spec Strategies
+ *
+ * Specializations:
+ *   - Spec 96: Dreadnought (Void Plate Heavy Tank)
+ *   - Spec 40: Heretic (Dark Mending Healer / Hybrid)
+ *   - Spec 41: Corruption (Old God Insanity Caster DPS)
+ *   - Spec 42: Godblade (Void Melee Insanity DPS)
+ */
+
+#include "profiles/ProfileCultist.h"
+#include "profiles/ProfileRegistry.h"
+#include "engine/SpecStrategyRegistry.h"
+#include "engine/CombatContext.h"
+#include "Player.h"
+
+namespace BotAI
+{
+    void RegisterCultistProfiles()
+    {
+        // =========================================================================
+        // 1. SPEC 96: DREADNOUGHT (VOID PLATE HEAVY TANK)
+        // =========================================================================
+        // Contract:
+        // - Canonical Role: Tank
+        // - Baseline State: Void Armor (buff 804633)
+        // - Anti-Spam: Dreadnought & Abyssal Ward throttled to prevent spam bug
+        // - TankReady: Void-Enchanted Armor active + HP >= 75%
+        // =========================================================================
+        {
+            CombatProfile p;
+            p.classId = 25; // Cultist
+            p.specId = 96;  // Dreadnought
+            p.role = BotRole::Tank;
+            p.profileName = "Cultist_Dreadnought_Tank";
+
+            // Primary Taunts
+            // Real taunt: Spell.dbc effect ATTACK_ME + MOD_TAUNT, 8 s native cooldown. The generic
+            // Taunt355 root is not a learned spell for Ascension classes ("not known/resolvable" in
+            // every I17 tank decision) and passive ids cannot be cast.
+            {
+                AbilityDescriptor d;
+                d.name = "Test of Pride (Taunt)";
+                d.rootSpellId = 804412;
+                d.tags = AbilityTag::Taunt;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 455.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Taunt";
+                d.rootSpellId = 355;
+                d.tags = AbilityTag::Taunt;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 450.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Grasp of Zek'voz";
+                d.rootSpellId = 573028;
+                d.tags = AbilityTag::Taunt;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 15000;
+                d.baseScore = 440.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Active Mitigation (FIXED: Added missingAuraOnCaster & internalThrottleMs to prevent spam)
+            {
+                AbilityDescriptor d;
+                d.name = "Dreadnought";
+                d.rootSpellId = 680750;
+                d.tags = AbilityTag::DefensiveCD | AbilityTag::Shield;
+                d.targetType = TargetType::Self;
+                d.maxSelfHpPct = 55.0f;
+                d.missingAuraOnCaster = 680750;
+                d.internalThrottleMs = 15000;
+                d.baseScore = 350.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Abyssal Ward";
+                d.rootSpellId = 804670;
+                d.tags = AbilityTag::DefensiveCD | AbilityTag::Shield;
+                d.targetType = TargetType::Self;
+                d.maxSelfHpPct = 65.0f;
+                d.missingAuraOnCaster = 804670;
+                d.internalThrottleMs = 15000;
+                d.baseScore = 320.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Self-Sustain
+            {
+                AbilityDescriptor d;
+                d.name = "Satiate";
+                d.rootSpellId = 804275;
+                d.tags = AbilityTag::DirectHeal;
+                d.targetType = TargetType::Self;
+                d.maxSelfHpPct = 45.0f;
+                d.internalThrottleMs = 6000;
+                d.baseScore = 300.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Buff: Void-Enchanted Armor (Anti-spam throttle)
+            {
+                AbilityDescriptor d;
+                d.name = "Void-Enchanted Armor";
+                d.rootSpellId = 804633;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 804633;
+                d.internalThrottleMs = 30000;
+                d.baseScore = 200.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Threat Strikes
+            {
+                AbilityDescriptor d;
+                d.name = "Blade of the Empire";
+                d.rootSpellId = 500720;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 230.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Eldritch Strike";
+                d.rootSpellId = 801964;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 210.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Gaze of C'Thun";
+                d.rootSpellId = 500110;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 190.0f;
+                p.abilities.push_back(d);
+            }
+
+            ProfileRegistry::RegisterProfile(std::move(p));
+
+            SpecStrategy s;
+            s.classId = 25;
+            s.specId = 96;
+            s.role = BotRole::Tank;
+            s.strategyName = "Dreadnought_Tank_Strategy";
+
+            s.isReadyToPull = [](Player* bot, CombatContext const&) -> bool
+            {
+                return bot->GetHealthPct() >= 75.0f;
+            };
+
+            s.phaseModifiers[CombatPhase::Emergency] = {
+                { AbilityTag::DefensiveCD, 2.5f, 100.0f },
+                { AbilityTag::Shield,      2.0f,  80.0f }
+            };
+
+            SpecStrategyRegistry::RegisterStrategy(std::move(s));
+        }
+
+        // =========================================================================
+        // 2. SPEC 40: HERETIC (DARK MENDING HEALER)
+        // =========================================================================
+        // Contract:
+        // - Canonical Role: Healer
+        // - Baseline State: Caster
+        // - Resource: Mana + Insanity
+        // - Anti-Spam: Herald of the Depths throttled to 30s
+        // =========================================================================
+        {
+            CombatProfile p;
+            p.classId = 25;
+            p.specId = 40; // Heretic
+            p.role = BotRole::Healer;
+            p.profileName = "Cultist_Heretic_Healer";
+            // Malevolence (5 yards) and Blade of the Empire are the main throughput of the spec: the guide has the Heretic heal standing in melee range.
+            p.preferredEngageDistance = PROFILE_MELEE_ENGAGE_DISTANCE;
+
+            // Critical Direct Heal
+            {
+                AbilityDescriptor d;
+                d.name = "Eldritch Mending (Emergency)";
+                d.rootSpellId = 500711;
+                d.tags = AbilityTag::EmergencyHeal | AbilityTag::DirectHeal;
+                d.targetType = TargetType::LowestHealthAlly;
+                d.maxTargetHpPct = 40.0f;
+                d.internalThrottleMs = 4000;
+                d.baseScore = 400.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Protective Shield
+            {
+                AbilityDescriptor d;
+                d.name = "Void Shield";
+                d.rootSpellId = 500715;
+                d.tags = AbilityTag::Shield;
+                d.targetType = TargetType::LowestHealthAlly;
+                d.maxTargetHpPct = 60.0f;
+                d.internalThrottleMs = 8000;
+                d.baseScore = 340.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Native learned direct healing, rather than treating a self channel as a heal.
+            {
+                AbilityDescriptor d;
+                d.name = "Eldritch Mending (Triage)";
+                d.rootSpellId = 500711;
+                d.tags = AbilityTag::DirectHeal;
+                d.targetType = TargetType::LowestHealthAlly;
+                d.maxTargetHpPct = 80.0f;
+                d.baseScore = 280.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Satiate (Self Channel)";
+                d.rootSpellId = 804275;
+                d.tags = AbilityTag::Buff; // not OffensiveCD: that tag scaled it to 15% on a normal target and it was never cast
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 804275;
+                d.baseScore = 220.0f;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float
+                {
+                    float mana = 100.0f * ctx.bot->GetPower(POWER_MANA) /
+                        std::max(1u, ctx.bot->GetMaxPower(POWER_MANA));
+                    // 6 s channel that restores mana (180 s cooldown) and raises damage taken: only when mana is low and nobody needs a heal
+                    return (mana < 40.0f && ctx.lowestAllyHpPct >= 70.0f) ? 0.0f : -1.0f;
+                };
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Sanity Tap";
+                d.rootSpellId = 802575;
+                d.tags = AbilityTag::Buff; // not OffensiveCD: a mana/insanity spell real players use constantly (21% of casts)
+                d.targetType = TargetType::Self;
+                d.minSelfHpPct = 55.0f;
+                d.baseScore = 300.0f;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float
+                {
+                    return ctx.bot->GetPower(POWER_MANA) * 100 /
+                        std::max(1u, ctx.bot->GetMaxPower(POWER_MANA)) < 40 ? 0.0f : -1.0f;
+                };
+                p.abilities.push_back(d);
+            }
+
+            // Dark Blessing
+            {
+                AbilityDescriptor d;
+                d.name = "Herald of the Depths";
+                d.rootSpellId = 92131;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 92131;
+                d.internalThrottleMs = 30000;
+                d.baseScore = 220.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Offensive Weaving
+            {
+                AbilityDescriptor d;
+                d.name = "Gaze of C'Thun";
+                d.rootSpellId = 500110;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.requireAuraMissingOnTarget = true;
+                d.internalThrottleMs = 6000;
+                d.baseScore = 160.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Horrorbolt";
+                d.rootSpellId = 800416;
+                d.tags = AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 130.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // weapon strike, 43% of real casts
+                d.name = "Blade of the Empire";
+                d.rootSpellId = 500720;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 150.0f; // free weapon strike: filler
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // needs the native Madness/Insanity aura
+                d.name = "Entropic Slam";
+                d.rootSpellId = 804152;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 235.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Hammer of Twilight";
+                d.rootSpellId = 805116;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 225.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // 60 s cooldown: the next Eldritch Mendings and Malevolences are instant and critical
+                d.name = "Eldritch Eye";
+                d.rootSpellId = 802049;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.internalThrottleMs = 60000;
+                d.baseScore = 360.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // main throughput per the guide: damages the enemy and puts Black Blood on nearby allies; 5 yard range
+                d.name = "Malevolence";
+                d.rootSpellId = 502241;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 320.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // 30 minute tether on the tank, the guide recasts it every dungeon
+                d.name = "Abyssal Covenant";
+                d.rootSpellId = 500751;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::TankAlly;
+                d.internalThrottleMs = 120000;
+                d.requireAuraMissingOnTarget = true;
+                d.baseScore = 380.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // 3 charges, 30 s recharge: heals the next time the ally takes damage
+                d.name = "Dark Infusion";
+                d.rootSpellId = 570249;
+                d.tags = AbilityTag::PeriodicHeal;
+                d.targetType = TargetType::LowestHealthAlly;
+                d.internalThrottleMs = 6000;
+                d.requireAuraMissingOnTarget = true;
+                d.baseScore = 320.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // shield on every party member
+                d.name = "Forbidden Ritual";
+                d.rootSpellId = 800105;
+                d.tags = AbilityTag::Shield;
+                d.targetType = TargetType::Self;
+                d.internalThrottleMs = 60000;
+                d.baseScore = 330.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // allies nearby receive increased healing for 30 s
+                d.name = "Tentacle of Yogg-Saron";
+                d.rootSpellId = 802042;
+                d.tags = AbilityTag::TotemOrWard;
+                d.targetType = TargetType::Self;
+                d.internalThrottleMs = 31000;
+                d.baseScore = 300.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // instant heal worth 0.416 bonus healing for 20 Insanity, 8 s cooldown
+                d.name = "Eldritch Shock";
+                d.rootSpellId = 808038;
+                d.tags = AbilityTag::DirectHeal;
+                d.targetType = TargetType::LowestHealthAlly;
+                d.maxTargetHpPct = 90.0f;
+                d.baseScore = 285.0f;
+                p.abilities.push_back(d);
+            }
+
+            ProfileRegistry::RegisterProfile(std::move(p));
+
+            SpecStrategy s;
+            s.classId = 25;
+            s.specId = 40;
+            s.role = BotRole::Healer;
+            s.strategyName = "Heretic_Healer_Strategy";
+            s.minResourceToEngage = 50.0f;
+            s.recoveryThreshold = 20.0f;
+
+            s.isReadyToPull = [](Player* bot, CombatContext const&) -> bool
+            {
+                return bot->GetPower(POWER_MANA) * 100 / std::max(1u, bot->GetMaxPower(POWER_MANA)) >= 50;
+            };
+
+            s.phaseModifiers[CombatPhase::Emergency] = {
+                { AbilityTag::EmergencyHeal, 2.5f, 100.0f },
+                { AbilityTag::DirectHeal,    1.8f,  50.0f }
+            };
+            s.phaseModifiers[CombatPhase::Recovery] = {
+                { AbilityTag::Filler,        0.1f, -50.0f }
+            };
+
+            SpecStrategyRegistry::RegisterStrategy(std::move(s));
+        }
+
+        // =========================================================================
+        // 3. SPEC 41: CORRUPTION (OLD GOD CASTER DPS)
+        // =========================================================================
+        // Contract:
+        // - Canonical Role: Dps
+        // - Baseline State: Caster
+        // - Resource: Mana + Insanity
+        // - Tactical Policy: Channel Gaze of C'Thun, AoE Screams, summon heralds
+        // =========================================================================
+        {
+            CombatProfile p;
+            p.classId = 25;
+            p.specId = 41; // Corruption
+            p.role = BotRole::Dps;
+            p.profileName = "Cultist_Corruption_Dps";
+
+            // Emergency Defense
+            {
+                AbilityDescriptor d;
+                d.name = "Void Shield";
+                d.rootSpellId = 500715;
+                d.tags = AbilityTag::DefensiveCD | AbilityTag::Shield;
+                d.targetType = TargetType::Self;
+                d.maxSelfHpPct = 35.0f;
+                d.internalThrottleMs = 15000;
+                d.baseScore = 350.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Burst Offensive Cooldowns
+            {
+                AbilityDescriptor d;
+                d.name = "Corrupting Whispers";
+                d.rootSpellId = 92130;
+                d.tags = AbilityTag::OffensiveCD;
+                d.targetType = TargetType::Self;
+                d.internalThrottleMs = 90000;
+                d.baseScore = 280.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Vision of Doom";
+                d.rootSpellId = 520388;
+                d.tags = AbilityTag::OffensiveCD;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 60000;
+                d.baseScore = 270.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Heralds (Throttled so not spammed)
+            {
+                AbilityDescriptor d;
+                d.name = "Herald of Yogg-Saron";
+                d.rootSpellId = 805120;
+                d.tags = AbilityTag::OffensiveCD;
+                d.targetType = TargetType::Self;
+                d.internalThrottleMs = 60000;
+                d.baseScore = 250.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Herald of C'thun";
+                d.rootSpellId = 805119;
+                d.tags = AbilityTag::OffensiveCD;
+                d.targetType = TargetType::Self;
+                d.internalThrottleMs = 60000;
+                d.baseScore = 240.0f;
+                p.abilities.push_back(d);
+            }
+
+            // DoTs & Channels
+            {
+                AbilityDescriptor d;
+                d.name = "Gaze of C'Thun";
+                d.rootSpellId = 500110;
+                d.tags = AbilityTag::RangedAttack | AbilityTag::PeriodicDamage;
+                d.targetType = TargetType::CurrentTarget;
+                d.requireAuraMissingOnTarget = true;
+                d.internalThrottleMs = 6000;
+                d.baseScore = 240.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Eldritch Screams";
+                d.rootSpellId = 525049;
+                d.tags = AbilityTag::AoEDamage;
+                d.targetType = TargetType::CurrentTarget;
+                d.minAoETargets = 3;
+                d.baseScore = 220.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Filler
+            {
+                AbilityDescriptor d;
+                d.name = "Horrorbolt";
+                d.rootSpellId = 800416;
+                d.tags = AbilityTag::Filler;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 220.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // 20 s cooldown beam, 18% of real casts
+                d.name = "Obliteration Beam";
+                d.rootSpellId = 805572;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 245.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Blade of the Empire";
+                d.rootSpellId = 500720;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 150.0f; // free weapon strike: filler
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Entropic Slam";
+                d.rootSpellId = 804152;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 225.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Darkwither";
+                d.rootSpellId = 800446;
+                d.tags = AbilityTag::RangedAttack | AbilityTag::PeriodicDamage;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 6000;
+                d.requireAuraMissingOnTarget = true;
+                d.baseScore = 240.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Eldritch Devastation";
+                d.rootSpellId = 802727;
+                d.tags = AbilityTag::RangedAttack | AbilityTag::PeriodicDamage;
+                d.targetType = TargetType::CurrentTarget;
+                d.internalThrottleMs = 6000;
+                d.baseScore = 230.0f;
+                p.abilities.push_back(d);
+            }
+
+            ProfileRegistry::RegisterProfile(std::move(p));
+
+            SpecStrategy s;
+            s.classId = 25;
+            s.specId = 41;
+            s.role = BotRole::Dps;
+            s.strategyName = "Corruption_Dps_Strategy";
+            s.minResourceToEngage = 40.0f;
+            s.recoveryThreshold = 15.0f;
+
+            s.isReadyToPull = [](Player* bot, CombatContext const&) -> bool
+            {
+                return bot->GetPower(POWER_MANA) * 100 / std::max(1u, bot->GetMaxPower(POWER_MANA)) >= 40;
+            };
+
+            s.phaseModifiers[CombatPhase::Burst] = {
+                { AbilityTag::OffensiveCD,  1.8f, 50.0f },
+                { AbilityTag::RangedAttack, 1.3f, 30.0f }
+            };
+            s.phaseModifiers[CombatPhase::AoE] = {
+                { AbilityTag::AoEDamage,    2.0f, 60.0f }
+            };
+
+            SpecStrategyRegistry::RegisterStrategy(std::move(s));
+        }
+
+        // =========================================================================
+        // 4. SPEC 42: GODBLADE (VOID MELEE DPS)
+        // =========================================================================
+        // Contract:
+        // - Canonical Role: Dps
+        // - Baseline State: Melee
+        // - Resource: Insanity
+        // - Gap Closer: Grasp of Zek'voz
+        // =========================================================================
+        {
+            CombatProfile p;
+            p.classId = 25;
+            p.specId = 42; // Godblade
+            p.role = BotRole::Dps;
+            p.profileName = "Cultist_Godblade_Dps";
+
+            // Buff
+            {
+                AbilityDescriptor d;
+                d.name = "Shroud of Pride";
+                d.rootSpellId = 805126;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.missingAuraOnCaster = 805126;
+                d.internalThrottleMs = 30000;
+                d.baseScore = 250.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Burst Cooldown
+            {
+                AbilityDescriptor d;
+                d.name = "Obliteration";
+                d.rootSpellId = 92129;
+                d.tags = AbilityTag::OffensiveCD;
+                d.targetType = TargetType::Self;
+                d.internalThrottleMs = 90000;
+                d.baseScore = 280.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Gap Closer: Grasp of Zek'voz
+            {
+                AbilityDescriptor d;
+                d.name = "Grasp of Zek'voz";
+                d.rootSpellId = 573028;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 240.0f;
+                d.customScorer = [](CombatContext const& ctx, AbilityDescriptor const&) -> float
+                {
+                    if (!ctx.victim) return -1.0f;
+                    float dist = ctx.bot->GetDistance(ctx.victim);
+                    return (dist >= 8.0f && dist <= 25.0f) ? 100.0f : -1.0f;
+                };
+                p.abilities.push_back(d);
+            }
+
+            // Melee Strikes
+            {
+                AbilityDescriptor d;
+                d.name = "Blade of the Empire";
+                d.rootSpellId = 500720;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 240.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Eldritch Strike";
+                d.rootSpellId = 801964;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 220.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Devourer";
+                d.rootSpellId = 300265;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 200.0f;
+                p.abilities.push_back(d);
+            }
+
+            // Spender
+            {
+                AbilityDescriptor d;
+                d.name = "Gaze of C'Thun";
+                d.rootSpellId = 500110;
+                d.tags = AbilityTag::RangedAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.requireAuraMissingOnTarget = true;
+                d.internalThrottleMs = 6000;
+                d.baseScore = 245.0f; // 10 s cooldown: cast on cooldown instead of being starved by the free strikes;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // 21% of real casts
+                d.name = "Entropic Slam";
+                d.rootSpellId = 804152;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 250.0f; // 3300 damage per cast against 1750 for Blade of the Empire
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Netherstrike";
+                d.rootSpellId = 806222;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.baseScore = 230.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                d.name = "Rift";
+                d.rootSpellId = 806250;
+                d.tags = AbilityTag::Buff;
+                d.targetType = TargetType::Self;
+                d.internalThrottleMs = 45000;
+                d.baseScore = 220.0f;
+                p.abilities.push_back(d);
+            }
+            {
+                AbilityDescriptor d;
+                // free, needs the native aura 680602; 16 casts in the baseline
+                d.name = "Hammer of Twilight";
+                d.rootSpellId = 805116;
+                d.tags = AbilityTag::MeleeAttack;
+                d.targetType = TargetType::CurrentTarget;
+                d.requiredAuraOnCaster = 680602;
+                d.baseScore = 255.0f; // about 5,000 damage per cast against 1,750 for Blade of the Empire;
+                p.abilities.push_back(d);
+            }
+
+            ProfileRegistry::RegisterProfile(std::move(p));
+
+            SpecStrategy s;
+            s.classId = 25;
+            s.specId = 42;
+            s.role = BotRole::Dps;
+            s.strategyName = "Godblade_Dps_Strategy";
+
+            s.isReadyToPull = [](Player* bot, CombatContext const&) -> bool
+            {
+                return bot->GetHealthPct() >= 70.0f;
+            };
+
+            s.phaseModifiers[CombatPhase::Burst] = {
+                { AbilityTag::OffensiveCD, 1.8f, 50.0f }
+            };
+            s.phaseModifiers[CombatPhase::Execute] = {
+                { AbilityTag::MeleeAttack, 1.4f, 40.0f }
+            };
+
+            // ResourcePolicy for Insanity (500706)
+            {
+                ResourcePolicy pol;
+                pol.key = CombatResourceKey{ CombatResourceKind::AuraStack, 0, 500706 };
+                pol.overcapThreshold = 85;
+                s.resourcePolicies.push_back(pol);
+            }
+
+            SpecStrategyRegistry::RegisterStrategy(std::move(s));
+        }
+    }
+}
