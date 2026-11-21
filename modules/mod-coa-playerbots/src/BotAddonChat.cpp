@@ -589,6 +589,13 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
             SendCoaBotReply(commander, line);
         return;
     }
+    // GETECONOMY: the "Economy" tab -- state, gold and 24-hour trade of the sender's guild and group bots, and the latest trades.
+    if (verb == "GETECONOMY")
+    {
+        for (std::string const& line : BotEconomy::GetEconomyLines(commander))
+            SendCoaBotReply(commander, line);
+        return;
+    }
     if (verb == "SETSTOCK" && parts.size() >= 3)
     {
         BotEconomy::SetStockLimit(commander, std::strtoul(parts[1].c_str(), nullptr, 10), std::strtoll(parts[2].c_str(), nullptr, 10), nullptr);

@@ -1,15 +1,20 @@
 /*
  * mod-coa-playerbots
  *
- * Bot economy, step 1: deciding what a bot would sell, and why, without selling anything yet.
+ * Bot economy: what bots sell, buy and carry to town.
  *
  * A bot carries things it will never use again: grey junk, gear it has outgrown or cannot wear,
- * potions and food beyond what it needs, valuable finds. This layer looks into a bot's bags and
- * sorts every stack into Keep / Vendor / Auction by a fixed set of rules (BotEconomy.cpp), puts a
- * price on it (the auction houses' current lowest buyout when there is one, the vendor price
- * otherwise) and writes what it found to a journal the owner can read. For now it only plans: the
- * journal rows are marked as "not executed". Selling, travelling to a city and buying come later
- * and will reuse the same plan.
+ * potions and food beyond what it needs, valuable finds. PlanSale looks into a bot's bags and sorts
+ * every stack into Keep / Vendor / Auction by a fixed set of rules (BotEconomy.cpp), puts a price on
+ * it (the auction houses' current lowest buyout when there is one, the vendor price otherwise) and
+ * writes what it found to a journal the owner can read. With CoaBots.Economy.DryRun = 0 bots act on
+ * the plan: they travel to a vendor or an auction house, sell and list, collect their auction mail,
+ * buy food, drink and potions, and pay a share into the guild bank.
+ *
+ * Buying: with CoaBots.Economy.AuctionBuyGear = 1 a bot with money to spare also shops the auction
+ * house for gear upgrades for its spec. Crafting orders (BotMgr::CraftOrder) fetch missing reagents
+ * through SourceReagents: from the guild bank, from vendors and from the auction house, each one
+ * switched on by its own CoaBots.Crafting.* setting.
  *
  * The rules never touch what a bot needs: equipped gear, quest items, profession tools, bags,
  * trade goods (they go to the guild bank), recipes, keys, the hearthstone, anything the owner
@@ -20,11 +25,14 @@
 #define COA_PLAYERBOTS_BOT_ECONOMY_H
 
 #include "Define.h"
+#include "ObjectGuid.h"
 #include <string>
 #include <vector>
 
 class ChatHandler;
+class Item;
 class Player;
+class SpellInfo;
 class WorldSession;
 
 namespace BotEconomy
@@ -85,6 +93,12 @@ namespace BotEconomy
     // GetStockLines: replies for GETSTOCK, `STOCK:<entry>,<count>,<limit>,<name>|...` (chunked by length).
     // SetStockLimit: keep >= 0 sets the limit, keep < 0 clears it. Guild master or officers only (not checked for console).
     std::vector<std::string> GetStockLines(Player* requester);
+
+    // Replies for GETECONOMY (the addon's Economy tab), for the requester's guild-mate and group bots:
+    // `ECONSTATE:<enabled>,<live>,<buy gear>,<craft sourcing>,<hourly cap left, -1 = none>`,
+    // `ECONBOT:<guid>,<name>,<money>,<sold 24h>,<bought 24h>|...` (chunked) and
+    // `ECONLOG:<bot>,<item>,<count>,<verdict>,<unit copper>,<minutes ago>|...` (latest executed journal rows), then `ECONEND`.
+    std::vector<std::string> GetEconomyLines(Player* requester);
     void SetStockLimit(Player* requester, uint32 itemEntry, int64 keep, ChatHandler* handler);
 
     // `.botcmd economy ...` (plan <guid>, journal [n], status, protect <item>, unprotect <item>).
@@ -105,6 +119,42 @@ namespace BotEconomy
 
     // Write an executed vendor-sale row for a bag-cleanup sell. No-op when the economy is off.
     void RecordCleanupVendorSale(Player* bot, uint32 itemEntry, uint32 count, uint32 unitCopper, char const* reason);
+
+    // Reagents of the bot's crafting order: bag cleanup, guild-order deposits and sales leave them alone.
+    bool IsReservedReagent(Player* bot, uint32 itemEntry);
+
+    // A reserved reagent, or gear the bot bought at the auction house in the last few hours (it is equipped right
+    // away; one that could not be is kept for a while instead of being sold straight back).
+    bool IsReservedItem(Player* bot, Item const* item);
+
+    // Takes the items and money a player mailed the bot (crafting reagents, for one), from that sender only.
+    void CollectMailFrom(Player* bot, ObjectGuid sender);
+
+    struct ReagentShortfall
+    {
+        uint32 entry = 0;
+        uint32 count = 0;
+    };
+
+    // What `crafts` casts of the recipe still need beyond what the crafter carries.
+    std::vector<ReagentShortfall> MissingReagents(Player* crafter, SpellInfo const* recipe, uint32 crafts);
+
+    // Fetches the reagents a crafting order is short of, for up to a few casts at once: from the guild bank
+    // (CoaBots.Crafting.ReagentsFromGuildBank), then from vendors that sell them for gold
+    // (CoaBots.Crafting.ReagentsFromVendor), then from the auction house (CoaBots.Crafting.ReagentsFromAuction,
+    // needs the live economy). Purchases come out of the crafter's money above its reserve and out of
+    // budgetLeftCopper. Returns what is still missing.
+    std::vector<ReagentShortfall> SourceReagents(Player* crafter, SpellInfo const* recipe, uint32 crafts, uint64& budgetLeftCopper);
+
+    // "3x Bolt of Linen Cloth, 1x Coarse Thread".
+    std::string DescribeReagents(std::vector<ReagentShortfall> const& reagents);
+
+    bool CraftSourcingEnabled();
+    uint64 CraftReagentBudgetCopper();
+    // 0: a crafting order waits for its reagents forever.
+    uint32 CraftOrderTimeoutMs();
+    // Failed casts in a row before a crafting order is given up; 0: never.
+    uint32 CraftMaxCastFailures();
 }
 
 #endif // COA_PLAYERBOTS_BOT_ECONOMY_H

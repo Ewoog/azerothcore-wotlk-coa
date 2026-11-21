@@ -1067,7 +1067,7 @@ namespace
             return true;
         if (proto->ItemId == HEARTHSTONE_ENTRY)
             return true;
-        if (BotEconomy::IsProtectedItem(proto->ItemId))
+        if (BotEconomy::IsProtectedItem(proto->ItemId) || BotEconomy::IsReservedItem(bot, item))
             return true;
         if (proto->ItemId == OrderItemOf(bot))
             return true;
@@ -1240,7 +1240,7 @@ namespace
             if (!item)
                 return;
             ObjectGuid const guid = item->GetGUID();
-            if (tools.keep.count(guid))
+            if (tools.keep.count(guid) || BotEconomy::IsReservedItem(bot, item))
                 return;
             ItemTemplate const* proto = item->GetTemplate();
             if (EconomyHoldsItem(proto ? proto->ItemId : 0, live ? &liveVerdicts : nullptr))
@@ -1989,7 +1989,7 @@ namespace BotMaintenance
                 if (!proto)
                     continue;
                 ObjectGuid const guid = item->GetGUID();
-                if (tools.keep.count(guid))
+                if (tools.keep.count(guid) || BotEconomy::IsReservedItem(bot, item))
                     continue;
                 if (EconomyHoldsItem(proto->ItemId, live ? &liveVerdicts : nullptr))
                     continue;
