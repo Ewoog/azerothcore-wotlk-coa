@@ -1692,7 +1692,7 @@ void BotMgr::DepositLooseResourcesToGuildBank(Player* bot)
     auto collect = [&](Item* item)
     {
         ItemTemplate const* proto = item ? item->GetTemplate() : nullptr;
-        if (proto && proto->Class == ITEM_CLASS_TRADE_GOODS)
+        if (proto && proto->Class == ITEM_CLASS_TRADE_GOODS && !BotEconomy::IsReservedReagent(bot, proto->ItemId))
             resourceEntries.insert(proto->ItemId);
     };
 
@@ -2421,7 +2421,7 @@ bool BotMgr::MakeRoomForGatherOrder(Player* bot)
     for (auto otherItr = other.begin(); otherItr != other.end();)
     {
         ItemTemplate const* proto = sObjectMgr->GetItemTemplate(otherItr->first);
-        if (bot->HasQuestForItem(otherItr->first) || BotAI::IsProfessionTool(proto))
+        if (bot->HasQuestForItem(otherItr->first) || BotAI::IsProfessionTool(proto) || BotEconomy::IsReservedReagent(bot, otherItr->first))
             otherItr = other.erase(otherItr);
         else
             ++otherItr;

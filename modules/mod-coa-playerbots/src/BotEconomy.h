@@ -30,6 +30,7 @@
 #include <vector>
 
 class ChatHandler;
+class Item;
 class Player;
 class SpellInfo;
 class WorldSession;
@@ -112,6 +113,13 @@ namespace BotEconomy
 
     // Write an executed vendor-sale row for a bag-cleanup sell. No-op when the economy is off.
     void RecordCleanupVendorSale(Player* bot, uint32 itemEntry, uint32 count, uint32 unitCopper, char const* reason);
+
+    // Reagents of the bot's crafting order: bag cleanup, guild-order deposits and sales leave them alone.
+    bool IsReservedReagent(Player* bot, uint32 itemEntry);
+
+    // A reserved reagent, or gear the bot bought at the auction house in the last few hours (it is equipped right
+    // away; one that could not be is kept for a while instead of being sold straight back).
+    bool IsReservedItem(Player* bot, Item const* item);
 
     // Takes the items and money a player mailed the bot (crafting reagents, for one), from that sender only.
     void CollectMailFrom(Player* bot, ObjectGuid sender);

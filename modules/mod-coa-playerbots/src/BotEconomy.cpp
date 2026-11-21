@@ -27,6 +27,7 @@
 #include "Random.h"
 #include "ScriptMgr.h"
 #include "SpellInfo.h"
+#include "SpellMgr.h"
 #include "StringFormat.h"
 #include "World.h"
 #include "WorldConfig.h"
@@ -653,6 +654,8 @@ namespace
     } g_buyTotals;
 
     std::unordered_map<ObjectGuid, uint32> g_nextShopAt;
+    std::unordered_map<ObjectGuid, std::unordered_map<ObjectGuid, uint32>> g_purchases; // bot -> bought item -> kept until (game ms)
+    constexpr uint32 PURCHASE_KEEP_MS = 6 * 60 * 60 * 1000;
     std::unordered_set<ObjectGuid> g_wantsShopping;
 
     uint64 SpareMoney(Player* bot)
@@ -690,6 +693,7 @@ namespace
         AuctionEntry* a = house ? house->GetAuction(auctionId) : nullptr;
         if (!MayBuy(bot, a))
             return false;
+        ObjectGuid const itemGuid = a->item_guid;
         uint32 const cost = a->bidder == bot->GetGUID() ? a->buyout - a->bid : a->buyout;
         if (!bot->HasEnoughMoney(cost))
             return false;
@@ -714,6 +718,11 @@ namespace
 
         if (auto count = g_listingCount.find(ownerLow); count != g_listingCount.end() && count->second)
             --count->second;
+        auto& purchases = g_purchases[bot->GetGUID()];
+        uint32 const now = GameTime::GetGameTimeMS().count();
+        for (auto it = purchases.begin(); it != purchases.end();)
+            it = int32(now - it->second) >= 0 ? purchases.erase(it) : std::next(it);
+        purchases[itemGuid] = now + PURCHASE_KEEP_MS;
         CollectAuctionMail(bot);
         return true;
     }
@@ -1168,7 +1177,7 @@ namespace BotEconomy
             if (!proto)
                 return;
             uint32 const entry = item->GetEntry();
-            if (entry == HEARTHSTONE_ENTRY || g_protected.count(entry))
+            if (entry == HEARTHSTONE_ENTRY || g_protected.count(entry) || BotEconomy::IsReservedItem(bot, item))
                 return;
             // A resource taken out of the guild bank to be sold (see the Stock limits).
             if (proto->Class == ITEM_CLASS_TRADE_GOODS)
@@ -2034,6 +2043,31 @@ namespace BotEconomy
         line.unitCopper = unitCopper;
         line.priceSource = "bag-cleanup";
         JournalDone(bot, line, count, unitCopper, "vendor", "bag-cleanup");
+    }
+
+    bool IsReservedReagent(Player* bot, uint32 itemEntry)
+    {
+        BotMgr::CraftOrderState const* order = bot ? sBotMgr->GetCraftOrder(bot->GetGUID()) : nullptr;
+        SpellInfo const* recipe = order ? sSpellMgr->GetSpellInfo(order->spellId) : nullptr;
+        if (!recipe)
+            return false;
+        for (uint8 i = 0; i < MAX_SPELL_REAGENTS; ++i)
+            if (recipe->Reagent[i] > 0 && uint32(recipe->Reagent[i]) == itemEntry)
+                return true;
+        return false;
+    }
+
+    bool IsReservedItem(Player* bot, Item const* item)
+    {
+        if (!bot || !item)
+            return false;
+        if (IsReservedReagent(bot, item->GetEntry()))
+            return true;
+        auto purchases = g_purchases.find(bot->GetGUID());
+        if (purchases == g_purchases.end())
+            return false;
+        auto bought = purchases->second.find(item->GetGUID());
+        return bought != purchases->second.end() && int32(GameTime::GetGameTimeMS().count() - bought->second) < 0;
     }
 
     void CollectMailFrom(Player* bot, ObjectGuid sender)
