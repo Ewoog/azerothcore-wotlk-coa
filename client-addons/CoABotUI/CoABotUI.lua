@@ -7,7 +7,7 @@
 
 local ADDON_NAME = "CoABotUI"
 local PROTOCOL_PREFIX = "COABOT"
-local VERSION = "2.1.1"
+local VERSION = "2.2.3"
 
 -- Role configuration: names, labels, and display colors
 local ROLES = {
@@ -124,12 +124,52 @@ local function SendGroupCommand(verb)
     SendRawBody(verb .. ":0")
 end
 
-local function ShowItemTooltip(owner, itemEntry, anchor)
-    if not itemEntry then return end
+-- A server-sent item id is only trusted as a whole number in the real item-entry range; anything
+-- else (nil, 0, negative, NaN, a stray string) is treated as "no item".
+local function ValidItemEntry(itemEntry)
+    local entry = tonumber(itemEntry)
+    if not entry or entry ~= entry or entry <= 0 or entry >= 2147483647 or entry ~= math.floor(entry) then
+        return nil
+    end
+    return entry
+end
+
+-- Server text is cut to a sane length and stripped of "|" so it can never open a broken escape
+-- sequence (|H links, |T textures) inside a FontString.
+local function SafeText(text, maxLen)
+    text = tostring(text or "")
+    text = text:gsub("|", "/"):gsub("[%c]", " ")
+    maxLen = maxLen or 120
+    if #text > maxLen then text = text:sub(1, maxLen) end
+    return text
+end
+
+-- 2.2.1: a full item tooltip (SetHyperlink) is only built for items the client already has
+-- cached (GetItemInfo returns a real link). Building one for an uncached "item:N" makes the
+-- client fill the tooltip while the item record is still missing, and Ascension's tooltip
+-- extension (Extensions.dll) is the likeliest place that turns into a null read -- the 2.2.0
+-- Orders/Task Board crash. Uncached items get a plain name-only tooltip instead.
+local function ShowItemTooltip(owner, itemEntry, anchor, fallbackName)
+    local entry = ValidItemEntry(itemEntry)
+    if not entry or not owner or not owner.IsVisible or not owner:IsVisible() then return end
     GameTooltip:SetOwner(owner, anchor or "ANCHOR_RIGHT")
-    local _, itemLink = GetItemInfo(itemEntry)
-    GameTooltip:SetHyperlink(itemLink or ("item:" .. tostring(itemEntry)))
+    local name, itemLink = GetItemInfo(entry)
+    local shown = false
+    if type(itemLink) == "string" and itemLink:find("|Hitem:%d+") then
+        shown = pcall(GameTooltip.SetHyperlink, GameTooltip, itemLink)
+    end
+    if not shown then
+        GameTooltip:ClearLines()
+        GameTooltip:SetText(SafeText(name or fallbackName or ("Item #" .. entry), 80), 1, 0.82, 0)
+        GameTooltip:AddLine("Full details appear once your client has seen this item.", 0.7, 0.7, 0.7, true)
+    end
     GameTooltip:Show()
+end
+
+-- Hides GameTooltip if it currently belongs to `owner` (used before a row is hidden or reused,
+-- so the tooltip is never left attached to a frame that's going away or showing other data).
+local function HideTooltipIfOwned(owner)
+    if owner and GameTooltip:IsOwned(owner) then GameTooltip:Hide() end
 end
 
 -------------------------------------------------------------------------------
@@ -232,9 +272,111 @@ function UpdateRoleButtonText(row, botGuidLow, defaultRole)
     end
 end
 
+-- Queued gather orders from the GUILDROSTER reply's QUEUED lines, in queue order:
+-- { {queueId=, itemEntry=, count=, position=, canManage=, requester=, itemName=}, ... }
+local guildQueueCache = {}
+
+-- Skill-line id -> profession name, for the compact ROSTERPROF line ("<skillId>=<value>,...") the
+-- server sends since 2.2.2. Ids are the client's own SkillLine.dbc ids; 732/757 are CoA's
+-- Woodcutting/Woodworking. Must stay in step with BotMgr::PROFESSION_SKILLS on the server.
+local PROFESSION_NAME_BY_ID = {
+    [164] = "Blacksmithing", [165] = "Leatherworking", [171] = "Alchemy", [182] = "Herbalism",
+    [186] = "Mining", [197] = "Tailoring", [202] = "Engineering", [333] = "Enchanting",
+    [393] = "Skinning", [755] = "Jewelcrafting", [773] = "Inscription", [129] = "First Aid",
+    [185] = "Cooking", [356] = "Fishing", [732] = "Woodcutting", [757] = "Woodworking",
+}
+-- [botGuidLow] = name, kept across roster refreshes so an order notice can still name its bot.
+local botNameCache = {}
+
+-- 2.2.1: the board is no longer wiped on every request (2.2.0 cleared both caches every 3 s, so
+-- each auto-refresh hid every row and showed it again line by line -- rows, buttons and any
+-- tooltip on them were torn down and rebuilt constantly). Instead each reply line is stamped with
+-- the request "generation" it answered, and entries the latest reply didn't mention are pruned.
+local rosterGen = 0
+local queueStaging = {}
+
+-- Drops bots the last finished reply didn't list and swaps in the last reply's queue.
+local function PruneGuildRoster(keepGen)
+    for guid, info in pairs(guildRosterCache) do
+        if (info.gen or 0) < keepGen then guildRosterCache[guid] = nil end
+    end
+end
+
+local function CommitQueueStaging()
+    for k in pairs(guildQueueCache) do guildQueueCache[k] = nil end
+    for i, entry in ipairs(queueStaging) do guildQueueCache[i] = entry end
+    table.sort(guildQueueCache, function(a, b) return a.position < b.position end)
+end
+
+-- One Task Board redraw shortly after a burst of ROSTER/QUEUED lines, instead of a full redraw
+-- per line (a big guild sends dozens of lines per refresh).
+local taskBoardRefreshDriver = CreateFrame("Frame")
+taskBoardRefreshDriver:Hide()
+local taskBoardRefreshAt = 0
+local taskBoardBurstSeen = false
+taskBoardRefreshDriver:SetScript("OnUpdate", function(self)
+    if GetTime() < taskBoardRefreshAt then return end
+    self:Hide()
+    if taskBoardBurstSeen then
+        -- The reply burst for rosterGen is in: anything older is gone, the queue is current.
+        taskBoardBurstSeen = false
+        PruneGuildRoster(rosterGen)
+        CommitQueueStaging()
+    end
+    if RefreshTaskBoard then RefreshTaskBoard() end
+end)
+
+local function ScheduleTaskBoardRefresh()
+    taskBoardRefreshAt = GetTime() + 0.25
+    taskBoardRefreshDriver:Show()
+end
+
 local function RequestGuildRoster()
+    -- A previous request that got no lines at all (no bots online, empty queue) is settled here.
+    if rosterGen > 0 then
+        PruneGuildRoster(rosterGen)
+        CommitQueueStaging()
+    end
+    rosterGen = rosterGen + 1
+    queueStaging = {}
+    taskBoardBurstSeen = false
     SendGroupCommand("GUILDROSTER")
 end
+
+local function ItemNameOrId(itemEntry)
+    local entry = ValidItemEntry(itemEntry)
+    local name = entry and GetItemInfo(entry)
+    return name or ("item " .. tostring(entry or "?"))
+end
+
+-- Big centre-screen notice (raid-warning style) for order completion/failure; the chat line
+-- itself comes from the server's system message, so nothing is printed twice.
+local function OrderNotice(msg, r, g, b)
+    msg = SafeText(msg, 160)
+    if RaidNotice_AddMessage and RaidWarningFrame then
+        RaidNotice_AddMessage(RaidWarningFrame, msg, { r = r, g = g, b = b })
+    elseif UIErrorsFrame then
+        UIErrorsFrame:AddMessage(msg, r, g, b, 1.0)
+    end
+    PlaySound("RaidWarning")
+end
+
+local ORDER_FAIL_TEXT = {
+    nosource = "no source found",
+    stuck = "couldn't find any",
+    noprogress = "no progress for 30 min",
+    noskinning = "can't skin it",
+    leftguild = "left the guild",
+    nobot = "no free guild bot",
+}
+
+local ORDER_RESULT_TEXT = {
+    denied = "Only a guild officer or the player who placed that order can change it.",
+    none = "That order is already gone.",
+    offline = "That bot is offline right now.",
+    busy = "That bot is mid-teleport; try again in a moment.",
+    failed = "No other place to get that item was found, so the order was dropped.",
+}
 
 -- Forward declaration -- HandleIncomingMessage (defined below, before the picker UI exists yet)
 -- needs to poke the picker's refresh once new catalog rows stream in; the picker itself is only
@@ -371,17 +513,90 @@ local function HandleIncomingMessage(body)
     elseif verb == "ROSTER" then
         local botGuidLow = tonumber(parts[2])
         if not botGuidLow then return end
+        local botName = SafeText(parts[3] ~= "" and parts[3] or "?", 24)
+        botNameCache[botGuidLow] = botName
+        local gathered = tonumber(parts[9]) or 0
+        local target = tonumber(parts[10]) or 0
+        if gathered ~= gathered or gathered < 0 then gathered = 0 end
+        if target ~= target or target < 0 or target == math.huge then target = 0 end
         guildRosterCache[botGuidLow] = {
-            name = parts[3] or "?",
+            gen = rosterGen,
+            name = botName,
             classId = tonumber(parts[4]) or 0,
             level = tonumber(parts[5]) or 0,
-            task = parts[6] or "idle",
-            professions = parts[7] or "",
-            taskItemEntry = tonumber(parts[8]) or 0,
+            task = SafeText(parts[6] ~= "" and parts[6] or "idle", 120),
+            -- Old servers put "Name=value,..." here; 2.2.2+ servers leave it empty and send
+            -- ROSTERPROF lines instead, so the last known list is kept until those arrive.
+            professions = (parts[7] and parts[7] ~= "") and parts[7]
+                or (guildRosterCache[botGuidLow] and guildRosterCache[botGuidLow].professions) or "",
+            profGen = guildRosterCache[botGuidLow] and guildRosterCache[botGuidLow].profGen,
+            taskItemEntry = ValidItemEntry(parts[8]) or 0,
+            -- Appended fields (older servers omit them): gather progress and manage rights.
+            orderGathered = gathered,
+            orderTarget = target,
+            canManage = parts[11] == "1",
         }
-        if RefreshTaskBoard then
-            RefreshTaskBoard()
+        taskBoardBurstSeen = true
+        ScheduleTaskBoardRefresh()
+
+    elseif verb == "ROSTERPROF" then
+        -- ROSTERPROF:<guid>:<skillId>=<value>,...  (several lines per bot if needed; merged per refresh)
+        local botGuidLow = tonumber(parts[2])
+        local info = botGuidLow and guildRosterCache[botGuidLow]
+        if not info then return end
+        if info.profGen ~= rosterGen then
+            info.profGen = rosterGen
+            info.profList = {}
         end
+        info.profList = info.profList or {}
+        for idStr, valueStr in (parts[3] or ""):gmatch("(%d+)=(%d+)") do
+            local id = tonumber(idStr)
+            local name = PROFESSION_NAME_BY_ID[id] or ("Skill " .. id)
+            table.insert(info.profList, name .. "=" .. valueStr)
+        end
+        info.professions = table.concat(info.profList, ",")
+        taskBoardBurstSeen = true
+        ScheduleTaskBoardRefresh()
+
+    elseif verb == "QUEUED" then
+        local queueId = tonumber(parts[2])
+        if not queueId then return end
+        table.insert(queueStaging, {
+            queueId = queueId,
+            itemEntry = ValidItemEntry(parts[3]) or 0,
+            count = math.max(0, tonumber(parts[4]) or 0),
+            position = tonumber(parts[5]) or (#queueStaging + 1),
+            canManage = parts[6] == "1",
+            requester = SafeText(parts[7] ~= "" and parts[7] or "?", 24),
+            itemName = parts[8] and SafeText(parts[8], 60) or nil,
+        })
+        taskBoardBurstSeen = true
+        ScheduleTaskBoardRefresh()
+
+    elseif verb == "ORDERDONE" then
+        local botName = botNameCache[tonumber(parts[2]) or 0]
+        local text = (botName or "A guild bot") .. " finished: " .. (tonumber(parts[4]) or 0) .. "x " ..
+            ItemNameOrId(tonumber(parts[3])) .. " is in the guild bank."
+        OrderNotice(text, 0.25, 1.0, 0.4)
+        if taskBoardFrame and taskBoardFrame:IsShown() then RequestGuildRoster() end
+
+    elseif verb == "ORDERFAIL" then
+        local botName = botNameCache[tonumber(parts[2]) or 0]
+        local reason = ORDER_FAIL_TEXT[parts[6] or ""] or (parts[6] or "gave up")
+        local text = "Order failed: " .. ItemNameOrId(tonumber(parts[3])) .. " (" .. (tonumber(parts[4]) or 0) .. "/" ..
+            (tonumber(parts[5]) or 0) .. ") - " .. (botName and (botName .. ": ") or "") .. reason
+        OrderNotice(text, 1.0, 0.3, 0.25)
+        if taskBoardFrame and taskBoardFrame:IsShown() then RequestGuildRoster() end
+
+    elseif verb == "ORDERQUEUED" then
+        if taskBoardFrame and taskBoardFrame:IsShown() then RequestGuildRoster() end
+
+    elseif verb == "ORDERRESULT" then
+        local result = parts[4] or ""
+        if result ~= "ok" then
+            Log("|cFFFF8844" .. (ORDER_RESULT_TEXT[result] or ("Order change failed (" .. result .. ").")) .. "|r")
+        end
+        if taskBoardFrame and taskBoardFrame:IsShown() then RequestGuildRoster() end
 
     elseif verb == "BOTPAGE" then
         botBrowser.list = {}
@@ -1300,11 +1515,13 @@ local PROFESSION_ICONS = {
     ["Skinning"]       = "Interface\\Icons\\INV_Misc_Pelt_Wolf_01",
     ["Jewelcrafting"]  = "Interface\\Icons\\INV_Misc_Gem_01",
     ["Inscription"]    = "Interface\\Icons\\INV_Inscription_Tradeskill01",
-    ["First Aid"]      = "Interface\\Icons\\Spell_Holy_SealOfSacrifice2",
+    ["First Aid"]      = "Interface\\Icons\\Spell_Holy_SealOfSacrifice",
     ["Cooking"]        = "Interface\\Icons\\Trade_Cooking",
     ["Fishing"]        = "Interface\\Icons\\Trade_Fishing",
+    ["Woodcutting"]    = "Interface\\Icons\\INV_Axe_10",
+    ["Woodworking"]    = "Interface\\Icons\\INV_Misc_Statue_07",
 }
-local MAX_PROFESSION_ICONS = 14
+local MAX_PROFESSION_ICONS = 16
 
 local function CreateTaskRow(parent, index)
     local row = CreateFrame("Frame", nil, parent)
@@ -1319,25 +1536,42 @@ local function CreateTaskRow(parent, index)
     local nameText = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     nameText:SetPoint("TOPLEFT", row, "TOPLEFT", 4, -2)
     nameText:SetWidth(200)
+    nameText:SetHeight(14)
     nameText:SetJustifyH("LEFT")
+    if nameText.SetWordWrap then nameText:SetWordWrap(false) end
     row.nameText = nameText
 
     local taskText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     taskText:SetPoint("TOPRIGHT", row, "TOPRIGHT", -4, -2)
     taskText:SetWidth(240)
+    taskText:SetHeight(14)
     taskText:SetJustifyH("RIGHT")
+    if taskText.SetWordWrap then taskText:SetWordWrap(false) end
     row.taskText = taskText
 
     -- Invisible hit-area over taskText -- a FontString itself can't take mouse scripts, so this
     -- transparent Button stands in to show a real item GameTooltip (icon/stats) when the bot is
     -- actually crafting/gathering something (see RefreshTaskBoard's row.taskItemEntry).
     local taskHit = CreateFrame("Button", nil, row)
-    taskHit:SetAllPoints(taskText)
+    taskHit:SetPoint("TOPRIGHT", row, "TOPRIGHT", -4, -2)
+    taskHit:SetWidth(240)
+    taskHit:SetHeight(14)
     taskHit:SetScript("OnEnter", function(self)
-        if not row.taskItemEntry or row.taskItemEntry == 0 then return end
-        GameTooltip:SetOwner(self, "ANCHOR_LEFT")
-        GameTooltip:SetItemByID(row.taskItemEntry)
-        GameTooltip:Show()
+        -- The task line is one non-wrapping line; a gather order's live status ("walking to the
+        -- spot (240 yd)", "no nodes up here - trying another spot") can run past it, so the
+        -- tooltip always carries the whole text too.
+        local full = row.taskFull
+        if ValidItemEntry(row.taskItemEntry) then
+            ShowItemTooltip(self, row.taskItemEntry, "ANCHOR_LEFT", row.taskItemName)
+            if full and full ~= "" and GameTooltip:IsOwned(self) then
+                GameTooltip:AddLine(full, 0.6, 1, 0.6, true)
+                GameTooltip:Show()
+            end
+        elseif full and full ~= "" and full ~= "idle" and self:IsVisible() then
+            GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+            GameTooltip:SetText(full, 0.6, 1, 0.6, 1, true)
+            GameTooltip:Show()
+        end
     end)
     taskHit:SetScript("OnLeave", function() GameTooltip:Hide() end)
     row.taskHit = taskHit
@@ -1348,8 +1582,9 @@ local function CreateTaskRow(parent, index)
     row.profIcons = {}
     for i = 1, MAX_PROFESSION_ICONS do
         local icon = CreateFrame("Button", nil, row)
-        icon:SetSize(16, 16)
-        icon:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 4 + (i - 1) * 18, 2)
+        -- 16 icons at 16 px pitch end at x=260, clear of the progress bar (x=272).
+        icon:SetSize(15, 15)
+        icon:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 4 + (i - 1) * 16, 2)
         icon.tex = icon:CreateTexture(nil, "ARTWORK")
         icon.tex:SetAllPoints()
         icon.tex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
@@ -1371,7 +1606,110 @@ local function CreateTaskRow(parent, index)
     noProfText:Hide()
     row.noProfText = noProfText
 
+    -- Order management (bottom-right): Cancel, Top, and a progress bar for gather orders.
+    -- row.mode is "bot" (an active order, ids are bot guids) or "queued" (ids are queue ids).
+    local btnCancel = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+    btnCancel:SetWidth(50)
+    btnCancel:SetHeight(16)
+    btnCancel:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -2, 2)
+    btnCancel:SetText("Cancel")
+    btnCancel:SetScript("OnClick", function()
+        if not row.orderId then return end
+        if row.mode == "queued" then
+            SendRawBody("CANCELQUEUED:" .. row.orderId)
+        else
+            SendRawBody("CANCELORDER:" .. row.orderId)
+        end
+    end)
+    btnCancel:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_TOP")
+        GameTooltip:AddLine("Cancel this order")
+        GameTooltip:AddLine("Whatever was already delivered stays in the guild bank.", 1, 1, 1, true)
+        GameTooltip:Show()
+    end)
+    btnCancel:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    btnCancel:Hide()
+    row.btnCancel = btnCancel
+
+    local btnTop = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+    btnTop:SetWidth(36)
+    btnTop:SetHeight(16)
+    btnTop:SetPoint("RIGHT", btnCancel, "LEFT", -2, 0)
+    btnTop:SetText("Top")
+    btnTop:SetScript("OnClick", function()
+        if not row.orderId then return end
+        if row.mode == "queued" then
+            SendRawBody("TOPQUEUED:" .. row.orderId)
+        else
+            SendRawBody("PRIORITIZEORDER:" .. row.orderId)
+        end
+    end)
+    btnTop:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_TOP")
+        if row.mode == "queued" then
+            GameTooltip:AddLine("Move to top of the queue")
+            GameTooltip:AddLine("This order goes to the next guild bot that frees up.", 1, 1, 1, true)
+        else
+            GameTooltip:AddLine("Rush this order")
+            GameTooltip:AddLine("The bot drops what it's doing and teleports straight to a fresh spot for this item.", 1, 1, 1, true)
+        end
+        GameTooltip:Show()
+    end)
+    btnTop:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    btnTop:Hide()
+    row.btnTop = btnTop
+
+    local progress = CreateFrame("StatusBar", nil, row)
+    progress:SetWidth(90)
+    progress:SetHeight(10)
+    progress:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -94, 5)
+    progress:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+    progress:SetStatusBarColor(0.2, 0.8, 0.3)
+    progress:SetMinMaxValues(0, 1)
+    progress:SetValue(0)
+    local progressBg = progress:CreateTexture(nil, "BACKGROUND")
+    progressBg:SetAllPoints()
+    progressBg:SetTexture(0, 0, 0, 0.6)
+    local progressText = progress:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    progressText:SetPoint("CENTER", progress, "CENTER", 0, 0)
+    progress.text = progressText
+    progress:Hide()
+    row.progress = progress
+
     return row
+end
+
+-- Shows/hides a task row's progress bar and management buttons. gathered/target are 0 for no
+-- gather order; canManage comes from the server (officer, or the player who placed the order).
+local function ApplyOrderControls(row, mode, orderId, gathered, target, canManage, showTop)
+    row.mode = mode
+    row.orderId = orderId
+    -- 2.2.1: progress math is clamped -- a missing/zero/negative/NaN target never reaches the
+    -- StatusBar (min == max or a NaN value), and gathered is kept inside 0..target.
+    target = tonumber(target) or 0
+    gathered = tonumber(gathered) or 0
+    if target ~= target or target == math.huge then target = 0 end
+    if gathered ~= gathered or gathered < 0 then gathered = 0 end
+    target = math.floor(target)
+    gathered = math.floor(gathered)
+    if mode == "bot" and target > 0 then
+        row.progress:SetMinMaxValues(0, target)
+        row.progress:SetValue(math.min(gathered, target))
+        row.progress.text:SetText(gathered .. "/" .. target)
+        row.progress:Show()
+    else
+        row.progress:SetMinMaxValues(0, 1)
+        row.progress:SetValue(0)
+        row.progress:Hide()
+    end
+    local manageable = orderId and canManage and (mode == "queued" or target > 0)
+    if manageable then
+        row.btnCancel:Show()
+        if showTop then row.btnTop:Show() else row.btnTop:Hide() end
+    else
+        row.btnCancel:Hide()
+        row.btnTop:Hide()
+    end
 end
 
 -- Populates row's profession icon pool from a "Name=skill,Name=skill,..." CSV, showing the
@@ -1405,6 +1743,29 @@ local function ApplyProfessionIcons(row, csv)
     end
 end
 
+-- 2.2.1: hard cap on pooled Task Board rows. Every row is ~20 frames (14 profession icons, two
+-- template buttons, a status bar), so an unbounded pool for a big bot guild was a real memory and
+-- frame-count cost on a 32-bit client already near its address-space limit.
+local MAX_TASK_ROWS = 40
+
+-- Hides a pooled row and drops any tooltip that is attached to it or its children.
+local function HideTaskRow(row)
+    if not row then return end
+    HideTooltipIfOwned(row.taskHit)
+    HideTooltipIfOwned(row.btnCancel)
+    HideTooltipIfOwned(row.btnTop)
+    for _, icon in ipairs(row.profIcons or {}) do HideTooltipIfOwned(icon) end
+    row:Hide()
+end
+
+local function GetTaskRow(i)
+    if i > MAX_TASK_ROWS then return nil end
+    if not taskRows[i] then
+        taskRows[i] = CreateTaskRow(taskBoardFrame.listArea, i)
+    end
+    return taskRows[i]
+end
+
 function RefreshTaskBoard()
     if not taskBoardFrame or not taskBoardFrame:IsShown() then return end
 
@@ -1415,32 +1776,74 @@ function RefreshTaskBoard()
     end
     table.sort(guids)
 
-    for i = 1, math.max(#guids, #taskRows) do
-        local guid = guids[i]
-        if guid then
-            if not taskRows[i] then
-                taskRows[i] = CreateTaskRow(taskBoardFrame.listArea, i)
-            end
-            local row = taskRows[i]
-            local info = guildRosterCache[guid]
+    -- One flat list of what to draw: bots first, then queued orders (front of the queue first).
+    local items = {}
+    for _, guid in ipairs(guids) do
+        items[#items + 1] = { kind = "bot", guid = guid, info = guildRosterCache[guid] }
+    end
+    for q, entry in ipairs(guildQueueCache) do
+        items[#items + 1] = { kind = "queued", q = q, entry = entry }
+    end
+
+    local shownCount = math.min(#items, MAX_TASK_ROWS)
+    for i = 1, shownCount do
+        local item = items[i]
+        local row = GetTaskRow(i)
+        -- Whatever data the row showed before is being replaced; never leave a tooltip on it.
+        if row.dataKey ~= (item.kind .. ":" .. tostring(item.guid or (item.entry and item.entry.queueId))) then
+            HideTaskRow(row)
+            row.dataKey = item.kind .. ":" .. tostring(item.guid or (item.entry and item.entry.queueId))
+        end
+        if item.kind == "bot" then
+            local info = item.info
             local color = ClassColorForId(info.classId)
-            row.nameText:SetText(color .. info.name .. "|r |cFF888888(lvl " .. info.level .. ")|r")
+            row.nameText:SetText(color .. SafeText(info.name, 24) .. "|r |cFF888888(lvl " .. (tonumber(info.level) or 0) .. ")|r")
 
             local isIdle = (info.task == "idle")
             local taskColor = isIdle and "|cFF888888" or "|cFF55FF55"
-            row.taskText:SetText(taskColor .. info.task .. "|r")
-            row.taskItemEntry = info.taskItemEntry or 0
+            row.taskText:SetText(taskColor .. SafeText(info.task, 90) .. "|r")
+            row.taskFull = SafeText(info.task, 140)
+            row.taskItemEntry = ValidItemEntry(info.taskItemEntry) or 0
+            row.taskItemName = nil
 
             ApplyProfessionIcons(row, info.professions)
-            row:Show()
-        elseif taskRows[i] then
-            taskRows[i]:Hide()
+            ApplyOrderControls(row, "bot", item.guid, info.orderGathered, info.orderTarget, info.canManage, true)
+        else
+            local entry = item.entry
+            row.nameText:SetText("|cFFFFD100Queued #" .. (tonumber(entry.position) or item.q) .. "|r |cFF888888by " .. SafeText(entry.requester, 24) .. "|r")
+            local itemName = (entry.itemName and entry.itemName ~= "") and entry.itemName or ItemNameOrId(entry.itemEntry)
+            itemName = SafeText(itemName, 60)
+            row.taskText:SetText("|cFFCCCCCC" .. (tonumber(entry.count) or 0) .. "x " .. itemName .. " - waiting for a free bot|r")
+            row.taskFull = nil
+            row.taskItemEntry = ValidItemEntry(entry.itemEntry) or 0
+            row.taskItemName = itemName
+            ApplyProfessionIcons(row, "")
+            row.noProfText:Hide()
+            ApplyOrderControls(row, "queued", entry.queueId, 0, 0, entry.canManage, item.q > 1)
+        end
+        row:Show()
+    end
+    for i = shownCount + 1, #taskRows do
+        HideTaskRow(taskRows[i])
+        taskRows[i].dataKey = nil
+    end
+
+    local hidden = #items - shownCount
+    local moreText = taskBoardFrame.moreText
+    if moreText then
+        if hidden > 0 then
+            moreText:ClearAllPoints()
+            moreText:SetPoint("TOPLEFT", taskBoardFrame.listArea, "TOPLEFT", 4, -8 - shownCount * 44)
+            moreText:SetText("|cFF888888+" .. hidden .. " more not shown (the board lists the first " .. MAX_TASK_ROWS .. ").|r")
+            moreText:Show()
+        else
+            moreText:Hide()
         end
     end
 
-    taskBoardFrame.listArea:SetHeight(math.max(#guids * 44 + 8, 1))
+    taskBoardFrame.listArea:SetHeight(math.max(shownCount * 44 + 8 + (hidden > 0 and 20 or 0), 1))
 
-    if #guids == 0 then
+    if #items == 0 then
         taskBoardFrame.emptyText:Show()
     else
         taskBoardFrame.emptyText:Hide()
@@ -1536,6 +1939,17 @@ local function CreateGuildTaskBoardFrame()
     emptyText:SetText("|cFF888888No guild bots found. Make sure you're in a guild\nwith online companion bots, then click Refresh.|r")
     emptyText:SetJustifyH("CENTER")
     frame.emptyText = emptyText
+
+    local moreText = listArea:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    moreText:SetJustifyH("LEFT")
+    moreText:Hide()
+    frame.moreText = moreText
+
+    -- Leaving the page never strands a tooltip on one of its rows.
+    frame:SetScript("OnHide", function()
+        for _, row in ipairs(taskRows) do HideTaskRow(row) end
+        for _, row in ipairs(taskRows) do row.dataKey = nil end
+    end)
 
     local refreshTimer = 0
     frame:SetScript("OnUpdate", function(self, elapsed)
@@ -1802,14 +2216,14 @@ local function CreateOrderItemRow(parent, index)
     icon:SetTexCoord(0.08, 0.92, 0.08, 0.92) -- trims the default icon border artifact
     row.icon = icon
 
-    -- Hover tooltip over the whole row -- a real item tooltip via SetItemByID needs no data
+    -- Hover tooltip over the whole row -- a real item tooltip via SetHyperlink needs no data
     -- beyond the entry id already on the row, so no extra server round-trip is needed for this.
     -- Textures (unlike icon here) have no EnableMouse/SetScript -- the row itself is the real
     -- Frame, so the hit-test area belongs on it, not the icon texture.
     row:EnableMouse(true)
     row:SetScript("OnEnter", function(self)
-        if not self.entry then return end
-        ShowItemTooltip(self, self.entry, "ANCHOR_RIGHT")
+        if not ValidItemEntry(self.entry) then return end
+        ShowItemTooltip(self, self.entry, "ANCHOR_RIGHT", self.name)
     end)
     row:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
@@ -1941,10 +2355,14 @@ function RefreshOrderPicker()
                 row.qtyBox:SetMaxLetters(4)
                 row.btnOrder:SetText("Order")
             end
-            local icon = GetItemIcon and GetItemIcon(item.entry)
+            local validEntry = ValidItemEntry(item.entry)
+            local icon = validEntry and GetItemIcon and GetItemIcon(validEntry)
+            if type(icon) ~= "string" or icon == "" then icon = nil end
             row.icon:SetTexture(icon or "Interface\\Icons\\INV_Misc_QuestionMark")
             row:Show()
         elseif orderItemRows[i] then
+            HideTooltipIfOwned(orderItemRows[i])
+            HideTooltipIfOwned(orderItemRows[i].btnOrder)
             orderItemRows[i]:Hide()
         end
     end
