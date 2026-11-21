@@ -33,6 +33,7 @@
 #include "Corpse.h"
 #include "DBCStores.h"
 #include "DatabaseEnv.h"
+#include "GameTime.h"
 #include "Group.h"
 #include "GroupScript.h"
 #include "engine/GroupDirector.h"
@@ -2832,7 +2833,15 @@ void BotMgr::CraftOrder(ObjectGuid::LowType requesterCharLowGuid, uint32 itemEnt
         return;
     }
 
-    _craftOrders[crafter->GetGUID()] = { requester->GetGUID(), chosenSpell, itemEntry, count };
+    CraftOrderState& order = _craftOrders[crafter->GetGUID()];
+    order = CraftOrderState();
+    order.requesterGuid = requester->GetGUID();
+    order.spellId = chosenSpell;
+    order.itemEntry = itemEntry;
+    order.remainingCount = count;
+    order.placedAtMs = std::max<uint32>(1, GameTime::GetGameTimeMS().count());
+    order.nextSourcingAtMs = order.placedAtMs;
+    order.reagentBudgetLeftCopper = BotEconomy::CraftReagentBudgetCopper();
 
     if (handler)
         handler->PSendSysMessage("BotMgr: craft order placed -- bot '{}' will craft {}x item {} for '{}' (spell {}).",
@@ -3120,6 +3129,54 @@ void BotMgr::DumpRecipeCoverage(ChatHandler* handler) const
     handler->PSendSysMessage("  (custom/unresolved skill line): {} distinct craftable item(s)", uint32(itemsUnresolvedSkillLine.size()));
 }
 
+// A crafter short of reagents fetches them once a minute (guild bank, vendors, auction house -- whichever
+// CoaBots.Crafting.* allows), tells the requester once what is still missing, and gives the order up after
+// CoaBots.Crafting.OrderTimeoutMin. Returns false when the order is given up.
+bool BotMgr::WaitForCraftReagents(Player* crafter, SpellInfo const* info, CraftOrderState& order)
+{
+    constexpr uint32 SOURCING_INTERVAL_MS = 60 * 1000;
+    uint32 const now = GameTime::GetGameTimeMS().count();
+    if (!order.placedAtMs)
+        order.placedAtMs = std::max<uint32>(1, now);
+    if (int32(now - order.nextSourcingAtMs) < 0)
+        return true;
+    order.nextSourcingAtMs = now + SOURCING_INTERVAL_MS;
+
+    BotEconomy::CollectMailFrom(crafter, order.requesterGuid);
+    if (CrafterHasReagentsFor(crafter, info))
+        return true;
+    std::vector<BotEconomy::ReagentShortfall> const missing =
+        BotEconomy::SourceReagents(crafter, info, order.remainingCount, order.reagentBudgetLeftCopper);
+    if (missing.empty())
+        return true;
+
+    Player* requester = ObjectAccessor::FindPlayer(order.requesterGuid);
+    std::string const itemName = [&]() -> std::string
+    {
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(order.itemEntry);
+        return proto ? proto->Name1 : std::to_string(order.itemEntry);
+    }();
+    uint32 const timeout = BotEconomy::CraftOrderTimeoutMs();
+    if (timeout && now - order.placedAtMs > timeout)
+    {
+        if (requester)
+            ChatHandler(requester->GetSession()).PSendSysMessage(
+                "|cffff6060Crafting order:|r {} gave up on {}x {} -- still missing {}.", crafter->GetName(), order.remainingCount, itemName,
+                BotEconomy::DescribeReagents(missing));
+        LOG_INFO("module.coa-playerbots", "BotMgr: craft order for bot '{}' (spell {}) given up after {} min without reagents.",
+            crafter->GetName(), order.spellId, timeout / 60000);
+        return false;
+    }
+    if (!order.toldMissing && requester)
+    {
+        order.toldMissing = true;
+        ChatHandler(requester->GetSession()).PSendSysMessage(
+            "|cffffcc00Crafting order:|r {} needs {} to craft {}. Mail them to {} and it starts.", crafter->GetName(),
+            BotEconomy::DescribeReagents(missing), itemName, crafter->GetName());
+    }
+    return true;
+}
+
 // Called from Update() every tick, same cadence as the guildgather order drain. Casts are
 // naturally throttled to "at most one per bot per tick" just by this loop's own shape -- no
 // separate cooldown tracking needed since tradeskill casts aren't on the GCD.
@@ -3180,6 +3237,11 @@ void BotMgr::ProcessCraftOrders()
         {
             if (!CrafterHasReagentsFor(crafter, info))
             {
+                if (!WaitForCraftReagents(crafter, info, itr->second))
+                {
+                    itr = _craftOrders.erase(itr);
+                    continue;
+                }
                 ++itr; // still waiting on reagents -- retry next tick
                 continue;
             }

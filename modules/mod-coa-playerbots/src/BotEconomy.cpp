@@ -9,6 +9,7 @@
 #include "BotMgr.h"
 #include "BotMovement.h"
 #include "BotProgression.h"
+#include "CharacterCache.h"
 #include "Chat.h"
 #include "Config.h"
 #include "DBCStores.h"
@@ -24,6 +25,8 @@
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "Random.h"
+#include "ScriptMgr.h"
+#include "SpellInfo.h"
 #include "StringFormat.h"
 #include "World.h"
 #include "WorldConfig.h"
@@ -70,6 +73,18 @@ namespace
         bool consumeSupplies = false;      // eating and drinking use up food and drink
         uint32 supplyTarget = 20;          // how many of each a bot likes to carry
         uint32 dailyBudgetCopper = 20000;  // what one bot spends on supplies in a day
+        bool auctionBuyGear = false;       // bots buy gear upgrades at the auction house
+        uint32 auctionBuyBudgetPercent = 25;   // of the money above the reserve, spent on one shopping visit
+        uint32 auctionBuyMaxItems = 2;         // upgrades bought on one visit
+        uint32 auctionBuyMinUpgradePercent = 10; // how much better than the worn piece an upgrade has to be
+        bool auctionBuyFromBots = true;        // bots may buy other bots' listings, not only players'
+        uint32 shoppingMinSpareCopper = 200000; // 20 gold above the reserve before a bot goes shopping on its own
+        uint32 shoppingIntervalMin = 120;      // minutes between shopping trips of one bot
+        bool craftFromGuildBank = false;   // crafting orders take missing reagents from the guild bank
+        bool craftFromVendor = false;      // ... buy the ones vendors sell for gold
+        bool craftFromAuction = false;     // ... and buy the rest at the auction house
+        uint32 craftBudgetCopper = 100000; // what one crafting order may spend on reagents
+        uint32 craftTimeoutMin = 120;      // a crafting order still short of reagents after this long is given up
     } g_settings;
 
     uint32 g_settingsAgeMs = 1000000;
@@ -161,6 +176,18 @@ namespace
         g_settings.minListingCopper = sConfigMgr->GetOption<uint32>("CoaBots.Economy.MinListingCopper", 5000);
         g_settings.listingMinutes = std::max<uint32>(5, std::min<uint32>(2880, sConfigMgr->GetOption<uint32>("CoaBots.Economy.ListingMinutes", 1440)));
         g_settings.spreadMax = std::max<uint32>(g_settings.spreadMin, std::min<uint32>(50, sConfigMgr->GetOption<uint32>("CoaBots.Economy.PriceSpreadMaxPercent", 10)));
+        g_settings.auctionBuyGear = sConfigMgr->GetOption<bool>("CoaBots.Economy.AuctionBuyGear", false);
+        g_settings.auctionBuyBudgetPercent = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("CoaBots.Economy.AuctionBuyBudgetPercent", 25));
+        g_settings.auctionBuyMaxItems = std::min<uint32>(10, sConfigMgr->GetOption<uint32>("CoaBots.Economy.AuctionBuyMaxItems", 2));
+        g_settings.auctionBuyMinUpgradePercent = std::min<uint32>(500, sConfigMgr->GetOption<uint32>("CoaBots.Economy.AuctionBuyMinUpgradePercent", 10));
+        g_settings.auctionBuyFromBots = sConfigMgr->GetOption<bool>("CoaBots.Economy.AuctionBuyFromBots", true);
+        g_settings.shoppingMinSpareCopper = sConfigMgr->GetOption<uint32>("CoaBots.Economy.ShoppingMinSpareCopper", 200000);
+        g_settings.shoppingIntervalMin = std::max<uint32>(10, sConfigMgr->GetOption<uint32>("CoaBots.Economy.ShoppingIntervalMin", 120));
+        g_settings.craftFromGuildBank = sConfigMgr->GetOption<bool>("CoaBots.Crafting.ReagentsFromGuildBank", false);
+        g_settings.craftFromVendor = sConfigMgr->GetOption<bool>("CoaBots.Crafting.ReagentsFromVendor", false);
+        g_settings.craftFromAuction = sConfigMgr->GetOption<bool>("CoaBots.Crafting.ReagentsFromAuction", false);
+        g_settings.craftBudgetCopper = sConfigMgr->GetOption<uint32>("CoaBots.Crafting.ReagentBudgetCopper", 100000);
+        g_settings.craftTimeoutMin = sConfigMgr->GetOption<uint32>("CoaBots.Crafting.OrderTimeoutMin", 120);
     }
 
     void LoadProtected()
@@ -546,15 +573,16 @@ namespace
         return true;
     }
 
-    // Money and returned items from earlier auctions sit in the bot's mailbox; a player collects them at a mailbox,
-    // a bot in town just takes them. Returns the money collected.
-    uint64 CollectAuctionMail(Player* bot)
+    // Takes the money and items out of the bot's delivered mails that `wanted` accepts (never cash-on-delivery ones).
+    // Returns the money collected.
+    template <typename Wanted>
+    uint64 CollectMail(Player* bot, Wanted&& wanted)
     {
         uint64 money = 0;
         time_t const now = GameTime::GetGameTime().count();
         std::vector<Mail*> mails;
         for (Mail* m : bot->GetMails())
-            if (m && m->messageType == MAIL_AUCTION && m->state != MAIL_STATE_DELETED && m->deliver_time <= now && !m->COD)
+            if (m && m->state != MAIL_STATE_DELETED && m->deliver_time <= now && !m->COD && wanted(*m))
                 mails.push_back(m);
         if (mails.empty())
             return 0;
@@ -596,12 +624,285 @@ namespace
         return money;
     }
 
+    // Money and returned items from earlier auctions sit in the bot's mailbox; a player collects them at a mailbox,
+    // a bot in town just takes them. Returns the money collected.
+    uint64 CollectAuctionMail(Player* bot)
+    {
+        return CollectMail(bot, [](Mail const& m) { return m.messageType == MAIL_AUCTION; });
+    }
+
     void JournalDone(Player* bot, BotEconomy::Line const& l, uint32 count, uint32 unitCopper, char const* verdict, char const* source)
     {
         CharacterDatabase.Execute(Acore::StringFormat(
             "INSERT INTO mod_coa_bot_trade_journal (bot_guid, bot_name, item_entry, item_count, verdict, reason, unit_copper, price_source, executed) "
             "VALUES ({}, '{}', {}, {}, '{}', '{}', {}, '{}', 1)",
             bot->GetGUID().GetCounter(), QuoteSql(bot->GetName()), l.entry, count, verdict, QuoteSql(l.reason), unitCopper, QuoteSql(source)));
+    }
+
+    // ---- Buying --------------------------------------------------------------------------------------------------
+
+    struct BuyTotals
+    {
+        uint32 shoppingTrips = 0;
+        uint32 gearBought = 0;
+        uint64 gearCopper = 0;
+        uint32 reagentStacksBought = 0;
+        uint64 reagentAuctionCopper = 0;
+        uint64 reagentVendorCopper = 0;
+        uint32 reagentsFromGuildBank = 0;
+    } g_buyTotals;
+
+    std::unordered_map<ObjectGuid, uint32> g_nextShopAt;
+    std::unordered_set<ObjectGuid> g_wantsShopping;
+
+    uint64 SpareMoney(Player* bot)
+    {
+        return bot->GetMoney() > g_settings.moneyReserveCopper ? bot->GetMoney() - g_settings.moneyReserveCopper : 0;
+    }
+
+    // The auction house a bot trades at: the auctioneer's when it stands at one, otherwise its own side's.
+    AuctionHouseObject* HouseFor(Player* bot, uint32 auctioneerFaction)
+    {
+        if (auctioneerFaction)
+            return sAuctionMgr->GetAuctionsMap(auctioneerFaction);
+        if (sWorld->getBoolConfig(CONFIG_ALLOW_TWO_SIDE_INTERACTION_AUCTION))
+            return sAuctionMgr->GetAuctionsMapByHouseId(AuctionHouseId::Neutral);
+        return sAuctionMgr->GetAuctionsMapByHouseId(bot->GetTeamId() == TEAM_ALLIANCE ? AuctionHouseId::Alliance : AuctionHouseId::Horde);
+    }
+
+    bool OwnedByBot(ObjectGuid owner)
+    {
+        uint32 const accountId = sCharacterCache->GetCharacterAccountIdByGuid(owner);
+        return accountId && BotMgr::IsBotAccountId(accountId);
+    }
+
+    bool MayBuy(Player* bot, AuctionEntry const* a)
+    {
+        if (!a || !a->buyout || !a->itemCount || a->owner == bot->GetGUID() || !sAuctionMgr->GetAItem(a->item_guid))
+            return false;
+        return g_settings.auctionBuyFromBots || !OwnedByBot(a->owner);
+    }
+
+    // The same steps as a player's buyout (WorldSession::HandleAuctionPlaceBid): the seller is paid by mail, the bot gets
+    // the item by mail and takes it out at once.
+    bool Buyout(Player* bot, AuctionHouseObject* house, uint32 auctionId)
+    {
+        AuctionEntry* a = house ? house->GetAuction(auctionId) : nullptr;
+        if (!MayBuy(bot, a))
+            return false;
+        uint32 const cost = a->bidder == bot->GetGUID() ? a->buyout - a->bid : a->buyout;
+        if (!bot->HasEnoughMoney(cost))
+            return false;
+
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+        bot->ModifyMoney(-int32(cost));
+        if (a->bidder && a->bidder != bot->GetGUID())
+            sAuctionMgr->SendAuctionOutbiddedMail(a, a->buyout, bot, trans);
+        a->bidder = bot->GetGUID();
+        a->bid = a->buyout;
+        sAuctionMgr->SendAuctionSalePendingMail(a, trans);
+        sAuctionMgr->SendAuctionSuccessfulMail(a, trans);
+        sAuctionMgr->SendAuctionWonMail(a, trans);
+        sScriptMgr->OnAuctionSuccessful(house, a);
+
+        uint32 const ownerLow = a->owner.GetCounter();
+        a->DeleteFromDB(trans);
+        sAuctionMgr->RemoveAItem(a->item_guid);
+        house->RemoveAuction(a);
+        bot->SaveInventoryAndGoldToDB(trans);
+        CharacterDatabase.CommitTransaction(trans);
+
+        if (auto count = g_listingCount.find(ownerLow); count != g_listingCount.end() && count->second)
+            --count->second;
+        CollectAuctionMail(bot);
+        return true;
+    }
+
+    // Buys stacks of `entry`, cheapest per item first, until `count` are bought or the money runs out. Returns how many items came.
+    uint32 BuyFromAuction(Player* bot, uint32 entry, uint32 count, uint64& budgetLeft, char const* reason)
+    {
+        AuctionHouseObject* house = HouseFor(bot, 0);
+        if (!house || !count)
+            return 0;
+
+        struct Offer
+        {
+            uint32 id;
+            uint32 items;
+            uint32 buyout;
+        };
+        std::vector<Offer> offers;
+        for (auto const& [id, a] : house->GetAuctions())
+            if (a && a->item_template == entry && MayBuy(bot, a))
+                offers.push_back({ id, a->itemCount, a->buyout });
+        std::sort(offers.begin(), offers.end(), [](Offer const& x, Offer const& y) { return uint64(x.buyout) * y.items < uint64(y.buyout) * x.items; });
+
+        uint32 bought = 0;
+        for (Offer const& o : offers)
+        {
+            if (bought >= count)
+                break;
+            if (o.buyout > budgetLeft || o.buyout > SpareMoney(bot))
+                continue;
+            ItemPosCountVec dest;
+            if (bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, entry, o.items) != EQUIP_ERR_OK)
+                continue;
+            if (!Buyout(bot, house, o.id))
+                continue;
+            bought += o.items;
+            budgetLeft -= o.buyout;
+            ++g_buyTotals.reagentStacksBought;
+            g_buyTotals.reagentAuctionCopper += o.buyout;
+            BotEconomy::Line line;
+            line.entry = entry;
+            line.reason = reason;
+            JournalDone(bot, line, o.items, o.buyout / std::max<uint32>(1, o.items), "buy", "auction");
+        }
+        return bought;
+    }
+
+    // Items some vendor sells for gold in unlimited supply; built on first use.
+    std::unordered_set<uint32> const& VendorSoldItems()
+    {
+        static std::unordered_set<uint32> items;
+        static bool loaded = false;
+        if (!loaded)
+        {
+            loaded = true;
+            if (QueryResult result = WorldDatabase.Query("SELECT DISTINCT item FROM npc_vendor WHERE item > 0 AND maxcount = 0 AND ExtendedCost = 0"))
+                do
+                    items.insert((*result)[0].Get<uint32>());
+                while (result->NextRow());
+        }
+        return items;
+    }
+
+    uint32 BuyFromVendor(Player* bot, uint32 entry, uint32 count, uint64& budgetLeft, char const* reason)
+    {
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(entry);
+        if (!proto || !proto->BuyPrice || !count || !VendorSoldItems().count(entry))
+            return 0;
+        uint64 const perBatch = std::max<uint32>(1, proto->BuyCount);
+        auto costOf = [&](uint32 n) { return (uint64(proto->BuyPrice) * n + perBatch - 1) / perBatch; };
+        uint64 const money = std::min(budgetLeft, SpareMoney(bot));
+        while (count && costOf(count) > money)
+            --count;
+        if (!count)
+            return 0;
+        ItemPosCountVec dest;
+        if (bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, entry, count) != EQUIP_ERR_OK)
+            return 0;
+        uint64 const cost = costOf(count);
+        bot->ModifyMoney(-int64(cost));
+        bot->StoreNewItem(dest, entry, true);
+        budgetLeft -= cost;
+        g_buyTotals.reagentVendorCopper += cost;
+        BotEconomy::Line line;
+        line.entry = entry;
+        line.reason = reason;
+        JournalDone(bot, line, count, uint32(cost / count), "buy", "vendor");
+        return count;
+    }
+
+    struct GearPick
+    {
+        uint32 auctionId = 0;
+        uint32 entry = 0;
+        uint32 buyout = 0;
+        uint8 slot = NULL_SLOT;
+        float gain = 0.0f;
+    };
+
+    // The best upgrade on offer for each equipment slot, best gain first, every one within the shopping budget.
+    std::vector<GearPick> FindGearUpgrades(Player* bot, AuctionHouseObject* house, uint64 budget)
+    {
+        std::vector<GearPick> picks;
+        if (!house || !budget || BotGear::TrainingLocked(bot))
+            return picks;
+        BotRole const role = BotAI::GetRole(bot->GetGUID());
+        float const margin = 1.0f + g_settings.auctionBuyMinUpgradePercent / 100.0f;
+        std::unordered_map<uint8, GearPick> bestPerSlot;
+        std::unordered_map<uint8, float> wornScore;
+        for (auto const& [id, a] : house->GetAuctions())
+        {
+            if (!a || a->itemCount != 1 || a->buyout > budget || !MayBuy(bot, a))
+                continue;
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(a->item_template);
+            if (!proto || (proto->Class != ITEM_CLASS_ARMOR && proto->Class != ITEM_CLASS_WEAPON) || BotAI::IsProfessionTool(proto))
+                continue;
+            if (!BotGear::Allowed(bot, proto))
+                continue;
+            uint8 const slot = bot->FindEquipSlot(proto, NULL_SLOT, true);
+            if (slot == NULL_SLOT || BotGear::PreserveSlot(bot, slot))
+                continue;
+            auto worn = wornScore.find(slot);
+            if (worn == wornScore.end())
+            {
+                Item* current = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+                worn = wornScore.emplace(slot, current ? BotAI::ScoreItemForBot(bot, current->GetTemplate(), role) : 0.0f).first;
+            }
+            float const score = BotAI::ScoreItemForBot(bot, proto, role);
+            if (score <= 0.0f || score <= worn->second * margin)
+                continue;
+            float const gain = score - worn->second;
+            GearPick& best = bestPerSlot[slot];
+            if (!best.auctionId || gain > best.gain || (gain == best.gain && a->buyout < best.buyout))
+                best = { id, a->item_template, a->buyout, slot, gain };
+        }
+        for (auto const& [slot, pick] : bestPerSlot)
+            picks.push_back(pick);
+        std::sort(picks.begin(), picks.end(), [](GearPick const& x, GearPick const& y) { return x.gain > y.gain; });
+        return picks;
+    }
+
+    uint64 ShoppingBudget(Player* bot)
+    {
+        return SpareMoney(bot) * g_settings.auctionBuyBudgetPercent / 100;
+    }
+
+    // A bot with money to spare and an upgrade on offer is worth a trip to the auction house even when it has nothing to sell.
+    bool WantsShopping(Player* bot, uint32 now)
+    {
+        if (!g_settings.auctionBuyGear || SpareMoney(bot) < g_settings.shoppingMinSpareCopper)
+            return false;
+        auto next = g_nextShopAt.find(bot->GetGUID());
+        if (next != g_nextShopAt.end() && int32(now - next->second) < 0)
+            return false;
+        g_nextShopAt[bot->GetGUID()] = now + g_settings.shoppingIntervalMin * 60 * 1000;
+        return !FindGearUpgrades(bot, HouseFor(bot, 0), ShoppingBudget(bot)).empty();
+    }
+
+    void ShopForGear(Player* bot, uint32 auctioneerFaction)
+    {
+        if (!g_settings.auctionBuyGear)
+            return;
+        AuctionHouseObject* house = HouseFor(bot, auctioneerFaction);
+        uint64 budget = ShoppingBudget(bot);
+        uint32 bought = 0;
+        for (GearPick const& pick : FindGearUpgrades(bot, house, budget))
+        {
+            if (bought >= g_settings.auctionBuyMaxItems)
+                break;
+            if (pick.buyout > budget)
+                continue;
+            ItemPosCountVec dest;
+            if (bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, pick.entry, 1) != EQUIP_ERR_OK)
+                break;
+            if (!Buyout(bot, house, pick.auctionId))
+                continue;
+            budget -= pick.buyout;
+            ++bought;
+            ++g_buyTotals.gearBought;
+            g_buyTotals.gearCopper += pick.buyout;
+            BotEconomy::Line line;
+            line.entry = pick.entry;
+            line.reason = "auction-upgrade";
+            JournalDone(bot, line, 1, pick.buyout, "buy", "auction");
+            LOG_DEBUG("module.coa-playerbots", "BotEconomy: '{}' bought item {} at the auction house for {}.", bot->GetName(), pick.entry, Money(pick.buyout));
+        }
+        if (bought)
+            BotAI::MaintainEquipmentNow(bot);
+        g_nextShopAt[bot->GetGUID()] = GameTime::GetGameTimeMS().count() + g_settings.shoppingIntervalMin * 60 * 1000;
     }
 
     // ---- Supplies ------------------------------------------------------------------------------------------------
@@ -817,6 +1118,8 @@ namespace
                 g_tripTotals.guildCopper += share;
             }
         }
+        if (!vendorOnly)
+            ShopForGear(bot, auctioneerFaction);
         g_tripTotals.earnedCopper += gained;
         bot->SaveToDB(false, false);
     }
@@ -1032,8 +1335,12 @@ namespace BotEconomy
             // A bot working on a gold order goes to town for a smaller load: the sooner its finds are money, the sooner they are in the bank.
             uint64 const minTrip = g_goldOrders.count(bot->GetGUID()) ? std::min<uint64>(g_settings.minTripCopper, 5000) : g_settings.minTripCopper;
             bool const bagsFull = total > 0 && bot->GetFreeInventorySpace() <= g_settings.bagsFullFreeSlots;
-            if (total < minTrip && !bagsFull && !(g_needsSupplies.count(bot->GetGUID()) || NeedsSupplies(bot)))
+            bool const worthSelling = total >= minTrip || bagsFull || g_needsSupplies.count(bot->GetGUID()) || NeedsSupplies(bot);
+            bool const shopping = !worthSelling && !g_settings.dryRun && !g_trips.count(bot->GetGUID()) && WantsShopping(bot, now);
+            if (!worthSelling && !shopping)
                 continue;
+            if (shopping)
+                g_wantsShopping.insert(bot->GetGUID());
 
             uint64 fingerprint = 1469598103934665603ull;
             for (Line const& l : plan)
@@ -1046,7 +1353,8 @@ namespace BotEconomy
                 continue; // nothing new since this bot was last written down
             last->second = fingerprint;
 
-            ++g_totals.botsWithSales;
+            if (!plan.empty())
+                ++g_totals.botsWithSales;
             for (Line const& l : plan)
                 (l.verdict == Verdict::Auction ? g_totals.auctionCopper : g_totals.vendorCopper) += l.TotalCopper();
             Journal(bot, plan);
@@ -1394,6 +1702,7 @@ namespace BotEconomy
                 EndStockRun(guid);
             }
             g_wantsTrip.erase(guid);
+            g_wantsShopping.erase(guid);
             return false;
         }
 
@@ -1406,14 +1715,15 @@ namespace BotEconomy
             if (cooldown != g_nextTripAt.end() && int32(now - cooldown->second) < 0)
                 return false;
             g_wantsTrip.erase(guid);
-            // The auction house only for a load worth the walk; otherwise (or when it is too far) the nearest vendor, which is usually close.
+            bool const shopping = g_wantsShopping.erase(guid) > 0;
+            // The auction house only for a load worth the walk (or a shopping visit); otherwise (or when it is too far) the nearest vendor, which is usually close.
             Poi const* auctioneer = NearestAuctioneer(bot);
             Poi const* vendor = NearestVendor(bot);
             uint64 auctionCopper = 0;
             for (BotEconomy::Line const& l : BotEconomy::PlanSale(bot))
                 if (l.verdict == BotEconomy::Verdict::Auction)
                     auctionCopper += l.TotalCopper();
-            bool const auctionWorth = auctioneer && auctionCopper >= g_settings.minTripCopper &&
+            bool const auctionWorth = auctioneer && (auctionCopper >= g_settings.minTripCopper || shopping) &&
                 std::hypot(auctioneer->x - bot->GetPositionX(), auctioneer->y - bot->GetPositionY()) <= g_settings.maxAuctionTripYards;
             Poi const* poi = auctionWorth ? auctioneer : (vendor ? vendor : auctioneer);
             bool const vendorOnly = poi && poi == vendor && !auctionWorth;
@@ -1434,6 +1744,8 @@ namespace BotEconomy
             t.goalId = ++g_goalSeed;
             trip = g_trips.emplace(guid, t).first;
             ++g_tripTotals.trips;
+            if (shopping && auctionWorth)
+                ++g_buyTotals.shoppingTrips;
             ReleaseOrdinaryWalks(bot);
             LOG_DEBUG("module.coa-playerbots", "BotEconomy: '{}' sets off for the auctioneers ({:.0f}, {:.0f}).", bot->GetName(), t.x, t.y);
         }
@@ -1533,6 +1845,11 @@ namespace BotEconomy
                 Money(g_tripTotals.guildCopper), g_tripTotals.noDestination, g_tripTotals.timedOut);
             handler->PSendSysMessage("Would sell to vendors: {}; to the auction: {}. Auctions known to the market cache: {} items. Protected items: {}.",
                 Money(g_totals.vendorCopper), Money(g_totals.auctionCopper), g_market.size(), g_protected.size());
+            handler->PSendSysMessage("Buying: gear upgrades {} (CoaBots.Economy.AuctionBuyGear); shopping trips {}; upgrades bought {} for {}.",
+                g_settings.auctionBuyGear ? "on" : "off", g_buyTotals.shoppingTrips, g_buyTotals.gearBought, Money(g_buyTotals.gearCopper));
+            handler->PSendSysMessage("Crafting reagents: guild bank {}, vendors {}, auction {}; taken from guild banks {} item(s); bought {} auction stack(s) for {}, vendor reagents for {}.",
+                g_settings.craftFromGuildBank ? "on" : "off", g_settings.craftFromVendor ? "on" : "off", g_settings.craftFromAuction ? "on" : "off",
+                g_buyTotals.reagentsFromGuildBank, g_buyTotals.reagentStacksBought, Money(g_buyTotals.reagentAuctionCopper), Money(g_buyTotals.reagentVendorCopper));
             return;
         }
 
@@ -1588,6 +1905,25 @@ namespace BotEconomy
                 handler->PSendSysMessage("  {} (guid {}): {:.0f} yd from the auctioneers, {} s on the way{}{}{}", bot->GetName(), guid.GetCounter(),
                     std::hypot(bot->GetPositionX() - t.x, bot->GetPositionY() - t.y), (now - t.startedAt) / 1000, bot->IsInFlight() ? ", flying" : "",
                     bot->IsMounted() ? ", mounted" : "", BotWorldBehavior::HasActiveErrand(guid) ? ", doing another errand first" : "");
+            }
+            return;
+        }
+
+        if (sub == "shop" && tok.size() >= 2)
+        {
+            Player* bot = sBotMgr->FindBotPlayer(uint32(std::strtoul(tok[1].c_str(), nullptr, 10)));
+            if (!bot)
+            {
+                handler->PSendSysMessage("BotMgr: no online bot with guid {}.", tok[1]);
+                return;
+            }
+            uint64 const budget = ShoppingBudget(bot);
+            std::vector<GearPick> picks = FindGearUpgrades(bot, HouseFor(bot, 0), budget);
+            handler->PSendSysMessage("{} may spend {} on one visit; {} slot(s) have an upgrade on offer:", bot->GetName(), Money(budget), picks.size());
+            for (GearPick const& p : picks)
+            {
+                ItemTemplate const* proto = sObjectMgr->GetItemTemplate(p.entry);
+                handler->PSendSysMessage("  slot {}: {} for {} (+{:.1f} score)", uint32(p.slot), proto ? proto->Name1 : "?", Money(p.buyout), p.gain);
             }
             return;
         }
@@ -1659,7 +1995,7 @@ namespace BotEconomy
             return;
         }
 
-        handler->SendSysMessage("Usage: .botcmd economy [status | trips | goldorder <player guid> <gold> | stock <player guid> | stocklimit <player guid> <item> <keep, -1 clears> | plan <bot guid> | journal [n] | protect <item id> | unprotect <item id>]");
+        handler->SendSysMessage("Usage: .botcmd economy [status | trips | goldorder <player guid> <gold> | stock <player guid> | stocklimit <player guid> <item> <keep, -1 clears> | plan <bot guid> | shop <bot guid> | journal [n] | protect <item id> | unprotect <item id>]");
     }
 
     bool IsProtectedItem(uint32 itemEntry)
@@ -1698,5 +2034,94 @@ namespace BotEconomy
         line.unitCopper = unitCopper;
         line.priceSource = "bag-cleanup";
         JournalDone(bot, line, count, unitCopper, "vendor", "bag-cleanup");
+    }
+
+    void CollectMailFrom(Player* bot, ObjectGuid sender)
+    {
+        if (!bot || !sender)
+            return;
+        CollectMail(bot, [&](Mail const& m) { return m.messageType == MAIL_NORMAL && m.sender == sender.GetCounter(); });
+    }
+
+    std::vector<ReagentShortfall> MissingReagents(Player* crafter, SpellInfo const* recipe, uint32 crafts)
+    {
+        std::vector<ReagentShortfall> missing;
+        if (!crafter || !recipe)
+            return missing;
+        crafts = std::max<uint32>(1, crafts);
+        for (uint8 i = 0; i < MAX_SPELL_REAGENTS; ++i)
+        {
+            if (recipe->Reagent[i] <= 0 || !recipe->ReagentCount[i])
+                continue;
+            uint32 const entry = uint32(recipe->Reagent[i]);
+            uint32 const need = recipe->ReagentCount[i] * crafts;
+            uint32 const have = crafter->GetItemCount(entry, false);
+            if (have < need)
+                missing.push_back({ entry, need - have });
+        }
+        return missing;
+    }
+
+    std::vector<ReagentShortfall> SourceReagents(Player* crafter, SpellInfo const* recipe, uint32 crafts, uint64& budgetLeftCopper)
+    {
+        constexpr uint32 CASTS_PER_SOURCING = 5;
+        crafts = std::min(std::max<uint32>(1, crafts), CASTS_PER_SOURCING);
+        if (!crafter || !recipe || !CraftSourcingEnabled())
+            return MissingReagents(crafter, recipe, crafts);
+        EnsureTables();
+
+        for (ReagentShortfall const& shortfall : MissingReagents(crafter, recipe, crafts))
+        {
+            uint32 const entry = shortfall.entry;
+            uint32 const target = crafter->GetItemCount(entry, false) + shortfall.count;
+            auto stillShort = [&]() -> uint32
+            {
+                uint32 const have = crafter->GetItemCount(entry, false);
+                return have >= target ? 0 : target - have;
+            };
+
+            if (g_settings.craftFromGuildBank && crafter->GetGuild())
+            {
+                uint32 const before = crafter->GetItemCount(entry, false);
+                sBotMgr->GuildWithdrawItem(crafter->GetGUID().GetCounter(), entry, shortfall.count, nullptr);
+                uint32 const after = crafter->GetItemCount(entry, false);
+                if (after > before)
+                    g_buyTotals.reagentsFromGuildBank += after - before;
+            }
+            if (uint32 const left = stillShort(); left && g_settings.craftFromVendor)
+                BuyFromVendor(crafter, entry, left, budgetLeftCopper, "craft-reagent");
+            if (uint32 const left = stillShort(); left && g_settings.craftFromAuction && IsLive())
+                BuyFromAuction(crafter, entry, left, budgetLeftCopper, "craft-reagent");
+        }
+        crafter->SaveToDB(false, false);
+        return MissingReagents(crafter, recipe, 1);
+    }
+
+    std::string DescribeReagents(std::vector<ReagentShortfall> const& reagents)
+    {
+        std::string out;
+        for (ReagentShortfall const& r : reagents)
+        {
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(r.entry);
+            if (!out.empty())
+                out += ", ";
+            out += Acore::StringFormat("{}x {}", r.count, proto ? proto->Name1 : std::to_string(r.entry));
+        }
+        return out;
+    }
+
+    bool CraftSourcingEnabled()
+    {
+        return g_settings.craftFromGuildBank || g_settings.craftFromVendor || g_settings.craftFromAuction;
+    }
+
+    uint64 CraftReagentBudgetCopper()
+    {
+        return g_settings.craftBudgetCopper;
+    }
+
+    uint32 CraftOrderTimeoutMs()
+    {
+        return g_settings.craftTimeoutMin * 60 * 1000;
     }
 }

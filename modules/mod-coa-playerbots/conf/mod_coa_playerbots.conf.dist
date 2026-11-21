@@ -615,6 +615,28 @@ CoaBots.MarkSessionsAsBots = 1
 #                     so the market looks alive.
 #        Default:     5 / 10
 #
+#    CoaBots.Economy.AuctionBuyGear
+#        Description: 1 = bots buy gear upgrades for their spec at the auction house: on every trip to an auction
+#                     house, and on a shopping trip of their own when they have ShoppingMinSpareCopper to spare and
+#                     an upgrade is on offer. An upgrade must score AuctionBuyMinUpgradePercent better than the piece
+#                     the bot wears. Needs CoaBots.Economy.Enable = 1 and DryRun = 0. `.botcmd economy shop <bot guid>`
+#                     shows what a bot would buy.
+#        Default:     0
+#
+#    CoaBots.Economy.AuctionBuyBudgetPercent / AuctionBuyMaxItems / AuctionBuyMinUpgradePercent
+#        Description: Percent of the money above MoneyReserveCopper a bot may spend on one visit; upgrades bought on
+#                     one visit; how much better than the worn piece an upgrade has to be.
+#        Default:     25 / 2 / 10
+#
+#    CoaBots.Economy.AuctionBuyFromBots
+#        Description: 1 = bots may buy other bots' listings too. 0 = only players' listings.
+#        Default:     1
+#
+#    CoaBots.Economy.ShoppingMinSpareCopper / ShoppingIntervalMin
+#        Description: Money above the reserve a bot needs before it goes shopping with nothing to sell; minutes
+#                     between two looks for upgrades by the same bot.
+#        Default:     200000 - (20 gold) / 120
+#
 
 CoaBots.Economy.Enable = 0
 CoaBots.Economy.MinTripCopper = 50000
@@ -638,6 +660,48 @@ CoaBots.Economy.MinListingCopper = 5000
 CoaBots.Economy.ListingMinutes = 1440
 CoaBots.Economy.PriceSpreadMinPercent = 5
 CoaBots.Economy.PriceSpreadMaxPercent = 10
+CoaBots.Economy.AuctionBuyGear = 0
+CoaBots.Economy.AuctionBuyBudgetPercent = 25
+CoaBots.Economy.AuctionBuyMaxItems = 2
+CoaBots.Economy.AuctionBuyMinUpgradePercent = 10
+CoaBots.Economy.AuctionBuyFromBots = 1
+CoaBots.Economy.ShoppingMinSpareCopper = 200000
+CoaBots.Economy.ShoppingIntervalMin = 120
+
+###################################################################################################
+# CRAFTING ORDERS
+###################################################################################################
+#
+#    CoaBots.Crafting.ReagentsFromGuildBank
+#        Description: 1 = a bot on a crafting order takes the reagents it is missing out of its guild bank.
+#        Default:     0
+#
+#    CoaBots.Crafting.ReagentsFromVendor
+#        Description: 1 = it buys missing reagents that vendors sell for gold (thread, flux, vials, dyes...) with its
+#                     own money, keeping CoaBots.Economy.MoneyReserveCopper.
+#        Default:     0
+#
+#    CoaBots.Crafting.ReagentsFromAuction
+#        Description: 1 = it buys the rest at its side's auction house, cheapest per item first. Needs
+#                     CoaBots.Economy.Enable = 1 and DryRun = 0.
+#        Default:     0
+#
+#    CoaBots.Crafting.ReagentBudgetCopper
+#        Description: What one crafting order may spend on reagents in all.
+#        Default:     100000 - (10 gold)
+#
+#    CoaBots.Crafting.OrderTimeoutMin
+#        Description: A crafting order still short of reagents after this many minutes is given up, and the
+#                     requester is told what was missing. Reagents the requester mails to the crafter are taken
+#                     out of its mailbox while it waits. 0 = wait forever.
+#        Default:     120
+#
+
+CoaBots.Crafting.ReagentsFromGuildBank = 0
+CoaBots.Crafting.ReagentsFromVendor = 0
+CoaBots.Crafting.ReagentsFromAuction = 0
+CoaBots.Crafting.ReagentBudgetCopper = 100000
+CoaBots.Crafting.OrderTimeoutMin = 120
 
 ###################################################################################################
 # COMBAT INTELLIGENCE

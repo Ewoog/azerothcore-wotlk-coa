@@ -82,6 +82,14 @@ CoA Companions provides dedicated AI combat profiles for all **21 Conquest of Az
   - Smart loot distribution and greed/need rolling.
   - Leveling and zone progression from 1 to 80 with automatic talent allocation per spec build.
   - Racial mount usage and intelligent pathing.
+- **Economy** (`CoaBots.Economy.*`, `CoaBots.Crafting.*`, all off by default):
+  - Bots sort their bags into keep / vendor / auction, travel to town, sell and list, collect their auction mail,
+    buy food, drink and potions, and pay a share into the guild bank.
+  - Bots shop the auction house for gear upgrades for their spec (players' listings find real buyers).
+  - Guild gold orders and guild bank stock limits from the addon's task board.
+  - Crafting orders fetch their reagents from the guild bank, vendors and the auction house, take reagents the
+    requester mails them, tell the requester what is missing and give up after a timeout.
+  - `.botcmd economy status | plan <guid> | shop <guid> | journal` show what bots planned, sold and bought.
 
 ---
 

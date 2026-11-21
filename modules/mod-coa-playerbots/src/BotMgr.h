@@ -29,6 +29,7 @@
 class ChatHandler;
 class Guild;
 class Player;
+class SpellInfo;
 class Roll;
 class WorldSession;
 
@@ -260,6 +261,12 @@ public:
         uint32 remainingCount = 0;
         bool awaitingCastResult = false;
         uint32 itemCountBeforeCast = 0;
+        // Reagent sourcing (BotEconomy::SourceReagents): when the order was placed, when the crafter next looks
+        // for missing reagents, what it may still spend on them, and whether the requester was told what is missing.
+        uint32 placedAtMs = 0;
+        uint32 nextSourcingAtMs = 0;
+        uint64 reagentBudgetLeftCopper = 0;
+        bool toldMissing = false;
     };
     CraftOrderState const* GetCraftOrder(ObjectGuid const& guid) const;
 
@@ -715,6 +722,7 @@ private:
 
     std::unordered_map<ObjectGuid, CraftOrderState> _craftOrders;
     void ProcessCraftOrders();
+    bool WaitForCraftReagents(Player* crafter, SpellInfo const* info, CraftOrderState& order);
 
     std::vector<WorldSession*> _botSessions;
     // One detached login per GUID; concurrent callers share its completion.
