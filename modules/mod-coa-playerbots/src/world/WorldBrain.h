@@ -28,6 +28,7 @@
 
 #include "ObjectGuid.h"
 #include "WorldTask.h"
+#include <string>
 
 class ChatHandler;
 class Player;
@@ -49,6 +50,12 @@ namespace WorldBrain
 
     // The ambient layer took the tick (a repair/vendor need, a flight): the current task pauses.
     void NotifyAmbientBusy(Player* bot);
+
+    // The idle watchdog (BotAI) saw the bot stand still with nothing to show for a while: whatever
+    // the brain was holding it on -- a stuck task (its quest is set aside like any other failed
+    // run), a detour, a town break -- is let go, and the bot is sent grinding with an immediate
+    // re-plan. Returns a short description of what was reset, for the log and `.botcmd why`.
+    std::string Nudge(Player* bot);
 
     // Something else owns the bot now (a group, a manual command, a battleground, a dungeon).
     // Releases every claim; the task is dropped and re-planned when the brain is next updated.

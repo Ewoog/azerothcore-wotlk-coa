@@ -23,6 +23,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 class ChatHandler;
@@ -91,7 +92,10 @@ public:
     void GuildWithdrawMoney(ObjectGuid::LowType charLowGuid, uint32 copper, ChatHandler* handler);
 
     // Orders bot to gather itemEntry up to targetCount and deposit into guild bank.
-    void GuildGather(ObjectGuid::LowType charLowGuid, uint32 itemEntry, uint32 targetCount, ChatHandler* handler);
+    // requesterLowGuid: the player who asked (gets ORDERDONE/ORDERFAIL notices and may cancel
+    // the order without being a guild officer). 0 == take it from handler's session, if any.
+    void GuildGather(ObjectGuid::LowType charLowGuid, uint32 itemEntry, uint32 targetCount, ChatHandler* handler,
+        ObjectGuid::LowType requesterLowGuid = 0);
 
     // Finds an online guild-mate bot of `requesterCharLowGuid` that knows a recipe spell
     // producing itemEntry (any learned spell with a SPELL_EFFECT_CREATE_ITEM effect targeting
@@ -123,8 +127,130 @@ public:
         float targetY = 0.0f;
         float targetZ = 0.0f;
         bool hasTargetLocation = false;
+        // Player who placed the order (0 for a GM .botcmd order with no player session, or a row
+        // saved before the requester_guid column existed). Notified on completion/failure and
+        // allowed to cancel it even without officer rank.
+        ObjectGuid::LowType requesterLowGuid = 0;
+        // RetryGuildGatherLocation calls since the last deposit; GUILD_GATHER_MAX_STALLED_RETRIES
+        // of them in a row gives the order up (ORDERFAIL). Not persisted -- a restart starts over.
+        uint32 stalledRetries = 0;
+        // getMSTime() of the last deposit (or of the bot coming online with the order); drives
+        // GUILD_GATHER_NO_PROGRESS_MS. 0 == not started yet. Not persisted.
+        uint32 lastProgressMs = 0;
+
+        // --- Not persisted: live state for progress, status text and spot rotation ---------------
+        // How many of the ordered item the bot is carrying right now (capped at remainingCount).
+        // Counts toward the progress the Task Board shows, so a bot that is gathering but cannot
+        // bank (guild bank full) is visibly making progress instead of sitting at 0.
+        uint32 heldCount = 0;
+        // The last guild-bank deposit attempt found no room (or no rights) for this item. The
+        // finished order is then mailed to the requester instead (see MailGatherItems).
+        bool bankBlocked = false;
+        uint32 lastDepositTryMs = 0;
+        // getMSTime() the bot was first seen in a group led by a real player (0 == not grouped).
+        // Grouped bots follow their leader, so the order pauses and, after a while, is handed on.
+        uint32 groupedSinceMs = 0;
+        // Short, human-readable "what is it doing right now" for the Task Board / .botcmd orderstatus.
+        std::string status;
+        // Spots this order already tried and found empty; the next pick avoids them.
+        struct TriedSpot { uint32 mapId; float x; float y; };
+        std::vector<TriedSpot> triedSpots;
+        // Short number for chat lines and `.botcmd orderstatus` ("order #3"). Handed out when the
+        // order is placed or loaded; not persisted, so it can change after a restart.
+        uint32 orderNo = 0;
+        // The requester was told about the first item counted / a node that gave something else /
+        // full bags. One line each per order, so chat is not flooded.
+        bool firstProgressTold = false;
+        uint32 startProgress = 0; // GatherOrderProgress when placed/loaded: "first progress" is above it
+        bool wrongLootTold = false;
+        bool bagsFullTold = false;
+        // The bot's bags cannot take one more of the ordered item even after making room. Loot
+        // that does not fit stays in the node, so nothing is counted until this clears.
+        bool bagsFull = false;
+        uint32 lastRoomCheckMs = 0;
+        // What the bot looted while on this order (nodes, corpses): for orderstatus.
+        uint32 lootsOpened = 0;
+        uint32 lootsWithItem = 0;
+        uint32 lootsLeftBehind = 0;
+        std::string lastLoot;
     };
     GuildGatherOrder const* GetGuildGatherOrder(ObjectGuid const& guid) const;
+    // Banked + carried, capped at targetCount: what the Task Board shows as progress.
+    static uint32 GatherOrderProgress(GuildGatherOrder const& order);
+    // BotAI's running commentary for an order ("walking to the spot (240 yd)", "searching for
+    // nodes", ...). No-op when the bot has no order or the text is unchanged.
+    void SetGatherOrderStatus(ObjectGuid const& guid, std::string const& status);
+    // `.botcmd orderstatus`: one line per active/queued order with everything needed to see why
+    // it is (not) moving -- position, distance to its spot, skill, bags, bank, retries, idle time.
+    void DescribeGatherOrders(ChatHandler* handler) const;
+    // BotAI::TakeAllLoot reports every loot window it emptied for a bot with an order: what was in
+    // it (entry, count), how many of the ordered item reached the bags, and whether anything had to
+    // be left behind (bags full). Feeds orderstatus and the one-time "got something else" line.
+    void NoteGatherLoot(Player* bot, std::vector<std::pair<uint32, uint32>> const& looted, uint32 orderItemsStored,
+        bool leftBehind);
+    // True when bot has an active gather order; *itemEntry gets the ordered item.
+    bool GetGatherOrderItem(ObjectGuid const& guid, uint32* itemEntry) const;
+    // Makes room in an order bot's bags for one more of the ordered item: clutter sweep, then
+    // other Trade Goods to the guild bank, then (bank full) mails them to the requester. Returns
+    // true when the item now fits.
+    bool MakeRoomForGatherOrder(Player* bot);
+
+    // Where an ordered item can come from, computed once per item from the world DB loot tables
+    // and the in-memory spawn/template stores (see BuildGatherSourceInfo in BotMgr.cpp).
+    // huntCorpseEntries: creature entries whose corpse loot (creature_loot_template, directly or
+    // through one level of reference_loot_template) can yield the item; huntSkinEntries: entries
+    // whose skinning loot (skinning_loot_template via creature_template.skinloot, Skinning skill
+    // only) can. Only normal-rank creatures with at least one spawn on an open-world continent
+    // (maps 0, 1, 530, 571) are listed.
+    struct HuntSpawn
+    {
+        uint16 mapId = 0;
+        float x = 0.0f, y = 0.0f, z = 0.0f;
+        uint8 minLevel = 1, maxLevel = 1;
+    };
+    struct GatherSourceInfo
+    {
+        bool nodeSourced = false;      // loot of a Herbalism/Mining-locked gameobject (chests don't count)
+        uint32 nodeSkillId = 0;        // SKILL_HERBALISM / SKILL_MINING
+        uint32 nodeRequiredSkill = 0;  // lowest skill value any of those nodes needs
+        bool fishSourced = false;      // in fishing_loot_template
+        std::unordered_set<uint32> huntCorpseEntries;
+        std::unordered_set<uint32> huntSkinEntries;
+        std::vector<HuntSpawn> huntSpawns;
+        uint8 huntMinLevel = 0;        // lowest minlevel among hunt sources with a spawn (0 = none)
+        // gameobject_template entries of the real Herbalism/Mining nodes that can yield the item
+        // (chests excluded), and the best loot chance among them (0 = only in equal-chance groups).
+        std::vector<uint32> nodeGoEntries;
+        float nodeBestChance = 0.0f;
+        // Targeted hunting applies: not a node or fish item, and at least one spawned creature drops it.
+        bool IsHunt() const { return !nodeSourced && !fishSourced && !huntSpawns.empty(); }
+        bool SkinOnly() const { return huntCorpseEntries.empty() && !huntSkinEntries.empty(); }
+    };
+    GatherSourceInfo const& GetGatherSourceInfo(uint32 itemEntry);
+
+    // Task Board management (docs/addon-protocol.md CANCELORDER / PRIORITIZEORDER / CANCELQUEUED /
+    // TOPQUEUED). Each returns a short result token for the addon reply ("ok", "denied", "none").
+    // Allowed when `commander` is in the bot's (or queued order's) guild and is either a guild
+    // master/officer (rank 0/1) or the player who placed the order.
+    std::string CancelGatherOrder(Player* commander, ObjectGuid::LowType botLowGuid);
+    std::string PrioritizeGatherOrder(Player* commander, ObjectGuid::LowType botLowGuid);
+    std::string CancelQueuedGatherOrder(Player* commander, uint32 queueId);
+    std::string TopQueuedGatherOrder(Player* commander, uint32 queueId);
+
+    // Restarts the 30-minute no-progress clock so a repair or ammo trip does not fail the order.
+    void PauseGuildGatherWatchdog(ObjectGuid const& guid);
+
+    // Gather orders placed while every eligible guild bot is busy wait here instead of
+    // overwriting a running order; the front of the vector is assigned first (TOPQUEUED moves an
+    // entry there). Persisted in mod_coa_bot_guild_gather_queue.
+    struct QueuedGatherOrder
+    {
+        uint32 queueId = 0;
+        uint32 guildId = 0;
+        ObjectGuid::LowType requesterLowGuid = 0;
+        uint32 itemEntry = 0;
+        uint32 count = 0;
+    };
 
     struct CraftOrderState
     {
@@ -142,8 +268,14 @@ public:
     // empty nearby for too long (GUILD_GATHER_RETELEPORT_MS) -- the original spot's node was
     // already consumed (respawn pending) or claimed by someone else first. No-op if the bot has no
     // such order, no active session, or the item has no resolvable gather location at all.
-    void RetryGuildGatherLocation(ObjectGuid const& guid);
+    // Every GUILD_GATHER_MAX_STALLED_RETRIES-th call without a deposit in between, or a call
+    // that finds no source at all, gives the order up instead (FailGuildGatherOrder).
+    // `rush` (PRIORITIZEORDER) teleports straight to the new spot even on the same map and does
+    // not count as a stalled retry.
+    void RetryGuildGatherLocation(ObjectGuid const& guid, bool rush = false);
     void LoadGuildGatherOrders();
+    // Erases the order (memory + DB) and tells its requester why (ORDERFAIL:...:<reason>).
+    void FailGuildGatherOrder(ObjectGuid const& botGuid, std::string const& reason);
     void SaveGuildGatherOrder(ObjectGuid const& guid, GuildGatherOrder const& order);
     void DeleteGuildGatherOrder(ObjectGuid const& guid);
 
@@ -322,6 +454,11 @@ public:
     // Invite one listed bot to the commander's group / to the commander's guild (the guild's own invite rights apply).
     void InviteBotToGroup(Player* commander, ObjectGuid::LowType botGuid, ChatHandler* handler);
     void InviteBotToGuild(Player* commander, ObjectGuid::LowType botGuid, ChatHandler* handler);
+
+    // If `bot` is a tracked bot already in another group, leave that group so a new invite can
+    // succeed. Returns false (and leaves the group alone) when the bot is in combat, in a
+    // battleground, or on a dungeon/raid map. Returns true when the bot has no group, or left it.
+    bool TryReleaseBotFromGroup(Player* inviter, Player* bot);
 
     // Toggles autonomous dungeon/raid play for `leader`'s whole group: while enabled, a Tank
     // bot idle inside an instance (no target, leader not already fighting) scans for the
@@ -551,6 +688,30 @@ private:
     void EnsureBotBankRights(Player* bot, Guild* guild);
 
     std::unordered_map<ObjectGuid, GuildGatherOrder> _guildGatherOrders;
+    std::unordered_map<uint32, GatherSourceInfo> _gatherSourceInfo;
+    std::vector<QueuedGatherOrder> _gatherQueue;
+    uint32 _nextGatherQueueId = 1;
+    uint32 _nextGatherOrderNo = 1;
+    // Sends a system line to the order's requester when that is an online real player.
+    void TellGatherRequester(GuildGatherOrder const& order, std::string const& text);
+    void LoadGatherQueue();
+    void SaveGatherQueue();
+    void ProcessGatherQueue();
+    // Picks the best online, ungrouped guild bot for itemEntry (level/skill fit, then not busy).
+    // allowBusy=false returns nullptr when every candidate already has a gather/craft order.
+    Player* PickGatherBot(uint32 guildId, uint32 itemEntry, bool allowBusy);
+    bool ResolveOrderLocation(Player* bot, GuildGatherOrder const& order, bool avoidCurrentTarget,
+        uint32& mapId, float& x, float& y, float& z);
+    void NotifyGatherOrderDone(Player* bot, GuildGatherOrder const& order, uint32 mailedCount = 0);
+    // Mails up to `count` of itemEntry from the bot's bags to the requester (whole stacks, real
+    // MailDraft, 12 stacks per mail). Returns how many items went out.
+    uint32 MailGatherItems(Player* bot, ObjectGuid::LowType requesterLowGuid, uint32 itemEntry, uint32 count);
+    // Points the order at a new spot: walks there when it is close, teleports when it is on
+    // another map or further than GATHER_ORDER_TELEPORT_BEYOND_YARDS (or `rush`).
+    void SendBotToOrderSpot(Player* bot, GuildGatherOrder& order, bool rush);
+    void NotifyGatherOrderFail(ObjectGuid const& botGuid, std::string const& botName, GuildGatherOrder const& order,
+        std::string const& reason);
+    bool CanManageGatherOrder(Player* commander, uint32 guildId, ObjectGuid::LowType requesterLowGuid) const;
 
     std::unordered_map<ObjectGuid, CraftOrderState> _craftOrders;
     void ProcessCraftOrders();
@@ -576,6 +737,13 @@ private:
     std::unordered_map<ObjectGuid, uint32> _tradeAgeMs;
     bool _tradeEnabled = true;
     bool _autoLootInGroup = false;
+    bool _inventorySellWhenNearVendor = true;
+    bool _inventorySellOnLeaderVendor = true;
+    uint32 _inventoryKeepQuality = 3;
+    bool _questShareTurnIn = true;
+    bool _questShareAccept = true;
+    bool _gatherWhileFollowing = true;
+    float _gatherFollowRadius = 20.0f;
     void UpdateTrades(uint32 diff);
     std::mutex _killEventLock;
     std::vector<KillEvent> _killEvents;
@@ -591,8 +759,29 @@ public:
     // already-running server without needing a restart.
     void QueueAllBotsForAutoLogin();
     bool AutoLootInGroup() const { return _autoLootInGroup; }
+    bool InventorySellWhenNearVendor() const { return _inventorySellWhenNearVendor; }
+    bool InventorySellOnLeaderVendor() const { return _inventorySellOnLeaderVendor; }
+    uint32 InventoryKeepQuality() const { return _inventoryKeepQuality; }
+    bool QuestShareTurnIn() const { return _questShareTurnIn; }
+    bool QuestShareAccept() const { return _questShareAccept; }
+    bool GatherWhileFollowing() const { return _gatherWhileFollowing; }
+    float GatherFollowRadius() const { return _gatherFollowRadius; }
 };
 
 #define sBotMgr BotMgr::instance()
+
+// Server -> addon reply on the COABOT channel (defined in BotAddonChat.cpp), so BotMgr can push
+// unsolicited notices such as ORDERDONE / ORDERFAIL to a player running the addon.
+void CoaBotSendAddonReply(Player* recipient, std::string const& body);
+
+// Every COABOT reply, "COABOT\t" prefix included, stays at or under this many bytes (the client's
+// addon-whisper path is only safe to ~255). SendCoaBotReply enforces it as a last resort.
+constexpr std::size_t COABOT_MAX_REPLY_BYTES = 250;
+// Wire-safe copy of free text: newlines and every char in `bad` become spaces, then it is cut to
+// maxBytes on a UTF-8 boundary. Use bad = "|" for a trailing field, ":|" for a middle field, and
+// ":|," inside comma lists.
+std::string CoaBotWireText(std::string const& text, std::size_t maxBytes, char const* bad);
+// Bytes left for a trailing free-text field after `head`.
+std::size_t CoaBotWireRoom(std::string const& head);
 
 #endif // COA_PLAYERBOTS_BOT_MGR_H

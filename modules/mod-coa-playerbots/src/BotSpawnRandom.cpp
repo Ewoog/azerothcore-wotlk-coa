@@ -1613,9 +1613,9 @@ void SpawnCustomBots(uint32 count, uint8 level, uint8 forcedClassId, uint32 forc
 namespace
 {
 // Every primary profession (11), the 3 uncapped secondaries, and this realm's own two custom
-// ones -- confirmed live: unlike stock WotLK's 2-primary-profession cap, CoA lets one character
-// hold every profession at once, so a fresh population bot just gets all of them instead of a
-// random subset.
+// ones. CoA itself still lets a character hold every profession; random bots now get a
+// two-primary set from AssignVariedProfessions instead. This list is only used by
+// GrantAllProfessions (`.botcmd professiontrainer`).
 constexpr uint32 PROFESSION_SKILLS[] = {
     171, 164, 333, 202, 165, 197, 182, 186, 393, 755, 773, // Alchemy, Blacksmithing, Enchanting,
                                                             // Engineering, Leatherworking, Tailoring,
@@ -1895,36 +1895,13 @@ void GearUpFreshBotForLevel(Player* bot, uint8 level)
     TryEquipBestOf(bot, EQUIPMENT_SLOT_RANGED, ranged, level);
 }
 
-// Profession skills shaped by the bot's personality. CoA lets a character hold every profession,
-// so every one is learned, but at values below the level's cap and spread per bot, with the ones
-// its personality leans toward (gathering, fishing) kept higher -- which is also what makes Gatherer
-// bots the ones able to open the higher-level nodes.
-void GrantShapedProfessions(Player* bot, uint8 level)
+// Profession skills for a freshly cloned population bot: a guid-stable, class-biased pair of
+// primaries plus the three secondaries. Caps and trainer rank spells (including Woodcutting /
+// Woodworking's 300 ceiling) are applied through BotProgression, so a bot can actually use
+// the skill instead of only having a bare SetSkill entry.
+void GrantShapedProfessions(Player* bot, uint8 /*level*/)
 {
-    constexpr uint32 SKILL_WOODCUTTING = 732;
-    uint16 cap = uint16(std::max<uint32>(1, std::min<uint32>(450, uint32(level) * 6)));
-    uint8 gathering = 50;
-    uint8 fishing = 25;
-    BotAI::GetProfessionLeans(bot, gathering, fishing);
-
-    for (uint32 skillId : PROFESSION_SKILLS)
-    {
-        uint32 lo = 35;
-        uint32 hi = 80;
-        if (skillId == SKILL_HERBALISM || skillId == SKILL_MINING || skillId == SKILL_SKINNING ||
-            skillId == SKILL_WOODCUTTING)
-        {
-            lo = 30 + gathering / 2;
-            hi = std::min<uint32>(100, lo + 25);
-        }
-        else if (skillId == SKILL_FISHING)
-        {
-            lo = 20 + fishing / 2;
-            hi = std::min<uint32>(100, lo + 25);
-        }
-        uint16 value = uint16(std::max<uint32>(1, uint32(cap) * RandomInt(lo, hi) / 100));
-        bot->SetSkill(uint16(skillId), 1, value, cap);
-    }
+    BotProgression::AssignVariedProfessions(bot, true);
 }
 
 // Post-login setup for a freshly cloned population bot. Runs once, from BotMgr::SpawnBot's onReady
@@ -2075,14 +2052,15 @@ uint32 g_pendingLeveledBotThrottleMs = 0;
 // through this path. Safe to call repeatedly (SetSkill on an already-known skill is a no-op
 // beyond refreshing the cap). Needs real (BotSpawn-external) linkage, unlike ApplyFreshBotSetup
 // above, to be callable from BotCommand.cpp's professiontrainer command.
-void GrantAllProfessions(Player* bot, uint8 level)
+void GrantAllProfessions(Player* bot, uint8 /*level*/)
 {
-    uint16 cap = uint16(std::max<uint32>(1, std::min<uint32>(450, uint32(level) * 6)));
+    if (!bot)
+        return;
     for (uint32 skillId : PROFESSION_SKILLS)
-        bot->SetSkill(uint16(skillId), 1, cap, cap);
-
-    if (!bot->HasSpell(7620))
-        bot->learnSpell(7620);
+        BotProgression::GrantProfessionAtCap(bot, skillId);
+    // A GM asked for every profession; auto-reroll must not undo that on the next login.
+    BotProgression::MarkProfessionsManual(bot);
+    BotProgression::GrantProfessionTools(bot);
 }
 
 void GearUpForTraining(Player* bot)

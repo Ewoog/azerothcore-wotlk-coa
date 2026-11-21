@@ -17,14 +17,18 @@
 #include "BotEconomy.h"
 #include "BotFormations.h"
 #include "BotMgr.h"
+#include "BotProgression.h"
 #include "Chat.h"
 #include "ClassSpecRoles.h"
+#include "Creature.h"
 #include "Group.h"
 #include "ItemTemplate.h"
 #include "map/BotMapService.h"
 #include "Log.h"
 #include "MotionMaster.h"
+#include "ObjectMgr.h"
 #include "Player.h"
+#include "QuestDef.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 #include "Unit.h"
@@ -119,14 +123,243 @@ Player* ResolveAuthorizedBot(Player* commander, ObjectGuid::LowType botGuidLow)
 // it directly to their own session, since a bot's own null-socket session can't send it and
 // there's no other recipient involved. Body gets the same "COABOT\t" prefix as an outgoing
 // client message so one client-side CHAT_MSG_ADDON handler covers both directions.
+// Largest reply body that keeps "COABOT\t" + body at or under COABOT_MAX_REPLY_BYTES (250). The
+// 3.3.5 client's addon-whisper path is only safe up to ~255 bytes; a longer line can crash the
+// client before any addon sees it (seen with the 2.2.0 ROSTER line), so nothing longer ever leaves.
+constexpr std::size_t MAX_REPLY_BODY = COABOT_MAX_REPLY_BYTES - PROTOCOL_PREFIX_LEN;
+
 void SendCoaBotReply(Player* recipient, std::string const& body)
 {
+    if (body.size() > MAX_REPLY_BODY)
+    {
+        // Last line of defence: every builder below is sized to fit, so this is a bug worth logging.
+        LOG_ERROR("module.coa-playerbots", "BotAddonChat: reply '{}...' is {} bytes (cap {}); cut to fit.",
+            body.substr(0, 24), body.size() + PROTOCOL_PREFIX_LEN, COABOT_MAX_REPLY_BYTES);
+        SendCoaBotReply(recipient, CoaBotWireText(body, MAX_REPLY_BODY, ""));
+        return;
+    }
     WorldPacket packet;
     ChatHandler::BuildChatPacket(packet, CHAT_MSG_WHISPER, LANG_ADDON, recipient->GetGUID(), recipient->GetGUID(),
         std::string(PROTOCOL_PREFIX) + body, 0, recipient->GetName(), recipient->GetName(), 0, false);
     recipient->SendDirectMessage(&packet);
 }
 
+// Free text (quest titles, objective names) goes last on its reply line so the client can take
+// everything after the fixed fields verbatim, colons included. Pipes and line breaks are swapped
+// for spaces (a stray '|' would start a client escape sequence) and the text is cut on a UTF-8
+// character boundary so the whole body stays under the addon-whisper length cap.
+std::string WireText(std::string const& text, std::size_t maxBytes)
+{
+    return CoaBotWireText(text, maxBytes, "|");
+}
+
+// Room left for the trailing free-text field of a reply whose fixed part is `head`.
+std::size_t WireRoom(std::string const& head)
+{
+    return CoaBotWireRoom(head);
+}
+
+// PROFS:<guid>:<skillId>:<value>:<max>|... -- the first line keeps the old verb (older AltBots
+// read it as the whole list); entries that don't fit go on PROFSMORE lines of the same shape,
+// which newer AltBots merge in. 16 professions fit on one line in practice; paging only kicks in
+// for absurd skill values. PROFALLOWED stays one line (16 ids x <= 4 digits).
+void SendProfessionLists(Player* commander, Player* bot, ObjectGuid::LowType botGuidLow)
+{
+    uint32 catalogCount = 0;
+    BotProgression::ProfessionInfo const* catalog = BotProgression::ProfessionCatalog(catalogCount);
+    std::string allowed;
+    std::vector<std::string> learned;
+    for (uint32 i = 0; i < catalogCount; ++i)
+    {
+        uint32 skillId = catalog[i].skillId;
+        if (!allowed.empty())
+            allowed += ",";
+        allowed += std::to_string(skillId);
+        if (!bot->HasSkill(skillId))
+            continue;
+        learned.push_back(std::to_string(skillId) + ":" +
+            std::to_string(uint32(bot->GetSkillValue(skillId))) + ":" +
+            std::to_string(uint32(bot->GetMaxSkillValue(skillId))));
+    }
+    std::string const guid = std::to_string(botGuidLow);
+    SendCoaBotReply(commander, "PROFALLOWED:" + guid + ":0:" + allowed);
+
+    std::string head = "PROFS:" + guid + ":";
+    std::string body;
+    for (std::string const& entry : learned)
+    {
+        if (!body.empty() && head.size() + body.size() + 1 + entry.size() > MAX_REPLY_BODY)
+        {
+            SendCoaBotReply(commander, head + body);
+            head = "PROFSMORE:" + guid + ":";
+            body.clear();
+        }
+        if (!body.empty())
+            body += "|";
+        body += entry;
+    }
+    SendCoaBotReply(commander, head + body);
+}
+
+// GETQUESTS reply: QUESTHDR, then QUEST + its QOBJ lines per quest-log entry, then QUESTEND.
+void SendBotQuestLog(Player* commander, Player* bot, ObjectGuid::LowType botGuidLow)
+{
+    std::string const guid = std::to_string(botGuidLow);
+
+    std::vector<uint32> questIds;
+    for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+    {
+        uint32 questId = bot->GetQuestSlotQuestId(slot);
+        if (questId && sObjectMgr->GetQuestTemplate(questId))
+            questIds.push_back(questId);
+    }
+
+    SendCoaBotReply(commander, "QUESTHDR:" + guid + ":" + std::to_string(questIds.size()) + ":" +
+        std::to_string(uint32(bot->GetLevel())));
+
+    QuestStatusMap& statusMap = bot->getQuestStatusMap();
+    for (uint32 questId : questIds)
+    {
+        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+        QuestStatus status = bot->GetQuestStatus(questId);
+        uint32 statusCode = 0;
+        if (status == QUEST_STATUS_COMPLETE)
+            statusCode = 1;
+        else if (status == QUEST_STATUS_FAILED)
+            statusCode = 2;
+
+        int32 level = bot->GetQuestLevel(quest);
+        if (level <= 0)
+            level = int32(bot->GetLevel());
+
+        std::string const qid = std::to_string(questId);
+        std::string head = "QUEST:" + guid + ":" + qid + ":" + std::to_string(level) + ":" +
+            std::to_string(statusCode) + ":";
+        SendCoaBotReply(commander, head + WireText(quest->GetTitle(), WireRoom(head)));
+
+        QuestStatusData const* data = nullptr;
+        QuestStatusMap::const_iterator itr = statusMap.find(questId);
+        if (itr != statusMap.end())
+            data = &itr->second;
+
+        auto sendObjective = [&](char type, uint32 id, uint32 have, uint32 need, std::string const& name)
+        {
+            if (have > need)
+                have = need;
+            std::string objHead = "QOBJ:" + guid + ":" + qid + ":" + std::string(1, type) + ":" +
+                std::to_string(id) + ":" + std::to_string(have) + ":" + std::to_string(need) + ":";
+            SendCoaBotReply(commander, objHead + WireText(name, WireRoom(objHead)));
+        };
+
+        // Kill / use-object objectives (>0 creature entry, <0 gameobject entry).
+        for (uint8 i = 0; i < QUEST_OBJECTIVES_COUNT; ++i)
+        {
+            int32 npcOrGo = quest->RequiredNpcOrGo[i];
+            uint32 need = quest->RequiredNpcOrGoCount[i];
+            if (!npcOrGo || !need)
+                continue;
+
+            uint32 have = data ? data->CreatureOrGOCount[i] : 0;
+            std::string name = quest->ObjectiveText[i];
+            char type = 'c';
+            uint32 entry = 0;
+            if (npcOrGo > 0)
+            {
+                entry = uint32(npcOrGo);
+                if (name.empty())
+                    if (CreatureTemplate const* tmpl = sObjectMgr->GetCreatureTemplate(entry))
+                        name = tmpl->Name;
+            }
+            else
+            {
+                type = 'g';
+                entry = uint32(-npcOrGo);
+                if (name.empty())
+                    if (GameObjectTemplate const* tmpl = sObjectMgr->GetGameObjectTemplate(entry))
+                        name = tmpl->name;
+            }
+            if (name.empty())
+                name = std::string(type == 'c' ? "Creature " : "Object ") + std::to_string(entry);
+            sendObjective(type, entry, have, need, name);
+        }
+
+        // Item objectives: what the bot is carrying (bank included), capped at the requirement.
+        for (uint8 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
+        {
+            uint32 itemId = quest->RequiredItemId[i];
+            uint32 need = quest->RequiredItemCount[i];
+            if (!itemId || !need)
+                continue;
+
+            uint32 have = bot->GetItemCount(itemId, true);
+            std::string name;
+            if (ItemTemplate const* tmpl = sObjectMgr->GetItemTemplate(itemId))
+                name = tmpl->Name1;
+            if (name.empty())
+                name = "Item " + std::to_string(itemId);
+            sendObjective('i', itemId, have, need, name);
+        }
+
+        // Player kills (PvP quests).
+        if (uint32 needKills = quest->GetPlayersSlain())
+            sendObjective('p', 0, data ? data->PlayerCount : 0, needKills, "Players slain");
+
+        // Exploration / scripted-event requirement: one done-or-not line.
+        if (quest->HasSpecialFlag(QUEST_SPECIAL_FLAGS_EXPLORATION_OR_EVENT))
+        {
+            std::string name;
+            for (uint8 i = 0; i < QUEST_OBJECTIVES_COUNT && name.empty(); ++i)
+                if (!quest->RequiredNpcOrGo[i] && !quest->ObjectiveText[i].empty())
+                    name = quest->ObjectiveText[i];
+            if (name.empty())
+                name = "Explore or complete the event";
+            bool done = (data && data->Explored) || statusCode == 1;
+            sendObjective('e', 0, done ? 1 : 0, 1, name);
+        }
+    }
+
+    SendCoaBotReply(commander, "QUESTEND:" + guid + ":" + std::to_string(questIds.size()));
+}
+
+void HandleCoaBotMessage(Player* commander, std::string const& body);
+}
+
+std::string CoaBotWireText(std::string const& text, std::size_t maxBytes, char const* bad)
+{
+    std::string out;
+    out.reserve(text.size() < maxBytes ? text.size() : maxBytes);
+    for (char c : text)
+    {
+        bool replace = c == '\n' || c == '\r' || c == '\0';
+        for (char const* b = bad; b && *b && !replace; ++b)
+            replace = (c == *b);
+        out += replace ? ' ' : c;
+    }
+    if (out.size() > maxBytes)
+    {
+        // Cut on a UTF-8 character boundary (never in the middle of a multi-byte name).
+        std::size_t cut = maxBytes;
+        while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80)
+            --cut;
+        out.resize(cut);
+    }
+    return out;
+}
+
+std::size_t CoaBotWireRoom(std::string const& head)
+{
+    std::size_t const maxBody = COABOT_MAX_REPLY_BYTES - (sizeof("COABOT\t") - 1);
+    return head.size() >= maxBody ? 0 : maxBody - head.size();
+}
+
+void CoaBotSendAddonReply(Player* recipient, std::string const& body)
+{
+    if (recipient && recipient->GetSession())
+        SendCoaBotReply(recipient, body);
+}
+
+namespace
+{
 void HandleCoaBotMessage(Player* commander, std::string const& body)
 {
     std::vector<std::string> parts = SplitColon(body);
@@ -304,6 +537,40 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
         return;
     }
 
+    // Task Board order management. These name a guild bot (or a queue id), not a grouped one, so
+    // they sit before the grouped-bot authorization gate below; BotMgr checks instead that the
+    // sender is in that guild and is a guild master/officer or the player who placed the order.
+    //   CANCELORDER:<botGuidLow>     -> ORDERRESULT:cancel:<botGuidLow>:<ok|denied|none>
+    //   PRIORITIZEORDER:<botGuidLow> -> ORDERRESULT:top:<botGuidLow>:<ok|denied|none|offline|busy|failed>
+    //   CANCELQUEUED:<queueId>       -> ORDERRESULT:cancelqueued:<queueId>:<ok|denied|none>
+    //   TOPQUEUED:<queueId>          -> ORDERRESULT:topqueued:<queueId>:<ok|denied|none>
+    if (verb == "CANCELORDER" || verb == "PRIORITIZEORDER" || verb == "CANCELQUEUED" || verb == "TOPQUEUED")
+    {
+        uint32 id = std::strtoul(parts[1].c_str(), nullptr, 10);
+        std::string result = "none";
+        char const* kind = "cancel";
+        if (verb == "CANCELORDER")
+            result = sBotMgr->CancelGatherOrder(commander, id);
+        else if (verb == "PRIORITIZEORDER")
+        {
+            kind = "top";
+            result = sBotMgr->PrioritizeGatherOrder(commander, id);
+        }
+        else if (verb == "CANCELQUEUED")
+        {
+            kind = "cancelqueued";
+            result = sBotMgr->CancelQueuedGatherOrder(commander, id);
+        }
+        else
+        {
+            kind = "topqueued";
+            result = sBotMgr->TopQueuedGatherOrder(commander, id);
+        }
+        LOG_INFO("module.coa-playerbots", "BotAddonChat: '{}' -> {} {} = {}.", commander->GetName(), verb, id, result);
+        SendCoaBotReply(commander, std::string("ORDERRESULT:") + kind + ":" + std::to_string(id) + ":" + result);
+        return;
+    }
+
     // GOLDORDER: ask a free guild-mate bot to earn that many gold for the guild bank (0 cancels the
     // guild's gold orders). Guild master or officers only, checked in BotEconomy::PlaceGoldOrder.
     if (verb == "GOLDORDER" && parts.size() >= 2)
@@ -406,6 +673,46 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
     }
     else if (verb == "STOPATTACK")
         BotAI::StopAttack(bot->GetGUID());
+    else if (verb == "FARM")
+    {
+        // FARM:<botGuidLow>[:<radius>] -- the creature type is whatever the commanding player has
+        // selected, resolved server-side exactly like PULL. Replies with the GETFARM shape.
+        Unit* target = commander->GetSelectedUnit();
+        Creature* creature = target ? target->ToCreature() : nullptr;
+        if (creature && creature->GetMap() == bot->GetMap())
+        {
+            float radius = parts.size() >= 3 ? float(std::strtod(parts[2].c_str(), nullptr)) : 40.0f;
+            if (radius <= 0.0f)
+                radius = 40.0f;
+            BotAI::StartFarm(bot, creature->GetEntry(), radius);
+        }
+        uint32 entry = 0, mapId = 0;
+        float radius = 0.0f;
+        BotAI::GetFarm(bot->GetGUID(), entry, radius, mapId);
+        SendCoaBotReply(commander, "FARM:" + std::to_string(botGuidLow) + ":" + std::to_string(entry) + ":" + std::to_string(uint32(radius)));
+    }
+    else if (verb == "FARMSTOP")
+    {
+        BotAI::StopFarm(bot->GetGUID());
+        SendCoaBotReply(commander, "FARM:" + std::to_string(botGuidLow) + ":0:0");
+    }
+    else if (verb == "GETFARM")
+    {
+        uint32 entry = 0, mapId = 0;
+        float radius = 0.0f;
+        BotAI::GetFarm(bot->GetGUID(), entry, radius, mapId);
+        SendCoaBotReply(commander, "FARM:" + std::to_string(botGuidLow) + ":" + std::to_string(entry) + ":" + std::to_string(uint32(radius)));
+    }
+    else if (verb == "INVENTORY")
+    {
+        // INVENTORY:<botGuidLow> -- sell junk to a vendor within 20 yards. Never destroys
+        // items in the field. Replies INVENTORY:<guid>:<copper>:<sold>:<destroyed>.
+        BotAI::InventorySweepResult const result = BotAI::SweepInventory(bot, true, false);
+        SendCoaBotReply(commander, "INVENTORY:" + std::to_string(botGuidLow) + ":" +
+            std::to_string(result.copperEarned) + ":" + std::to_string(result.stacksSold) + ":" +
+            std::to_string(result.stacksDestroyed));
+        ChatHandler(commander->GetSession()).SendSysMessage(BotAI::DescribeInventorySweep(bot, result));
+    }
     else if (verb == "SETROLE" && parts.size() >= 3)
         sBotMgr->SetRole(botGuidLow, parts[2], nullptr);
     else if (verb == "LEARNSPEC" && parts.size() >= 3)
@@ -436,16 +743,18 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
 
         uint32 currentSpecId = bot->GetPlayerSetting("core.ascension_active_spec", 0).value;
         char const* currentSpecName = BotAI::GetSpecName(bot->getClass(), currentSpecId);
-        SendCoaBotReply(commander, "ROLES:" + std::to_string(botGuidLow) + ":" + roles + ":" + currentRoleStr + ":" +
-            std::to_string(currentSpecId) + ":" + (currentSpecName ? currentSpecName : ""));
+        std::string rolesHead = "ROLES:" + std::to_string(botGuidLow) + ":" + roles + ":" + currentRoleStr + ":" +
+            std::to_string(currentSpecId) + ":";
+        SendCoaBotReply(commander, rolesHead + WireText(currentSpecName ? currentSpecName : "", WireRoom(rolesHead)));
     }
     else if (verb == "GETSPECS")
     {
         static char const* const ROLE_NAMES[] = { "dps", "tank", "healer", "support" };
         for (BotAI::SpecInfo const& spec : BotAI::GetAllSpecs(bot->getClass()))
         {
-            SendCoaBotReply(commander, "SPEC:" + std::to_string(botGuidLow) + ":" + std::to_string(spec.specId) + ":" +
-                ROLE_NAMES[uint32(spec.role)] + ":" + spec.name);
+            std::string specHead = "SPEC:" + std::to_string(botGuidLow) + ":" + std::to_string(spec.specId) + ":" +
+                ROLE_NAMES[uint32(spec.role)] + ":";
+            SendCoaBotReply(commander, specHead + WireText(spec.name ? spec.name : "", WireRoom(specHead)));
         }
     }
     else if (verb == "SETGEARPREF" && parts.size() >= 4)
@@ -503,6 +812,158 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
 
         SendCoaBotReply(commander, "GEARPREFS:" + std::to_string(botGuidLow) + ":" + legalArmor + ":" + legalWeapon +
             ":" + armorPrefName + ":" + weaponPrefName);
+        SendCoaBotReply(commander, "GEARLOCKS:" + std::to_string(botGuidLow) + ":" +
+            std::to_string(BotAI::GetLockedEquipMask(bot->GetGUID())));
+    }
+    else if (verb == "GETBAGS")
+    {
+        // GETBAGS:<botGuidLow> -- occupied backpack and bag slots only, no item names (the
+        // client resolves those with GetItemInfo). Replies are paged so each body stays under
+        // the 255-character addon-whisper limit. Shape:
+        //   BAGMETA:<guid>:<backpackSlots>:<bag19>:<bag20>:<bag21>:<bag22>
+        //   BAGS:<guid>:<page>:<pages>:<bag>:<slot>:<itemId>:<count>|...
+        //   BAGSEND:<guid>:<itemCount>
+        uint8 backpackSlots = 0;
+        uint8 bagSizes[4] = {};
+        BotAI::CollectBagSizes(bot, backpackSlots, bagSizes);
+        SendCoaBotReply(commander, "BAGMETA:" + std::to_string(botGuidLow) + ":" +
+            std::to_string(uint32(backpackSlots)) + ":" +
+            std::to_string(uint32(bagSizes[0])) + ":" + std::to_string(uint32(bagSizes[1])) + ":" +
+            std::to_string(uint32(bagSizes[2])) + ":" + std::to_string(uint32(bagSizes[3])));
+
+        std::vector<BotAI::BagSlotInfo> items;
+        BotAI::CollectBagSlots(bot, items);
+
+        // "COABOT\t" is prepended by SendCoaBotReply, so keep the verb body comfortably
+        // under 255. A single item chunk is at most "255:38:4294967295:4294967295|" (34).
+        constexpr std::size_t MAX_BODY = 220;
+        std::string const prefix = "BAGS:" + std::to_string(botGuidLow) + ":";
+        std::vector<std::string> pages;
+        std::string page;
+        for (BotAI::BagSlotInfo const& info : items)
+        {
+            std::string chunk = std::to_string(uint32(info.bag)) + ":" + std::to_string(uint32(info.slot)) + ":" +
+                std::to_string(info.entry) + ":" + std::to_string(info.count) + "|";
+            // Reserve room for the prefix plus "99:99:" page numbers.
+            if (!page.empty() && prefix.size() + 6 + page.size() + chunk.size() > MAX_BODY)
+            {
+                pages.push_back(page);
+                page.clear();
+            }
+            page += chunk;
+        }
+        if (!page.empty() || pages.empty())
+            pages.push_back(page);
+
+        uint32 const pageCount = uint32(pages.size());
+        for (uint32 i = 0; i < pageCount; ++i)
+        {
+            // Skip a completely empty first page when there were no items -- BAGSEND still fires.
+            if (pages[i].empty() && items.empty())
+                continue;
+            SendCoaBotReply(commander, prefix + std::to_string(i + 1) + ":" + std::to_string(pageCount) + ":" + pages[i]);
+        }
+        SendCoaBotReply(commander, "BAGSEND:" + std::to_string(botGuidLow) + ":" + std::to_string(items.size()));
+    }
+    else if (verb == "EQUIP" && parts.size() >= 4)
+    {
+        // EQUIP:<botGuidLow>:<bag>:<slot> -- bag 255 is the backpack, 19-22 an equipped bag.
+        uint8 bag = uint8(std::strtoul(parts[2].c_str(), nullptr, 10));
+        uint8 slot = uint8(std::strtoul(parts[3].c_str(), nullptr, 10));
+        BotAI::GearActionResult result = BotAI::EquipBagItem(bot, bag, slot);
+        char const* token = BotAI::GearActionToken(result);
+        SendCoaBotReply(commander, std::string("EQUIPRESULT:") + std::to_string(botGuidLow) + ":" +
+            (result == BotAI::GearActionResult::Ok ? "ok:" : "err:") + token);
+    }
+    else if (verb == "UNEQUIP" && parts.size() >= 3)
+    {
+        // UNEQUIP:<botGuidLow>:<equipSlot> -- moves the piece into bags if there is room and
+        // locks the emptied slot so auto-upgrade does not immediately refill it.
+        uint8 equipSlot = uint8(std::strtoul(parts[2].c_str(), nullptr, 10));
+        BotAI::GearActionResult result = BotAI::UnequipToBags(bot, equipSlot);
+        char const* token = BotAI::GearActionToken(result);
+        SendCoaBotReply(commander, std::string("UNEQUIPRESULT:") + std::to_string(botGuidLow) + ":" +
+            (result == BotAI::GearActionResult::Ok ? "ok:" : "err:") + token);
+    }
+    else if (verb == "UNLOCK" && parts.size() >= 3)
+    {
+        // UNLOCK:<botGuidLow>:<slot|all> -- clears a manual equipment lock so TryUpgradeGearOnce
+        // may fill or replace that slot again. "all" clears every lock on this bot.
+        if (parts[2] == "all")
+            BotAI::UnlockAllEquipSlots(bot->GetGUID());
+        else
+            BotAI::UnlockEquipSlot(bot->GetGUID(), uint8(std::strtoul(parts[2].c_str(), nullptr, 10)));
+        SendCoaBotReply(commander, "UNLOCKRESULT:" + std::to_string(botGuidLow) + ":ok:ok");
+        SendCoaBotReply(commander, "GEARLOCKS:" + std::to_string(botGuidLow) + ":" +
+            std::to_string(BotAI::GetLockedEquipMask(bot->GetGUID())));
+    }
+    else if (verb == "GETQUESTS")
+    {
+        // GETQUESTS:<botGuidLow> -- the bot's quest log with objective progress:
+        //   QUESTHDR:<guid>:<questCount>:<botLevel>
+        //   QUEST:<guid>:<questId>:<level>:<status 0 in progress|1 complete|2 failed>:<title>
+        //   QOBJ:<guid>:<questId>:<c|g|i|p|e>:<entry>:<have>:<need>:<name>
+        //   QUESTEND:<guid>:<questCount>
+        SendBotQuestLog(commander, bot, botGuidLow);
+    }
+    else if (verb == "GETPROFS")
+    {
+        // GETPROFS:<botGuidLow>
+        //   PROFALLOWED:<guid>:<limit>:<skillId>,...   limit 0 = CoA's uncapped list
+        //   PROFS:<guid>:<skillId>:<value>:<max>|...   (PROFSMORE:<guid>:... if it would not fit)
+        SendProfessionLists(commander, bot, botGuidLow);
+    }
+    else if (verb == "SETPROF" && parts.size() >= 3)
+    {
+        // SETPROF:<botGuidLow>:<skillId>              learn
+        // SETPROF:<botGuidLow>:none:<skillId>         unlearn (wipes the skill)
+        // SETPROF:<botGuidLow>:<skillId>:0            unlearn (alternate)
+        // SETPROF:<botGuidLow>:<1|2>:<skillId|none>   same learn/unlearn; the slot is ignored
+        //                                             because CoA does not cap primary professions.
+        bool unlearn = false;
+        uint32 skillId = 0;
+        if (parts[2] == "none")
+        {
+            unlearn = true;
+            if (parts.size() >= 4)
+                skillId = uint32(std::strtoul(parts[3].c_str(), nullptr, 10));
+        }
+        else if (parts.size() >= 4 && (parts[2] == "1" || parts[2] == "2"))
+        {
+            if (parts[3] == "none")
+                unlearn = true; // no slot-to-skill mapping; treat as invalid unless a third id follows
+            else
+                skillId = uint32(std::strtoul(parts[3].c_str(), nullptr, 10));
+        }
+        else
+        {
+            skillId = uint32(std::strtoul(parts[2].c_str(), nullptr, 10));
+            if (parts.size() >= 4 && parts[3] == "0")
+                unlearn = true;
+        }
+
+        char const* token = "invalid";
+        if (unlearn && !skillId)
+            token = "invalid";
+        else if (unlearn)
+            token = BotProgression::UnlearnProfession(bot, skillId);
+        else
+            token = BotProgression::LearnProfession(bot, skillId);
+
+        bool ok = token && std::string(token) == "ok";
+        // A player chose this set by hand; login auto-reroll must not overwrite it.
+        if (ok)
+            BotProgression::MarkProfessionsManual(bot);
+        // PROFRESULT:<guid>:<ok|err>:<token>:<skillId>:<learn|unlearn>:<value>:<max>
+        // (the last three are new; older addons read only the first five fields).
+        SendCoaBotReply(commander, std::string("PROFRESULT:") + std::to_string(botGuidLow) + ":" +
+            (ok ? "ok:" : "err:") + (token ? token : "invalid") + ":" + std::to_string(skillId) + ":" +
+            (unlearn ? "unlearn" : "learn") + ":" + std::to_string(uint32(bot->GetSkillValue(skillId))) + ":" +
+            std::to_string(uint32(bot->GetMaxSkillValue(skillId))));
+        LOG_INFO("module.coa-playerbots", "BotAddonChat: '{}' -> SETPROF bot '{}' {} skill {} = {}.",
+            commander->GetName(), bot->GetName(), unlearn ? "unlearn" : "learn", skillId, token ? token : "invalid");
+        // Refresh the addon list after every attempt, so the buttons always show the bot's real state.
+        SendProfessionLists(commander, bot, botGuidLow);
     }
 }
 

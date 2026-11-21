@@ -45,7 +45,7 @@ ObjectGuid::LowType CreateOneRandomBot(uint8 race, ChatHandler* handler = nullpt
 // `.botcmd spawnleveled [count]` -- same gradual-queue mechanism as SpawnRandomBots, but each
 // bot gets a random level (weighted mostly 1-10, tapering off toward 80 -- see
 // RollWeightedLevel in the .cpp) instead of always 80, plus a level-bracketed gear pass,
-// every profession this realm allows, starting bags, and basic food/water. Clamped to twice
+// a two-primary profession set, starting bags, and basic food/water. Clamped to twice
 // CoaBots.RandomSpawn.MaxCount (this path is meant for bigger population batches, 1000-1500).
 void SpawnLeveledBots(uint32 requestedCount, ChatHandler* handler);
 
@@ -61,9 +61,11 @@ uint32 CancelPendingSpawns();
 void ResetAccountLookupCache();
 
 // `.botcmd professiontrainer [charLowGuid]` -- grants every profession this realm allows to one
-// online bot (or every online bot, if omitted) at its current level's skill cap. Standalone from
-// ApplyFreshBotSetup so it can backfill a bot that never went through that path (this project's
-// original hand-made test characters predate it and have zero profession skills).
+// online bot (or every online bot, if omitted) at its current level's skill cap, with trainer
+// rank spells and the Woodcutting/Woodworking 300 ceiling. Marks the bot manual so login
+// auto-reroll will not replace the set. Standalone from ApplyFreshBotSetup so it can backfill
+// a bot that never went through that path (this project's original hand-made test characters
+// predate it and have zero profession skills).
 void RepairGear(Player* bot);
 
 // True when the bot's equipment does not suit it: an empty armor or main-hand slot, a piece that needs a higher level,

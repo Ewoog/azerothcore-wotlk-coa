@@ -279,6 +279,239 @@ CoaBots.AI.IdleIntervalMs = 250
 CoaBots.Trade.Enable = 1
 
 #
+# INVENTORY
+#
+#    CoaBots.Inventory.SellWhenNearVendor
+#        Description: When a bot is grouped with a real player and a vendor is within 20 yards,
+#                     sell grey junk and outgrown white/green gear even if the bags are not nearly
+#                     full. Solo bots still wait until they have two free slots or fewer. 0 keeps
+#                     the old "only when nearly full" gate for grouped bots too.
+#        Default:     1
+#
+#    CoaBots.Inventory.SellOnLeaderVendor
+#        Description: When a real player in the group opens a vendor (or gossip on a vendor NPC),
+#                     grouped bots within 20 yards of that vendor sell their junk. 0 turns the hook
+#                     off; SellWhenNearVendor still applies on the regular 10-second scan.
+#        Default:     1
+#
+#    CoaBots.Inventory.KeepQuality
+#        Description: Gear of this quality or better (3 = rare/blue) is not sold as "outgrown"
+#                     unless the bot has FreeSlotTarget free general bag slots or fewer. Greys
+#                     are always sold. 0 = Poor, 1 = Common, 2 = Uncommon, 3 = Rare, 4 = Epic.
+#        Default:     3
+#
+#    CoaBots.Inventory.CleanupEnable
+#        Description: Bots keep free bag space without the economy module. When general-purpose
+#                     bag slots drop below FreeSlotTarget, they sell grey junk, outgrown gear,
+#                     leftover quest items, excess trade goods and unused consumables (and
+#                     destroy unsellable leftover quest items and greys if no vendor is nearby).
+#                     Ungrouped bots travel to a vendor when their bags are nearly full (the
+#                     same trip also repairs and restocks ammo). Grouped bots sell when you
+#                     open a vendor. 0 turns this off.
+#        Default:     1
+#
+#    CoaBots.Inventory.FreeSlotTarget
+#        Description: Start cleanup (and a sell trip, for ungrouped bots) when the backpack and
+#                     general-purpose bags have fewer free slots than this. Quiver and
+#                     profession-bag slots are not counted.
+#        Default:     4
+#
+#    CoaBots.Inventory.TradeGoodsKeep
+#        Description: How many of each trade-good item a bot keeps. Anything above this is sold
+#                     when bags are nearly full. Materials for an active gather order, and items
+#                     on the economy protect list, are never sold.
+#        Default:     20
+#
+#    CoaBots.Inventory.EnsureBags
+#        Description: Fill empty bag slots with a level-appropriate general-purpose bag, and
+#                     replace a smaller equipped bag with a larger granted one: Small Brown
+#                     Pouch (6) under 10, Brown Leather Satchel (8) at 10, Heavy Brown Bag (10)
+#                     at 20, Mageweave Bag (12) at 35, Runecloth Bag (14) at 50, Netherweave
+#                     Bag (16) at 60. These item ids are in the CoA item_template. 0 turns this
+#                     off.
+#        Default:     1
+#
+#    CoaBots.Inventory.BuyBags
+#        Description: When a bot is at a vendor (you opened one, or an ungrouped bot arrived
+#                     on a sell/repair/ammo trip), buy a larger general-purpose bag that vendor
+#                     sells if the bot can afford it after BagBuyReserveCopper. 0 turns this off.
+#        Default:     1
+#
+#    CoaBots.Inventory.BagBuyReserveCopper
+#        Description: Copper the bot will not spend when buying a bag (10000 = 1 gold).
+#        Default:     10000
+#
+
+CoaBots.Inventory.SellWhenNearVendor = 1
+CoaBots.Inventory.SellOnLeaderVendor = 1
+CoaBots.Inventory.KeepQuality = 3
+CoaBots.Inventory.CleanupEnable = 1
+CoaBots.Inventory.FreeSlotTarget = 4
+CoaBots.Inventory.TradeGoodsKeep = 20
+CoaBots.Inventory.EnsureBags = 1
+CoaBots.Inventory.BuyBags = 1
+CoaBots.Inventory.BagBuyReserveCopper = 10000
+
+#
+# REPAIR AND AMMO
+#
+#    CoaBots.Maintenance.RepairOnLeaderVendor
+#        Description: When a real player in the group talks to a repair-capable NPC, grouped bots
+#                     on the same map and within ShareRange repair all of their damaged gear with
+#                     their own gold (what they cannot afford is left, and custom items whose
+#                     repair cost cannot be looked up are still mended). 0 turns this off.
+#        Default:     1
+#
+#    CoaBots.Maintenance.BuyAmmoOnLeaderVendor
+#        Description: When a real player in the group opens a vendor that sells arrows or bullets,
+#                     grouped bots on the same map and within ShareRange who have a bow, gun, or
+#                     crossbow equipped buy the best ammo that vendor sells which they can use,
+#                     up to AmmoFill, and equip it. 0 turns this off.
+#        Default:     1
+#
+#    CoaBots.Maintenance.ShareRange
+#        Description: How far a grouped bot may be from the commander (same map) to repair or
+#                     restock when the commander opens a repairer or ammo vendor, in yards.
+#        Default:     80
+#
+#    CoaBots.Maintenance.AutoTravel
+#        Description: Ungrouped bots (including alts working a gather order, and random world
+#                     bots) travel to the nearest same-map, same-faction repairer when their
+#                     gear is worn, or to a vendor that sells the right ammo when their quiver
+#                     is low. The trip pauses a gather order and the order resumes afterwards.
+#                     0 leaves only the opportunistic "already standing next to the NPC" path.
+#        Default:     1
+#
+#    CoaBots.Maintenance.TravelSearchYards
+#        Description: How far an ungrouped bot looks for a repairer or ammo vendor when AutoTravel
+#                     is on, in yards. The search stays on the bot's current map.
+#        Default:     30000
+#
+#    CoaBots.Maintenance.NearbyServiceYards
+#        Description: Once the bot has arrived, how far it will look for a live repairer or ammo
+#                     vendor around the destination, in yards.
+#        Default:     80
+#
+#    CoaBots.Maintenance.RepairItemPct
+#        Description: Start a repair trip (or opportunistic repair) when any equipped piece is
+#                     below this percent of its maximum durability.
+#        Default:     30
+#
+#    CoaBots.Maintenance.RepairAveragePct
+#        Description: Also start a repair trip when the average durability of all equipped pieces
+#                     that have durability is below this percent, even if no single piece is
+#                     under RepairItemPct.
+#        Default:     50
+#
+#    CoaBots.Maintenance.AmmoLow
+#        Description: Start an ammo trip when a bot with a bow, gun, or crossbow has fewer than
+#                     this many matching arrows or bullets in its bags and quiver.
+#        Default:     200
+#
+#    CoaBots.Maintenance.AmmoFill
+#        Description: Buy enough ammo to reach this count when restocking (at a vendor the
+#                     commander opened, after a trip, or when already standing next to one).
+#        Default:     1000
+#
+
+CoaBots.Maintenance.RepairOnLeaderVendor = 1
+CoaBots.Maintenance.BuyAmmoOnLeaderVendor = 1
+CoaBots.Maintenance.ShareRange = 80
+CoaBots.Maintenance.AutoTravel = 1
+CoaBots.Maintenance.TravelSearchYards = 30000
+CoaBots.Maintenance.NearbyServiceYards = 80
+CoaBots.Maintenance.RepairItemPct = 30
+CoaBots.Maintenance.RepairAveragePct = 50
+CoaBots.Maintenance.AmmoLow = 200
+CoaBots.Maintenance.AmmoFill = 1000
+
+
+#
+# QUEST SHARING
+#
+#    CoaBots.Quest.ShareTurnIn
+#        Description: When a real player in a group turns in a quest, grouped bots within 40 yards
+#                     that also have that quest complete hand it in too. They get the XP and gold
+#                     and pick the reward item that is the best upgrade for them (the same scoring
+#                     used when a solo bot turns a quest in). A bot that is missing required items,
+#                     or cannot take the reward yet, is skipped. 0 turns this off.
+#        Default:     1
+#
+#    CoaBots.Quest.ShareAccept
+#        Description: When a real player in a group accepts a quest, grouped bots within 40 yards
+#                     also take it if they can (level, race, class, prerequisites, quest log room).
+#                     Kill credit is already shared by the group; item-objective drops are not,
+#                     so a bot still has to loot those itself. 0 turns this off.
+#        Default:     1
+#
+
+CoaBots.Quest.ShareTurnIn = 1
+CoaBots.Quest.ShareAccept = 1
+
+#
+# GATHERING WHILE FOLLOWING
+#
+#    CoaBots.Gather.WhileFollowing
+#        Description: When a bot is following a real player, it will opportunistically gather
+#                     herbalism and mining nodes it passes if it has the matching profession
+#                     and enough skill for the node (the same lock/skill check a player uses).
+#                     The bot must be out of combat, nobody in the group may be in combat, the
+#                     leader must be within 40 yards, and the bot must have bag space. It walks
+#                     to the node, casts the real gather spell (skill-ups apply normally), loots,
+#                     then resumes following. Farm mode skips this so a farm order is not
+#                     interrupted. Chests, lockboxes and skinnable corpses are not gathered.
+#                     0 turns this off.
+#        Default:     1
+#
+#    CoaBots.Gather.FollowRadius
+#        Description: How close a node must be (yards) for a following bot to notice it.
+#                     Clamped to 5-40.
+#        Default:     20
+#
+
+CoaBots.Gather.WhileFollowing = 1
+CoaBots.Gather.FollowRadius = 20
+
+#
+#    CoaBots.Prof.StartSkill
+#        Starting skill value when the addon teaches a bot a profession (SETPROF).
+#        0 (default) is level-based: the value is set to the level cap (level * 6,
+#        max 450) so gathering and crafting of that tier work immediately.
+#        Any other number is used as the starting value, clamped between 1 and the cap.
+#        Unlearning a profession always wipes its skill and trainer rank spells.
+#
+CoaBots.Prof.StartSkill = 0
+
+#
+#    CoaBots.Professions.TwoPrimary
+#        Description: Fresh random bots (and a legacy reroll) receive two primary professions
+#                     plus Cooking, First Aid and Fishing, instead of every profession this
+#                     realm allows. The pair is weighted and class-biased but seeded by the
+#                     character guid, so it does not change on login. SETPROF on a companion
+#                     and a player's own account alts are not limited. 0 restores the old
+#                     grant-every-profession behaviour.
+#        Default:     1
+#
+#    CoaBots.Professions.GrantSecondaries
+#        Description: Also teach Cooking, First Aid and Fishing when assigning a random bot's
+#                     professions. 0 leaves secondaries untouched.
+#        Default:     1
+#
+#    CoaBots.Professions.RerollLegacy
+#        Description: On login, a bot-account bot that still has the old all-profession set
+#                     (ten or more primary professions) is assigned a varied pair once.
+#                     Bots marked manual (SETPROF or `.botcmd professiontrainer`) and
+#                     characters on a player's own account are left alone.
+#                     `.botcmd reroll professions all` / `.botcmd reroll professions <name>`
+#                     does the same on demand; `.botcmd profstats` shows the spread.
+#        Default:     1
+#
+
+CoaBots.Professions.TwoPrimary = 1
+CoaBots.Professions.GrantSecondaries = 1
+CoaBots.Professions.RerollLegacy = 1
+
+#
 #    CoaBots.MarkSessionsAsBots
 #        Description: Mark companion sessions as bots, so the server skips per-client work they have no client for
 #                     (login queries, view refreshes, reward trackers) and bots are left out of /who (see

@@ -17,6 +17,7 @@
 #include "Player.h"
 #include "SpellMgr.h"
 #include <algorithm>
+#include <boost/bind/placeholders.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <filesystem>
@@ -251,7 +252,7 @@ std::string DescribeBuildPicks(Player* bot)
         }
         std::string error;
         if (!AscensionClassServiceBridge::SetTalentRank(bot, *entry, pick.rank, error))
-            out += "level " + std::to_string(pick.level) + " entry " + std::to_string(pick.entryId) + " rank " + std::to_string(pick.rank) + ": " + error + "\n";
+            out += "level " + std::to_string(pick.level) + " entry " + std::to_string(pick.entryId) + " rank " + std::to_string(pick.rank) + ": " + error + "\n";
     }
     return out;
 }

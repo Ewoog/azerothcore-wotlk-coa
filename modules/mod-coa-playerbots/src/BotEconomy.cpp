@@ -1169,8 +1169,7 @@ namespace BotEconomy
                 if (auto l = limitsIt->second.find(entry); l != limitsIt->second.end())
                     limit = l->second;
             std::string name;
-            for (char c : proto->Name1)
-                name.push_back(c == ':' || c == '|' || c == ',' ? ' ' : c);
+            name = CoaBotWireText(proto->Name1, 100, ":|,"); // one row can never outgrow a STOCK line
             rows.push_back({ entry, count, limit, name });
         }
         std::sort(rows.begin(), rows.end(), [](Row const& x, Row const& y) { return x.name < y.name; });
@@ -1661,5 +1660,43 @@ namespace BotEconomy
         }
 
         handler->SendSysMessage("Usage: .botcmd economy [status | trips | goldorder <player guid> <gold> | stock <player guid> | stocklimit <player guid> <item> <keep, -1 clears> | plan <bot guid> | journal [n] | protect <item id> | unprotect <item id>]");
+    }
+
+    bool IsProtectedItem(uint32 itemEntry)
+    {
+        return g_protected.count(itemEntry) != 0;
+    }
+
+    bool IsLive()
+    {
+        return g_settings.enable && !g_settings.dryRun;
+    }
+
+    bool HasSaleTrip(Player const* bot)
+    {
+        if (!bot || !IsLive())
+            return false;
+        ObjectGuid const guid = bot->GetGUID();
+        return g_trips.count(guid) || g_wantsTrip.count(guid);
+    }
+
+    uint32 MoneyReserveCopper()
+    {
+        return g_settings.moneyReserveCopper;
+    }
+
+    void RecordCleanupVendorSale(Player* bot, uint32 itemEntry, uint32 count, uint32 unitCopper, char const* reason)
+    {
+        if (!bot || !g_settings.enable || !count)
+            return;
+        EnsureTables();
+        Line line;
+        line.entry = itemEntry;
+        line.count = count;
+        line.reason = reason && reason[0] ? reason : "bag-cleanup";
+        line.verdict = Verdict::Vendor;
+        line.unitCopper = unitCopper;
+        line.priceSource = "bag-cleanup";
+        JournalDone(bot, line, count, unitCopper, "vendor", "bag-cleanup");
     }
 }

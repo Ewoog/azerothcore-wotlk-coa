@@ -540,6 +540,12 @@ namespace BotZoneProgression
         if (bot->GetGroup())
             return false;
 
+        // A bot working a guild gather/craft order stays where the order sent it: a level-up (or a
+        // login into a zone "wrong" for its level, e.g. a level 60 sent for Copper Ore) used to
+        // relocate it away from its spot, and the order then had to walk all the way back.
+        if (!force && (sBotMgr->GetGuildGatherOrder(bot->GetGUID()) || sBotMgr->GetCraftOrder(bot->GetGUID())))
+            return false;
+
         // Do not stack teleports if already mid-teleport
         if (bot->IsBeingTeleportedNear() || bot->IsBeingTeleportedFar())
             return false;

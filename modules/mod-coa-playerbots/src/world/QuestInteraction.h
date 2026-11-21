@@ -70,6 +70,21 @@ namespace QuestInteraction
 
     // The time budget of an NPC task's current phase, as UpdateNpcTask enforces it (0: none).
     uint32 PhaseBudgetMs(BrainState const& state);
+
+    // A real player in a group accepted or turned in a quest. Nearby grouped bots (40 yards)
+    // take or hand in the same quest when CoaBots.Quest.ShareAccept / ShareTurnIn is on.
+    // Turn-in uses PickRewardIndex, CanRewardQuest and RewardQuest; accept uses CanTakeQuest,
+    // CanAddQuest and AddQuestAndCheckCompletion. Bots as the source are ignored so a bot's
+    // own turn-in cannot recurse or reward the player a second time.
+    // Turn-in reaches every grouped bot within 80 yards of the player on the same map (no 5-yard
+    // NPC range: RewardQuest is called directly) and tells the player in chat who turned in
+    // what, or why not (too far, dead, not finished, bags full).
+    void OnCompanionLeaderAccepted(Player* player, Quest const* quest, Object* giver);
+    void OnCompanionLeaderTurnedIn(Player* player, Quest const* quest, Object* giver);
+
+    // A real player opened a quest giver (creature or gameobject). Grouped bots hand in every
+    // finished quest that giver ends, including ones the player already turned in earlier.
+    void OnCompanionLeaderTalkedTo(Player* player, Object* giver);
 }
 
 #endif // COA_PLAYERBOTS_QUEST_INTERACTION_H

@@ -1,6 +1,8 @@
 #include "engine/BotDebugLog.h"
 #include "BotWorldBehavior.h"
 #include "BotAI.h"
+#include "BotMaintenance.h"
+#include "BotMgr.h"
 #include "BotMovement.h"
 #include "BotTaxi.h"
 #include "BotZoneProgression.h"
@@ -29,6 +31,7 @@ namespace
         None,
         Repair,
         Vendor,
+        Ammo,
         Errand,
         GatherArea,
         GrindArea,
@@ -125,7 +128,9 @@ namespace
         float arriveRadius = 4.0f;
         PoiKind poiKind = PoiKind::Count;
         uint32 poiSpawnId = 0;
+        uint32 poiEntry = 0;
         uint32 lastPoiSpawnId = 0;
+        WorldIntent pendingAfterTravel = WorldIntent::None;
         float poiX = 0.0f;
         float poiY = 0.0f;
         uint32 deadlineMs = 0;
@@ -187,6 +192,7 @@ namespace
         {
             case WorldIntent::Repair:     return "Repair";
             case WorldIntent::Vendor:     return "Vendor";
+            case WorldIntent::Ammo:       return "Ammo";
             case WorldIntent::Errand:     return "Errand";
             case WorldIntent::GatherArea: return "GatherArea";
             case WorldIntent::GrindArea:  return "GrindArea";
@@ -334,6 +340,7 @@ namespace
 
         state.poiKind = poi.kind;
         state.poiSpawnId = poi.spawnId;
+        state.poiEntry = poi.entry;
         state.poiX = poi.x;
         state.poiY = poi.y;
         state.lingerMs = lingerMs;
@@ -362,6 +369,8 @@ namespace
         state.intent = WorldIntent::None;
         state.poiKind = PoiKind::Count;
         state.poiSpawnId = 0;
+        state.poiEntry = 0;
+        state.pendingAfterTravel = WorldIntent::None;
         state.idleSinceMs = now;
     }
 
@@ -427,51 +436,147 @@ namespace
         }
     }
 
-    bool TryStartNeed(Player* bot, WorldState& state, uint32 now)
+    bool KnowsNodeNear(Player* bot, float x, float y, float z);
+    bool StartTravel(Player* bot, WorldState& state, uint32 now);
+
+    uint32 NeedLifetimeMs(float dist)
     {
-        static constexpr std::pair<WorldIntent, PoiKind> needs[] =
+        uint32 const cap = 15 * MINUTE * IN_MILLISECONDS;
+        uint32 lifetime = LIFETIME_NEED_MS + uint32(dist * 2000.0f);
+        return lifetime > cap ? cap : lifetime;
+    }
+
+    Poi const* NearestUsablePoi(Player* bot, PoiKind kind, float radius, uint32 ammoSubClass)
+    {
+        std::vector<Poi const*> candidates;
+        BotWorldPoi::Query(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), radius, kind, candidates);
+
+        Poi const* nearest = nullptr;
+        float nearestDist = 0.0f;
+        for (Poi const* poi : candidates)
         {
-            { WorldIntent::Repair, PoiKind::Repair },
-            { WorldIntent::Vendor, PoiKind::Vendor },
+            if (!IsUsableService(bot, *poi))
+                continue;
+            if (ammoSubClass && !BotMaintenance::VendorSellsUsableAmmo(poi->entry, bot, ammoSubClass))
+                continue;
+            float d = Dist2d(poi->x, poi->y, bot->GetPositionX(), bot->GetPositionY());
+            if (!nearest || d < nearestDist)
+            {
+                nearest = poi;
+                nearestDist = d;
+            }
+        }
+        return nearest;
+    }
+
+    bool LaunchNeedTrip(Player* bot, WorldState& state, WorldIntent intent, Poi const& poi, uint32 now)
+    {
+        // Ambient movement is lower priority than a gather/fish/grind walk, and a repair trip
+        // can start while a gather order still holds the bot. Release those so the trip can move.
+        BotMovement::ForceReleaseOwner(bot, MoveOwner::Gather);
+        BotMovement::ForceReleaseOwner(bot, MoveOwner::Fish);
+        BotMovement::ForceReleaseOwner(bot, MoveOwner::Grind);
+
+        float dist = Dist2d(poi.x, poi.y, bot->GetPositionX(), bot->GetPositionY());
+        uint32 lifetime = NeedLifetimeMs(dist);
+        constexpr float FLIGHT_MIN_YARDS = 900.0f;
+        constexpr float NEED_TELEPORT_YARDS = 400.0f;
+
+        auto teleportToPoi = [&]()
+        {
+            if (bot->IsBeingTeleported())
+                return;
+            if (bot->IsInCombat())
+                bot->CombatStop(true);
+            float dx = bot->GetPositionX() - poi.x;
+            float dy = bot->GetPositionY() - poi.y;
+            float len = std::max(0.001f, std::hypot(dx, dy));
+            float standOff = std::min(2.5f, len);
+            bot->TeleportTo(bot->GetMapId(), poi.x + dx / len * standOff, poi.y + dy / len * standOff,
+                poi.z + 1.0f, 0.0f);
+            sBotMgr->QueueTeleportAck(bot->GetSession());
         };
 
-        for (auto const& [intent, kind] : needs)
+        if (dist > FLIGHT_MIN_YARDS && KnowsNodeNear(bot, poi.x, poi.y, poi.z))
         {
-            if (OnCooldown(state, intent, now))
-                continue;
-
-            bool needed = intent == WorldIntent::Repair ? BotAI::NeedsRepair(bot) : BotAI::NeedsVendor(bot);
-            if (!needed)
-                continue;
-
-            std::vector<Poi const*> candidates;
-            BotWorldPoi::Query(bot->GetMapId(), bot->GetPositionX(), bot->GetPositionY(), _config.serviceRadius, kind,
-                candidates);
-
-            Poi const* nearest = nullptr;
-            float nearestDist = 0.0f;
-            for (Poi const* poi : candidates)
+            state.travelX = poi.x;
+            state.travelY = poi.y;
+            state.travelZ = poi.z;
+            state.travelTeleportFallback = false;
+            state.pendingAfterTravel = intent;
+            state.poiKind = poi.kind;
+            state.poiSpawnId = poi.spawnId;
+            state.poiEntry = poi.entry;
+            state.lingerMs = 3000;
+            if (StartTravel(bot, state, now))
             {
-                if (!IsUsableService(bot, *poi))
-                    continue;
-                float d = Dist2d(poi->x, poi->y, bot->GetPositionX(), bot->GetPositionY());
-                if (!nearest || d < nearestDist)
-                {
-                    nearest = poi;
-                    nearestDist = d;
-                }
+                Trace(bot, "chose WorldIntent::{} (need), flying toward {} {} ({:.0f} yd).", IntentName(intent),
+                    BotWorldPoi::KindName(poi.kind), poi.entry, dist);
+                return true;
             }
+            state.pendingAfterTravel = WorldIntent::None;
+            teleportToPoi();
+            BeginAtPoi(bot, state, intent, poi, 3000, lifetime, now);
+            Trace(bot, "chose WorldIntent::{} (need), teleporting to {} {} ({:.0f} yd, no flight).", IntentName(intent),
+                BotWorldPoi::KindName(poi.kind), poi.entry, dist);
+            return true;
+        }
 
+        if (dist > NEED_TELEPORT_YARDS)
+        {
+            teleportToPoi();
+            BeginAtPoi(bot, state, intent, poi, 3000, lifetime, now);
+            Trace(bot, "chose WorldIntent::{} (need), teleporting to {} {} ({:.0f} yd).", IntentName(intent),
+                BotWorldPoi::KindName(poi.kind), poi.entry, dist);
+            return true;
+        }
+
+        BeginAtPoi(bot, state, intent, poi, 3000, lifetime, now);
+        Trace(bot, "chose WorldIntent::{} (need), travelling to {} {} ({:.0f} yd).", IntentName(intent),
+            BotWorldPoi::KindName(poi.kind), poi.entry, dist);
+        return true;
+    }
+
+    bool TryStartNeed(Player* bot, WorldState& state, uint32 now)
+    {
+        float radius = _config.serviceRadius;
+        if (BotMaintenance::AutoTravelEnabled())
+        {
+            float travelYards = BotMaintenance::TravelSearchYards();
+            if (travelYards > radius)
+                radius = travelYards;
+        }
+
+        struct Need
+        {
+            WorldIntent intent;
+            PoiKind kind;
+            bool wanted;
+            uint32 ammoSubClass;
+        };
+
+        uint32 ammoSubClass = BotMaintenance::RequiredAmmoSubClass(bot);
+        Need needs[] = {
+            { WorldIntent::Repair, PoiKind::Repair, BotMaintenance::NeedsRepair(bot), 0 },
+            { WorldIntent::Ammo,   PoiKind::Vendor, BotMaintenance::NeedsAmmo(bot), ammoSubClass },
+            { WorldIntent::Vendor, PoiKind::Vendor, BotAI::NeedsVendor(bot), 0 },
+        };
+
+        for (Need const& need : needs)
+        {
+            if (!need.wanted || OnCooldown(state, need.intent, now))
+                continue;
+            if (need.intent == WorldIntent::Ammo && !need.ammoSubClass)
+                continue;
+
+            Poi const* nearest = NearestUsablePoi(bot, need.kind, radius, need.ammoSubClass);
             if (!nearest)
             {
-                SetCooldown(state, intent, now, NO_CANDIDATE_COOLDOWN_MS);
+                SetCooldown(state, need.intent, now, NO_CANDIDATE_COOLDOWN_MS);
                 continue;
             }
 
-            BeginAtPoi(bot, state, intent, *nearest, 3000, LIFETIME_NEED_MS, now);
-            Trace(bot, "chose WorldIntent::{} (need), travelling to {} {} ({:.0f} yd).", IntentName(intent),
-                BotWorldPoi::KindName(kind), nearest->entry, nearestDist);
-            return true;
+            return LaunchNeedTrip(bot, state, need.intent, *nearest, now);
         }
         return false;
     }
@@ -723,6 +828,17 @@ namespace
             // needs a node the bot has never been to). Zone progression falls back to the old
             // teleport; a quest trip just walks on from here (WorldBrain resumes it).
             state.travelStage = TravelStage::None;
+            if (state.pendingAfterTravel != WorldIntent::None)
+            {
+                WorldIntent const need = state.pendingAfterTravel;
+                state.pendingAfterTravel = WorldIntent::None;
+                float dist = Dist2d(state.travelX, state.travelY, bot->GetPositionX(), bot->GetPositionY());
+                Begin(bot, state, need, state.travelX, state.travelY, state.travelZ, 4.0f, NeedLifetimeMs(dist), now);
+                if (!state.lingerMs)
+                    state.lingerMs = 3000;
+                Trace(bot, "no flight route, walking the rest of the {} trip ({:.0f} yd).", IntentName(need), dist);
+                return AmbientTick::Busy;
+            }
             if (!state.travelTeleportFallback)
             {
                 Finish(bot, state, "no flight route, walking instead", FAIL_COOLDOWN_MS, now);
@@ -730,6 +846,17 @@ namespace
             }
             Finish(bot, state, "fell back to teleport", FAIL_COOLDOWN_MS, now);
             BotZoneProgression::RelocateBot(bot, true);
+            return AmbientTick::Relocated;
+        }
+
+        if (state.pendingAfterTravel != WorldIntent::None)
+        {
+            bool const forRepair = state.pendingAfterTravel == WorldIntent::Repair;
+            uint32 const vendorEntry = state.poiEntry;
+            state.pendingAfterTravel = WorldIntent::None;
+            Finish(bot, state, "completed need flight", 0, now);
+            state.travelStage = TravelStage::None;
+            BotMaintenance::ServiceAfterNeedTrip(bot, forRepair, vendorEntry);
             return AmbientTick::Relocated;
         }
 
@@ -844,13 +971,16 @@ namespace
     {
         BotMovement::Stop(bot, state.travelToken);
 
-        if (state.intent == WorldIntent::Repair || state.intent == WorldIntent::Vendor)
+        if (state.intent == WorldIntent::Repair || state.intent == WorldIntent::Vendor
+            || state.intent == WorldIntent::Ammo)
         {
             BotAI::MaintainEquipmentNow(bot);
+            BotMaintenance::ServiceAfterNeedTrip(bot, state.intent == WorldIntent::Repair, state.poiEntry);
 
             // The errand achieved nothing (the vendor the index pointed at does not repair or buy, or cannot be reached):
             // do not make the same trip again a minute later -- one bot made 62 in ten minutes, never repairing once.
-            if ((state.intent == WorldIntent::Repair && BotAI::NeedsRepair(bot)) ||
+            if ((state.intent == WorldIntent::Repair && BotMaintenance::NeedsRepair(bot)) ||
+                (state.intent == WorldIntent::Ammo && BotMaintenance::NeedsAmmo(bot)) ||
                 (state.intent == WorldIntent::Vendor && BotAI::NeedsVendor(bot)))
             {
                 SetCooldown(state, state.intent, now, UNSERVED_COOLDOWN_MS);
@@ -859,7 +989,7 @@ namespace
         }
 
         if (state.intent == WorldIntent::Errand || state.intent == WorldIntent::Repair
-            || state.intent == WorldIntent::Vendor)
+            || state.intent == WorldIntent::Vendor || state.intent == WorldIntent::Ammo)
             ArriveAtPoi(bot, state, profile);
 
         state.phase = Phase::Linger;
@@ -884,8 +1014,9 @@ namespace BotWorldBehavior
 
     AmbientTick UpdateBeforeSolo(Player* bot, AmbientProfile const& profile)
     {
-        if (!_config.enabled)
+        if (!_config.enabled && !BotMaintenance::AutoTravelEnabled())
             return AmbientTick::Idle;
+
 
         uint32 now = NowMs();
         WorldState& state = _states[bot->GetGUID()];
@@ -1027,6 +1158,16 @@ namespace BotWorldBehavior
             }
             if (status == NavStatus::Stuck)
             {
+                if ((state.intent == WorldIntent::Repair || state.intent == WorldIntent::Vendor
+                    || state.intent == WorldIntent::Ammo) && !bot->IsBeingTeleported())
+                {
+                    if (bot->IsInCombat())
+                        bot->CombatStop(true);
+                    bot->TeleportTo(bot->GetMapId(), state.x, state.y, state.z + 1.0f, 0.0f);
+                    sBotMgr->QueueTeleportAck(bot->GetSession());
+                    Trace(bot, "stuck on WorldIntent::{}, teleporting the rest of the way.", IntentName(state.intent));
+                    return AmbientTick::Busy;
+                }
                 Finish(bot, state, "abandoned (stuck)", FAIL_COOLDOWN_MS, now);
                 return AmbientTick::Relocated;
             }

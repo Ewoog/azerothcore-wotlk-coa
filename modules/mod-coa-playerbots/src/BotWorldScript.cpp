@@ -1,5 +1,6 @@
 #include "training/TrainingArenaManager.h"
 #include "BotAI.h"
+#include "QuestInteraction.h"
 #include "BotPerformance.h"
 #include "BotCheckpoint.h"
 #include "BotBenchmarkDriver.h"
@@ -8,13 +9,18 @@
 #include "BotMgr.h"
 #include "BotTalentBuilds.h"
 #include "BotWorldBehavior.h"
+#include "BotMaintenance.h"
 #include "WorldBrain.h"
 #include "DangerMap.h"
 #include "world/encounters/WorldEncounterDirector.h"
 #include "Config.h"
+#include "AllCreatureScript.h"
+#include "AllGameObjectScript.h"
 #include "Creature.h"
+#include "GameObject.h"
 #include "KillRewarder.h"
 #include "Log.h"
+#include "ObjectAccessor.h"
 #include "Group.h"
 #include "Player.h"
 #include "PlayerScript.h"
@@ -80,6 +86,7 @@ public:
         sBotMgr->LoadGuildGatherOrders();
         BotAI::LoadGatherLootData();
         BotWorldBehavior::LoadConfig();
+        BotMaintenance::LoadConfig();
         // Quest knowledge base, objective handlers' config: built once, after the world loaded.
         WorldBrain::Initialize();
         DangerMap::Initialize();
@@ -93,7 +100,38 @@ public:
 class coa_playerbots_playerscript : public PlayerScript
 {
 public:
-    coa_playerbots_playerscript() : PlayerScript("coa_playerbots_playerscript", { PLAYERHOOK_ON_REWARD_KILL_REWARDER, PLAYERHOOK_ON_LOGOUT, PLAYERHOOK_ON_PLAYER_KILLED_BY_CREATURE, PLAYERHOOK_ON_PLAYER_JUST_DIED, PLAYERHOOK_ON_LOOT_ITEM, PLAYERHOOK_ON_LEARN_SPELL, PLAYERHOOK_ON_LEVEL_CHANGED }) { }
+    coa_playerbots_playerscript() : PlayerScript("coa_playerbots_playerscript", { PLAYERHOOK_ON_REWARD_KILL_REWARDER, PLAYERHOOK_ON_LOGOUT, PLAYERHOOK_ON_PLAYER_KILLED_BY_CREATURE, PLAYERHOOK_ON_PLAYER_JUST_DIED, PLAYERHOOK_ON_LOOT_ITEM, PLAYERHOOK_ON_LEARN_SPELL, PLAYERHOOK_ON_LEVEL_CHANGED, PLAYERHOOK_ON_SEND_LIST_INVENTORY, PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST, PLAYERHOOK_ON_PLAYER_QUEST_ACCEPT, PLAYERHOOK_ON_QUEST_GIVER_CHOOSE_REWARD }) { }
+
+    void OnPlayerSendListInventory(Player* player, ObjectGuid vendorGuid, uint32& /*vendorEntry*/) override
+    {
+        if (!player || vendorGuid.IsEmpty())
+            return;
+        if (Creature* vendor = ObjectAccessor::GetCreature(*player, vendorGuid))
+        {
+            BotAI::OnPlayerOpenedVendor(player, vendor);
+            BotMaintenance::OnPlayerOpenedNpc(player, vendor);
+        }
+    }
+
+    void OnPlayerQuestAccept(Player* player, Quest const* quest) override
+    {
+        QuestInteraction::OnCompanionLeaderAccepted(player, quest, nullptr);
+    }
+
+    // Fires at the end of RewardQuest (every turn-in path). Bots that already handed the
+    // quest in from OnPlayerQuestGiverChooseReward are skipped by their quest status.
+    void OnPlayerCompleteQuest(Player* player, Quest const* quest) override
+    {
+        QuestInteraction::OnCompanionLeaderTurnedIn(player, quest, nullptr);
+    }
+
+    // Fires when the player confirms a turn-in and we still have the quest giver. Always
+    // return false so the core still rewards the player.
+    bool OnPlayerQuestGiverChooseReward(Player* player, Object* questGiver, Quest const* quest, uint32 /*reward*/) override
+    {
+        QuestInteraction::OnCompanionLeaderTurnedIn(player, quest, questGiver);
+        return false;
+    }
 
     void OnPlayerLootItem(Player* player, Item*, uint32 count, ObjectGuid lootGuid) override
     {
@@ -205,8 +243,46 @@ public:
     }
 };
 
+// Fires when a player talks to a vendor that has a gossip menu (trainers with a Browse goods
+// option, innkeepers, and so on). OnPlayerSendListInventory covers the vendor window itself.
+// Always returns false so the gossip menu still opens.
+class coa_playerbots_vendor_gossip_script : public AllCreatureScript
+{
+public:
+    coa_playerbots_vendor_gossip_script() : AllCreatureScript("coa_playerbots_vendor_gossip_script") { }
+
+    bool CanCreatureGossipHello(Player* player, Creature* creature) override
+    {
+        if (creature && creature->IsVendor())
+            BotAI::OnPlayerOpenedVendor(player, creature);
+        if (creature && (creature->IsArmorer() || creature->IsVendor()))
+            BotMaintenance::OnPlayerOpenedNpc(player, creature);
+        // Quest givers reach this hook through both CMSG_GOSSIP_HELLO and CMSG_QUESTGIVER_HELLO.
+        if (player && creature && creature->IsQuestGiver())
+            QuestInteraction::OnCompanionLeaderTalkedTo(player, creature);
+        return false;
+    }
+};
+
+// Quest-giver gameobjects (wanted posters, books): grouped bots hand in what that object ends.
+// Always returns false so the object's own gossip/quest dialog still opens.
+class coa_playerbots_questobject_script : public AllGameObjectScript
+{
+public:
+    coa_playerbots_questobject_script() : AllGameObjectScript("coa_playerbots_questobject_script") { }
+
+    bool CanGameObjectGossipHello(Player* player, GameObject* go) override
+    {
+        if (player && go && go->GetGoType() == GAMEOBJECT_TYPE_QUESTGIVER)
+            QuestInteraction::OnCompanionLeaderTalkedTo(player, go);
+        return false;
+    }
+};
+
 void AddSC_coa_playerbots_worldscript()
 {
     new coa_playerbots_worldscript();
     new coa_playerbots_playerscript();
+    new coa_playerbots_vendor_gossip_script();
+    new coa_playerbots_questobject_script();
 }

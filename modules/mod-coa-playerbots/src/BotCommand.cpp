@@ -1,6 +1,7 @@
 #include "training/TrainingArenaManager.h"
 #include "BotGear.h"
 #include "BotAI.h"
+#include "BotMaintenance.h"
 #include "BotPerformance.h"
 #include "BotMovement.h"
 #include "BotBattlegroundFill.h"
@@ -15,20 +16,26 @@
 #include "dialogue/BotDialogueManager.h"
 #include "dialogue/EncounterPresentation.h"
 #include "BotSpawnRandom.h"
+#include "BotProgression.h"
 #include "engine/CombatUtility.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "BotTalentBuilds.h"
 #include "Chat.h"
 #include "CommandScript.h"
+#include "Creature.h"
+#include "Group.h"
 #include "GameTime.h"
 #include "LFGMgr.h"
 #include "ObjectAccessor.h"
 #include "ObjectGuid.h"
+#include "ObjectMgr.h"
 #include "PathGenerator.h"
 #include "Player.h"
 #include "RBAC.h"
 #include "ScriptMgr.h"
+#include <algorithm>
+#include <cstdlib>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -55,6 +62,7 @@ public:
             { "guildinvite",       HandleBotGuildInviteCommand,       rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "guildcreate",       HandleBotGuildCreateCommand,       rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "guildgather",       HandleBotGuildGatherCommand,       rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+            { "orderstatus",       HandleBotOrderStatusCommand,       rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "guilddeposit",      HandleBotGuildDepositCommand,      rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "guildwithdraw",     HandleBotGuildWithdrawCommand,     rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "guilddepositgold",  HandleBotGuildDepositGoldCommand,  rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
@@ -84,6 +92,10 @@ public:
             { "follow",       HandleBotFollowCommand,       rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "stay",         HandleBotStayCommand,         rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "stopattack",   HandleBotStopAttackCommand,   rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+            { "farm",         HandleBotFarmCommand,         rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
+            { "farmstop",     HandleBotFarmStopCommand,     rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+            { "inventory",    HandleBotInventoryCommand,    rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
+            { "cleanbags",    HandleBotCleanBagsCommand,    rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "kill",         HandleBotKillCommand,         rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "suspend",      HandleBotSuspendCommand,      rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "resume",       HandleBotResumeCommand,       rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
@@ -93,12 +105,16 @@ public:
             { "quickfill",    HandleBotQuickFillCommand,    rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "invitebot",    HandleBotInviteRoleCommand,   rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "botlist",      HandleBotListCommand,         rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+            { "idle",         HandleBotIdleCommand,         rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
+            { "why",          HandleBotWhyCommand,          rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "craftorder",   HandleBotCraftOrderCommand,   rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "recipecoverage", HandleBotRecipeCoverageCommand, rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "guildroster",  HandleBotGuildRosterCommand,  rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "formation",    HandleBotFormationCommand,    rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "geartrainer",  HandleBotGearTrainerCommand,  rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "professiontrainer", HandleBotProfessionTrainerCommand, rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+            { "reroll",      HandleBotRerollCommand,        rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+            { "profstats",   HandleBotProfStatsCommand,     rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "economy",      HandleBotEconomyCommand,      rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "movement",     HandleBotMovementCommand,     rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
             { "pathtest",     HandleBotPathTestCommand,     rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
@@ -354,6 +370,70 @@ public:
         return true;
     }
 
+    // `.botcmd idle [yards]`: every bot within `yards` (default 60, 5-500) of the GM, nearest
+    // first, with what has it right now -- its group, standing order, open-world activity, how
+    // long it has stood still and the idle watchdog's strikes. `.botcmd why <name>` explains one.
+    static bool HandleBotIdleCommand(ChatHandler* handler, Optional<float> yards)
+    {
+        Player* gm = handler ? handler->GetPlayer() : nullptr;
+        if (!gm)
+        {
+            if (handler)
+                handler->SendSysMessage("BotMgr: .botcmd idle lists bots around you, so it needs an in-game character.");
+            return true;
+        }
+        float radius = std::clamp(yards.value_or(60.0f), 5.0f, 500.0f);
+
+        std::vector<std::pair<float, Player*>> nearby;
+        for (auto const& [guid, player] : ObjectAccessor::GetPlayers())
+        {
+            if (!player || player == gm || !player->IsInWorld() || !player->GetSession() ||
+                player->GetMapId() != gm->GetMapId() || player->GetInstanceId() != gm->GetInstanceId())
+                continue;
+            if (!BotMgr::IsBotAccountId(player->GetSession()->GetAccountId()))
+                continue;
+            float dist = gm->GetDistance(player);
+            if (dist <= radius)
+                nearby.emplace_back(dist, player);
+        }
+        std::sort(nearby.begin(), nearby.end(), [](auto const& lhs, auto const& rhs) { return lhs.first < rhs.first; });
+
+        handler->PSendSysMessage("BotMgr: {} bot(s) within {:.0f} yd.", nearby.size(), radius);
+        uint32 shown = 0;
+        for (auto const& [dist, bot] : nearby)
+        {
+            if (++shown > 40)
+            {
+                handler->PSendSysMessage("  ... {} more; use a smaller radius.", nearby.size() - 40);
+                break;
+            }
+            handler->PSendSysMessage("  {} (guid {}, lvl {}, {:.0f} yd): {}", bot->GetName(), bot->GetGUID().GetCounter(),
+                uint32(bot->GetLevel()), dist, BotAI::IdleSummary(bot));
+        }
+        return true;
+    }
+
+    // `.botcmd why <bot name>`: why that bot is doing what it is doing (or nothing).
+    static bool HandleBotWhyCommand(ChatHandler* handler, std::string name)
+    {
+        if (!handler)
+            return true;
+        if (!normalizePlayerName(name))
+        {
+            handler->SendSysMessage("BotMgr: usage: .botcmd why <bot name>");
+            return true;
+        }
+        Player* bot = ObjectAccessor::FindPlayerByName(name, false);
+        if (!bot || !bot->GetSession() || !BotMgr::IsBotAccountId(bot->GetSession()->GetAccountId()))
+        {
+            handler->PSendSysMessage("BotMgr: no online bot named {}.", name);
+            return true;
+        }
+        for (std::string const& line : BotAI::ExplainIdle(bot))
+            handler->SendSysMessage(line);
+        return true;
+    }
+
     // `.botcmd invitebot <player guid> <tank|healer|dps>`: what the addon's "Invite" button does for that player.
     static bool HandleBotInviteRoleCommand(ChatHandler* handler, ObjectGuid::LowType charLowGuid, std::string role)
     {
@@ -439,6 +519,93 @@ public:
         return true;
     }
 
+    // `.botcmd reroll professions all` -- assign a guid-stable two-primary set to every
+    // online bot-account bot that is not marked manual (SETPROF or professiontrainer).
+    // `.botcmd reroll professions <name>` -- same for one bot, including a manual one.
+    // Player-account alts are never touched.
+    static bool HandleBotRerollCommand(ChatHandler* handler, Tail args)
+    {
+        std::string text(args);
+        std::istringstream in(text);
+        std::string kind;
+        std::string who;
+        in >> kind >> who;
+        if (kind != "professions" || who.empty())
+        {
+            if (handler)
+                handler->SendSysMessage("BotMgr: usage: .botcmd reroll professions all   or   .botcmd reroll professions <bot name>");
+            return true;
+        }
+
+        auto applyOne = [](Player* bot, bool force) -> char const*
+        {
+            return BotProgression::AssignVariedProfessions(bot, force);
+        };
+
+        if (who == "all")
+        {
+            uint32 ok = 0;
+            uint32 skippedManual = 0;
+            uint32 skippedBusy = 0;
+            uint32 failed = 0;
+            for (Player* bot : sBotMgr->GetOnlineBots())
+            {
+                if (!bot)
+                    continue;
+                char const* token = applyOne(bot, false);
+                if (token && std::string(token) == "ok")
+                    ++ok;
+                else if (token && std::string(token) == "manual")
+                    ++skippedManual;
+                else if (token && (std::string(token) == "combat" || std::string(token) == "trade" ||
+                    std::string(token) == "dead" || std::string(token) == "teleport"))
+                    ++skippedBusy;
+                else
+                    ++failed;
+            }
+            if (handler)
+                handler->PSendSysMessage("BotMgr: rerolled professions for {} bot(s) ({} manual skipped, {} busy skipped, {} failed).",
+                    ok, skippedManual, skippedBusy, failed);
+            return true;
+        }
+
+        if (!normalizePlayerName(who))
+        {
+            if (handler)
+                handler->SendSysMessage("BotMgr: usage: .botcmd reroll professions all   or   .botcmd reroll professions <bot name>");
+            return true;
+        }
+        Player* bot = ObjectAccessor::FindPlayerByName(who, false);
+        if (!bot || !bot->GetSession() || !BotMgr::IsBotAccountId(bot->GetSession()->GetAccountId()))
+        {
+            if (handler)
+                handler->PSendSysMessage("BotMgr: no online bot named {}.", who);
+            return true;
+        }
+        char const* token = applyOne(bot, true);
+        if (handler)
+        {
+            if (token && std::string(token) == "ok")
+                handler->PSendSysMessage("BotMgr: rerolled professions for '{}'.", bot->GetName());
+            else
+                handler->PSendSysMessage("BotMgr: could not reroll professions for '{}' ({}).", bot->GetName(), token ? token : "invalid");
+        }
+        return true;
+    }
+
+    // `.botcmd profstats`: how many online bot-account bots know each profession, plus
+    // pairing counts and how many still have the old all-profession set.
+    static bool HandleBotProfStatsCommand(ChatHandler* handler)
+    {
+        if (!handler)
+            return true;
+        std::vector<std::string> lines;
+        BotProgression::AppendProfessionStats(lines);
+        for (std::string const& line : lines)
+            handler->SendSysMessage(line);
+        return true;
+    }
+
     // Debug/testing entry point for BotMgr::CraftOrder -- charLowGuid is the requester (any
     // online player, bot or real), same resolution style as quickfill above.
     static bool HandleBotCraftOrderCommand(ChatHandler* handler, ObjectGuid::LowType charLowGuid,
@@ -506,6 +673,14 @@ public:
     static bool HandleBotGuildGatherCommand(ChatHandler* handler, ObjectGuid::LowType charLowGuid, uint32 itemEntry, Optional<uint32> count)
     {
         sBotMgr->GuildGather(charLowGuid, itemEntry, count.value_or(1), handler);
+        return true;
+    }
+
+    // `.botcmd orderstatus`: every active and queued guild gather order with what its bot is doing,
+    // how far it is from its spot, its gathering skill, bag space, guild-bank room and idle time.
+    static bool HandleBotOrderStatusCommand(ChatHandler* handler)
+    {
+        sBotMgr->DescribeGatherOrders(handler);
         return true;
     }
 
@@ -844,6 +1019,205 @@ public:
         BotAI::StopAttack(ObjectGuid::Create<HighGuid::Player>(charLowGuid));
         if (handler)
             handler->PSendSysMessage("BotMgr: guid {} attack stopped, manual command reset.", charLowGuid);
+        return true;
+    }
+
+    // Farm mode: the bot keeps killing the creature type the commanding player has selected,
+    // within `radius` yards (default 40, clamped 10-100) of where the bot stands now, until
+    // `.botcmd farmstop` (or Follow/Stay/stopattack, a map change, relog or despawn). In-game
+    // only -- the target is read from the player's selection, like the addon's PULL verb.
+    static bool HandleBotFarmCommand(ChatHandler* handler, ObjectGuid::LowType charLowGuid, Optional<float> radius)
+    {
+        Player* commander = handler->GetPlayer();
+        if (!commander)
+        {
+            handler->SendSysMessage("BotMgr: .botcmd farm needs an in-game player with a creature selected.");
+            return true;
+        }
+
+        Player* bot = sBotMgr->FindBotPlayer(charLowGuid);
+        if (!bot)
+        {
+            handler->PSendSysMessage("BotMgr: no online bot with guid {}.", charLowGuid);
+            return true;
+        }
+
+        Unit* selected = commander->GetSelectedUnit();
+        Creature* creature = selected ? selected->ToCreature() : nullptr;
+        if (!creature)
+        {
+            handler->SendSysMessage("BotMgr: select the creature to farm first (a creature, not a player).");
+            return true;
+        }
+
+        if (creature->GetMap() != bot->GetMap())
+        {
+            handler->PSendSysMessage("BotMgr: bot '{}' is not on the same map as '{}'.", bot->GetName(), creature->GetName());
+            return true;
+        }
+
+        float wanted = radius.value_or(40.0f);
+        if (!BotAI::StartFarm(bot, creature->GetEntry(), wanted))
+        {
+            handler->PSendSysMessage("BotMgr: bot '{}' could not start farming.", bot->GetName());
+            return true;
+        }
+
+        uint32 entry = 0, mapId = 0;
+        float actualRadius = wanted;
+        BotAI::GetFarm(bot->GetGUID(), entry, actualRadius, mapId);
+        handler->PSendSysMessage("BotMgr: bot '{}' now farms '{}' (entry {}) within {:.0f} yards of its current spot. Stop with .botcmd farmstop {}.",
+            bot->GetName(), creature->GetName(), entry, actualRadius, charLowGuid);
+        return true;
+    }
+
+    static bool HandleBotFarmStopCommand(ChatHandler* handler, ObjectGuid::LowType charLowGuid)
+    {
+        BotAI::StopFarm(ObjectGuid::Create<HighGuid::Player>(charLowGuid));
+        if (handler)
+            handler->PSendSysMessage("BotMgr: guid {} farm mode stopped.", charLowGuid);
+        return true;
+    }
+
+    // `.botcmd cleanbags [all|name]`: one-time bag cleanup for online bots. Sells to a
+    // vendor within 80 yards if there is one; otherwise destroys leftover greys and stale
+    // quest items. Equips or grants larger bags. `all` is every online bot; a name is one.
+    static bool HandleBotCleanBagsCommand(ChatHandler* handler, Tail args)
+    {
+        if (!handler)
+            return true;
+
+        std::string raw(args);
+        while (!raw.empty() && raw.front() == ' ')
+            raw.erase(raw.begin());
+        while (!raw.empty() && raw.back() == ' ')
+            raw.pop_back();
+        if (raw.empty())
+        {
+            handler->SendSysMessage("Usage: .botcmd cleanbags [all|name]");
+            return true;
+        }
+
+        auto runOne = [&](Player* bot) -> BotMaintenance::BagCleanupResult
+        {
+            BotMaintenance::BagCleanupResult result = BotMaintenance::CleanBagsAround(
+                bot, true, true, 80.0f, handler->GetPlayer());
+            handler->PSendSysMessage("BotMgr: {} -- {} (sold {}, destroyed {}, bag upgrades {}).",
+                bot->GetName(), BotMaintenance::DescribeBags(bot), result.stacksSold,
+                result.stacksDestroyed, result.bagsEquipped + result.bagsBought + result.bagsGranted);
+            return result;
+        };
+
+        if (raw == "all" || raw == "ALL")
+        {
+            uint32 bots = 0, sold = 0, destroyed = 0, bagUps = 0;
+            for (Player* bot : sBotMgr->GetOnlineBots())
+            {
+                if (!bot || !bot->IsInWorld())
+                    continue;
+                BotMaintenance::BagCleanupResult const result = runOne(bot);
+                ++bots;
+                sold += result.stacksSold;
+                destroyed += result.stacksDestroyed;
+                bagUps += result.bagsEquipped + result.bagsBought + result.bagsGranted;
+            }
+            if (!bots)
+                handler->SendSysMessage("BotMgr: no online bots to clean.");
+            else
+                handler->PSendSysMessage("BotMgr: cleaned {} bot(s): sold {} stack(s), destroyed {}, bag upgrades {}.",
+                    bots, sold, destroyed, bagUps);
+            return true;
+        }
+
+        if (!normalizePlayerName(raw))
+        {
+            handler->SendSysMessage("Usage: .botcmd cleanbags [all|name]");
+            return true;
+        }
+        Player* bot = ObjectAccessor::FindPlayerByName(raw, false);
+        if (!bot || !bot->GetSession() || !BotMgr::IsBotAccountId(bot->GetSession()->GetAccountId()))
+        {
+            handler->PSendSysMessage("BotMgr: no online bot named {}.", raw);
+            return true;
+        }
+        runOne(bot);
+        return true;
+    }
+
+    // `.botcmd inventory <guid|all>`: grouped bots sell junk to a vendor within 20 yards.
+    // `all` is every online bot in the commanding player's group. In-game only (Console::No).
+    // Never destroys items in the field -- see BotAI::SweepInventory.
+    static bool HandleBotInventoryCommand(ChatHandler* handler, Tail args)
+    {
+        Player* commander = handler->GetPlayer();
+        if (!commander)
+        {
+            handler->SendSysMessage("BotMgr: .botcmd inventory needs an in-game player.");
+            return true;
+        }
+
+        std::string raw(args);
+        while (!raw.empty() && raw.front() == ' ')
+            raw.erase(raw.begin());
+        while (!raw.empty() && raw.back() == ' ')
+            raw.pop_back();
+        if (raw.empty())
+        {
+            handler->SendSysMessage("Usage: .botcmd inventory <guid|all>");
+            return true;
+        }
+
+        auto runOne = [&](Player* bot)
+        {
+            BotAI::InventorySweepResult const result = BotAI::SweepInventory(bot, true, false);
+            handler->SendSysMessage(BotAI::DescribeInventorySweep(bot, result));
+            return result;
+        };
+
+        if (raw == "all" || raw == "ALL")
+        {
+            Group* group = commander->GetGroup();
+            if (!group)
+            {
+                handler->SendSysMessage("BotMgr: you are not in a group.");
+                return true;
+            }
+
+            uint32 bots = 0, sold = 0, destroyed = 0, copper = 0;
+            for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+            {
+                Player* member = ref->GetSource();
+                if (!member || member == commander || !sBotMgr->FindBotPlayer(member->GetGUID().GetCounter()))
+                    continue;
+                BotAI::InventorySweepResult const result = runOne(member);
+                ++bots;
+                sold += result.stacksSold;
+                destroyed += result.stacksDestroyed;
+                copper += result.copperEarned;
+            }
+            if (!bots)
+                handler->SendSysMessage("BotMgr: no online bots are in your group.");
+            else if (bots > 1)
+                handler->PSendSysMessage("BotMgr: {} bot(s) sold {} stack(s) for {}g {}s {}c and destroyed {} stack(s).",
+                    bots, sold, copper / 10000, (copper / 100) % 100, copper % 100, destroyed);
+            return true;
+        }
+
+        char* end = nullptr;
+        unsigned long const guid = std::strtoul(raw.c_str(), &end, 10);
+        if (!guid || (end && *end))
+        {
+            handler->SendSysMessage("Usage: .botcmd inventory <guid|all>");
+            return true;
+        }
+
+        Player* bot = sBotMgr->FindBotPlayer(ObjectGuid::LowType(guid));
+        if (!bot)
+        {
+            handler->PSendSysMessage("BotMgr: no online bot with guid {}.", guid);
+            return true;
+        }
+        runOne(bot);
         return true;
     }
 

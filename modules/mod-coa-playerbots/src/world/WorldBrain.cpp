@@ -787,6 +787,52 @@ namespace WorldBrain
         WorldExecutor::PauseTask(bot, itr->second, "ambient errand");
     }
 
+    std::string Nudge(Player* bot)
+    {
+        auto itr = _states.find(bot->GetGUID());
+        if (itr == _states.end())
+            return "no brain state yet";
+        BrainState& state = itr->second;
+        BrainExtra& extra = _extra[bot->GetGUID()];
+        uint32 now = NowMs();
+        std::string what;
+
+        if (state.opportunityActive)
+        {
+            EndOpportunity(bot, state, extra, "idle watchdog");
+            what = "ended a gathering detour";
+        }
+        if (state.task.IsValid())
+        {
+            std::string task = Acore::StringFormat("{} #{} (quest {}, phase {})", WorldTaskTypeName(state.task.type),
+                state.task.id, state.task.quest.questId, TaskPhaseName(state.task.phase));
+            if (state.task.quest.questId)
+                SuspendQuest(bot, state, state.task.quest.questId, FailureReason::NoProgress);
+            DropTask(bot, state, FailureReason::NoProgress);
+            what += (what.empty() ? "" : ", ") + Acore::StringFormat("dropped stuck task {}", task);
+        }
+        if (state.breakUntilMs)
+        {
+            state.breakUntilMs = 0;
+            StartSession(state, now);
+            what += what.empty() ? "ended a town break" : ", ended a town break";
+        }
+        if (what.empty())
+            what = Acore::StringFormat("no task; activity was {}", WorldDirectiveName(state.activity));
+
+        // Something to do right away: grinding needs nothing but mobs nearby (and gives way to
+        // wandering by itself if there are none); a fresh plan is asked for at once too.
+        state.activity = WorldDirective::Grind;
+        state.activityUntilMs = now + 120000;
+        state.activityIdleSinceMs = 0;
+        state.goal = WorldGoal::Grinding;
+        state.emptyPlans = 0;
+        state.nextPlanMs = now;
+        state.nextRelocationAskMs = 0;
+        NoteEvent(state, "idle watchdog: " + what);
+        return what;
+    }
+
     void Suspend(Player* bot, SuspendReason reason)
     {
         WorldEncounterDirector::OnBotSuspended(bot, SuspendReasonName(reason));

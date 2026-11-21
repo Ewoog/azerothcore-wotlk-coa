@@ -20,6 +20,8 @@
 #define COA_PLAYERBOTS_BOT_PROGRESSION_H
 
 #include "Define.h"
+#include <string>
+#include <vector>
 
 class Player;
 
@@ -70,6 +72,54 @@ namespace BotProgression
     // Raises profession caps to the new level, then relearns abilities, recipes, tools and food.
     // Talents are applied separately by BotTalentBuilds.
     void OnLevelUp(Player* bot, uint8 newLevel);
+
+    // Addon-driven profession learn/unlearn (GETPROFS / SETPROF). CoA itself does not cap
+    // primary professions, and SETPROF is still uncapped so a player's own alts can hold
+    // every trade. Random bots are limited to two primaries plus the secondaries (see
+    // AssignVariedProfessions and CoaBots.Professions.TwoPrimary). LearnProfession teaches
+    // the trainer rank spells up to the level cap (level*6, max 450) and sets the starting
+    // skill from CoaBots.Prof.StartSkill (0 = the cap, so gathering of that tier works
+    // immediately). UnlearnProfession wipes the skill and those rank spells. Tokens: ok,
+    // combat, trade, dead, teleport, invalid, unknown, missing, noskill (the realm's
+    // SkillLine.dbc lacks the line, or the skill did not stick). Woodcutting and
+    // Woodworking cap at 300 (four ranks); every other profession at 450.
+    struct ProfessionInfo
+    {
+        uint32 skillId;
+        char const* name;
+        bool secondary;
+    };
+    ProfessionInfo const* ProfessionCatalog(uint32& count);
+    uint16 ProfessionCapForLevel(uint8 level);
+    uint16 ProfessionCapForSkill(uint32 skillId, uint8 level);
+    char const* LearnProfession(Player* bot, uint32 skillId);
+    char const* UnlearnProfession(Player* bot, uint32 skillId);
+
+    // Teach one profession at the level cap, including the trainer rank spells. Used by
+    // `.botcmd professiontrainer` (every profession this realm allows).
+    void GrantProfessionAtCap(Player* bot, uint32 skillId);
+
+    // Give a random bot a guid-stable pair of primary professions (class-biased weights)
+    // plus Cooking, First Aid and Fishing. Extra primaries left over from the old
+    // "grant every profession" factory path are unlearned. `force` skips the manual
+    // flag and busy checks (fresh setup, or a GM targeting one bot by name).
+    // Tokens: ok, manual, combat, trade, dead, teleport, invalid.
+    char const* AssignVariedProfessions(Player* bot, bool force);
+
+    // On login: if CoaBots.Professions.RerollLegacy is on, the character is a bot-account
+    // bot, it still has the old all-profession set, and SETPROF / professiontrainer has
+    // not marked it manual, assign a varied pair once. Player-account alts are left alone.
+    void MaybeRerollLegacyProfessions(Player* bot);
+
+    // SETPROF and `.botcmd professiontrainer` set this so auto-reroll will not overwrite
+    // a choice a player or GM made. `.botcmd reroll professions <name>` clears it.
+    void MarkProfessionsManual(Player* bot);
+    bool ProfessionsAreManual(Player* bot);
+    bool HasLegacyProfessionSet(Player* bot);
+
+    // `.botcmd profstats`: online bot-account bots, counts per profession and pairing.
+    void AppendProfessionStats(std::vector<std::string>& lines);
 }
+
 
 #endif // COA_PLAYERBOTS_BOT_PROGRESSION_H

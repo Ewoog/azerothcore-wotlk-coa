@@ -94,6 +94,7 @@
 #include "BotTaxi.h"
 #include "BotEconomy.h"
 #include "BotWorldBehavior.h"
+#include "BotMaintenance.h"
 #include "BotZoneProgression.h"
 #include "BotSpawnRandom.h"
 #include "WorldBrain.h"
@@ -115,6 +116,7 @@
 #include "QuestDef.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
+#include "StringFormat.h"
 #include "SpellAuraEffects.h"
 #include "SpellInfo.h"
 #include "Spell.h"
@@ -223,6 +225,24 @@ struct BotAIState
     BotManualCommand manualCommand = BotManualCommand::None;
     ObjectGuid pullTargetGuid;
 
+    // Farm mode -- see BotAI::StartFarm in BotAI.h and TryFarm below. The anchor is where the
+    // bot stood when the order was given; map, instance and login time pin it to that one
+    // place and session, so a teleport, map change or relog ends the order instead of sending
+    // the bot back across the world.
+    bool farmActive = false;
+    uint32 farmEntry = 0;
+    float farmRadius = 0.0f;
+    uint32 farmMapId = 0;
+    uint32 farmInstanceId = 0;
+    time_t farmLoginTime = 0;
+    float farmAnchorX = 0.0f, farmAnchorY = 0.0f, farmAnchorZ = 0.0f;
+    uint32 farmNextScanAtMs = 0;
+
+    // Bit i set means EQUIPMENT_SLOT i was locked by a commander EQUIP/UNEQUIP and
+    // TryUpgradeGearOnce must leave it alone. Cleared by Forget (despawn / bot relog)
+    // or by the UNLOCK verb. See BotAI::LockEquipSlot.
+    uint32 manualEquipLockMask = 0;
+
     // See BotAI::SetSuspended's comment in BotAI.h.
     bool suspended = false;
 
@@ -252,6 +272,37 @@ struct BotAIState
     // another bot first) left the order stalled at the original spot forever, since nothing else
     // ever nudged it toward a fresh location for the same item.
     uint32 gatherOrderStallMs = 0;
+    // Travel watchdog for a guild gather order's walk to its spot: the closest the bot has got to
+    // the spot it is walking to (and which spot that is), and how long it has gone without getting
+    // at least GATHER_ORDER_TRAVEL_MIN_GAIN yards closer. A walk that stops gaining is finished by
+    // a teleport instead of being retried forever (see UpdateSoloWorld).
+    float gatherTravelBestDist = 0.0f;
+    uint32 gatherTravelNoGainMs = 0;
+    float gatherTravelForX = 0.0f;
+    float gatherTravelForY = 0.0f;
+    bool gatherTravelTeleported = false;
+
+    // Guild-order hunting (TryHuntForOrder): the corpse a Skinning cast is in flight on and when
+    // it started; the 1 s target-scan throttle and whether the last scan found a target.
+    ObjectGuid huntSkinGuid;
+    uint32 huntSkinStartMs = 0;
+    uint32 nextHuntScanMs = 0;
+    bool huntLastScanFound = false;
+
+    // Idle watchdog (UpdateIdleWatchdog): where the bot stood when its current still stretch
+    // began and since when, the last tick the watchdog saw it (a gap means something else --
+    // combat, resting, looting -- had the bot), how many times in a row it has had to step in,
+    // and what it last did, for `.botcmd idle` / `.botcmd why`. idleWasGrouped catches the
+    // moment a bot leaves its group, so a Stay/Follow meant for that group can be dropped.
+    uint32 idleMapId = 0;
+    float idleAnchorX = 0.0f;
+    float idleAnchorY = 0.0f;
+    uint32 idleSinceMs = 0;
+    uint32 idleLastSeenMs = 0;
+    uint32 idleLastActionMs = 0;
+    uint8 idleStrikes = 0;
+    bool idleWasGrouped = false;
+    std::string idleLastReason;
 
     // Nodes this bot has tried and failed to gather from, each mapped to the GameTime ms at which
     // it becomes eligible again (see GATHER_NODE_RETRY_MS). Absolute deadlines rather than
@@ -408,11 +459,27 @@ constexpr uint32 GATHER_NODE_RETRY_MS = 60000;
 // the arrival test simply never becomes true.
 constexpr uint32 GATHER_WALK_TIMEOUT_MS = 20000;
 
+// Opportunistic herb/ore gathering while following a real player. Shorter than the solo
+// walk budget: the bot should not wander off the group for long. Scan more often than
+// idle solo gathering because the window for passing a node is brief.
+constexpr uint32 FOLLOW_GATHER_WALK_TIMEOUT_MS = 8000;
+constexpr uint32 FOLLOW_GATHER_SCAN_INTERVAL_MS = 2500;
+constexpr float FOLLOW_GATHER_LEADER_RANGE = 40.0f;
+
 // How long a targeted guild-gather order tolerates finding zero matching nodes nearby before
 // asking BotMgr to resolve and teleport to a fresh location for the same item. Node respawn
 // timers and other bots/players competing for the same resource both mean "nothing here right
 // now" is routine, not a failure worth abandoning the order over -- see gatherOrderStallMs.
 constexpr uint32 GUILD_GATHER_RETELEPORT_MS = 45000;
+// A node order standing at its spot with no node of its item in GATHER_ORDER_SEARCH_RADIUS gives the
+// spot up sooner than a hunt (nodes don't wander in; a spot with nothing up is just empty).
+constexpr uint32 GUILD_GATHER_NODE_STALL_MS = 25000;
+// How far an order's targeted node search looks around the bot.
+constexpr float GATHER_ORDER_SEARCH_RADIUS = 80.0f;
+// The walk to an order's spot must get this many yards closer at least once every
+// GATHER_ORDER_TRAVEL_NO_GAIN_MS, or the bot is teleported the rest of the way.
+constexpr float GATHER_ORDER_TRAVEL_MIN_GAIN = 10.0f;
+constexpr uint32 GATHER_ORDER_TRAVEL_NO_GAIN_MS = 30000;
 
 // A guild fishing order can be actively fishing (real casts, real bites waited for) at a spot
 // that simply never produces a catch -- e.g. technically "water" by FindNearbyWater's own check
@@ -1037,6 +1104,10 @@ void TryUpgradeGearOnce(Player* bot, BotRole role)
         if (eslot == NULL_SLOT)
             return false;
 
+        // A commander-chosen piece (or an emptied slot) stays put until UNLOCK or relog.
+        if (eslot < 32 && (states[bot->GetGUID()].manualEquipLockMask & (1u << eslot)))
+            return false;
+
         Item* current = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, eslot);
         float newScore = ScoreItemForBot(bot, proto, role) + BotGear::PowerScore(bot, proto);
         if (current)
@@ -1136,12 +1207,41 @@ bool HasGearBelowRepairThreshold(Player* bot)
     return false;
 }
 
+// True when this group contains at least one online, non-bot player. The relaxed "sell when a
+// vendor is already within 20 yards" gate is only for companions travelling with a person, not
+// for a pack of ungrouped or bot-only party members.
+bool GroupedWithRealPlayer(Player* bot)
+{
+    Group* group = bot->GetGroup();
+    if (!group)
+        return false;
+    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* member = ref->GetSource();
+        if (!member || member == bot || !member->GetSession())
+            continue;
+        if (!BotMgr::IsBotAccountId(member->GetSession()->GetAccountId()))
+            return true;
+    }
+    return false;
+}
+
+bool CanSweepInventory(Player const* bot)
+{
+    return bot && bot->IsAlive() && bot->IsInWorld()
+        && !bot->IsInCombat()
+        && !bot->IsBeingTeleported()
+        && !bot->GetTradeData()
+        && bot->GetLootGUID().IsEmpty();
+}
+
 // True grey vendor trash, OR gear this bot could equip but has already been superseded in that
 // exact slot -- the same "is this an upgrade" comparison TryUpgradeGearOnce makes, just answering
 // the opposite question. Shared by HasSellableJunk (the ambient "go find a vendor" signal) and
 // TryMaintainEquipment's actual clearing pass, so the two can never disagree about what counts.
-// Deliberately does NOT touch Trade Goods (ore/herbs/cloth/etc) -- those are worth real money or
-// a guild bank deposit, never vendor trash, see BotMgr::DepositLooseResourcesToGuildBank.
+// Never touches quest items, trade goods, profession tools, bags, consumables, or archived gear.
+// Blue (or whatever CoaBots.Inventory.KeepQuality is set to) and better superseded gear is kept
+// unless the bags are down to BAG_CLEANUP_FREE_SLOT_THRESHOLD free slots or fewer.
 bool IsClutterItem(Player* bot, Item const* item, BotRole role)
 {
     if (!item || BotGear::Archived(item))
@@ -1150,11 +1250,19 @@ bool IsClutterItem(Player* bot, Item const* item, BotRole role)
     if (!proto)
         return false;
 
+    if (proto->Class == ITEM_CLASS_QUEST || proto->StartQuest || proto->Bonding == BIND_QUEST_ITEM ||
+        proto->Bonding == BIND_QUEST_ITEM1 || bot->HasQuestForItem(proto->ItemId))
+        return false;
+    uint32 orderItem = 0; // a gather order's own item is never junk, whatever its class
+    if (sBotMgr->GetGatherOrderItem(bot->GetGUID(), &orderItem) && orderItem == proto->ItemId)
+        return false;
+    if (proto->Class == ITEM_CLASS_TRADE_GOODS || proto->Class == ITEM_CLASS_CONTAINER ||
+        proto->Class == ITEM_CLASS_CONSUMABLE || BotAI::IsProfessionTool(proto))
+        return false;
+
     if (proto->Quality == ITEM_QUALITY_POOR && proto->SellPrice > 0)
         return true;
 
-    if (BotAI::IsProfessionTool(proto))
-        return false;
     if (proto->Class != ITEM_CLASS_ARMOR && proto->Class != ITEM_CLASS_WEAPON)
         return false;
 
@@ -1168,7 +1276,13 @@ bool IsClutterItem(Player* bot, Item const* item, BotRole role)
 
     // Same 5% margin as TryUpgradeGearOnce, inverted: anything that wouldn't even count as an
     // upgrade there is dead weight here.
-    return ScoreItemForBot(bot, proto, role) <= ScoreItemForBot(bot, current->GetTemplate(), role) * 1.05f;
+    if (ScoreItemForBot(bot, proto, role) > ScoreItemForBot(bot, current->GetTemplate(), role) * 1.05f)
+        return false;
+
+    uint32 const keepQuality = sBotMgr->InventoryKeepQuality();
+    if (proto->Quality >= keepQuality && bot->GetFreeInventorySpace() > BAG_CLEANUP_FREE_SLOT_THRESHOLD)
+        return false;
+    return true;
 }
 
 // The ambient Vendor errand only makes sense when a vendor can actually help: this module only
@@ -1193,13 +1307,17 @@ bool HasSellableJunk(Player* bot, BotRole role)
 }
 
 // force skips the "only bother once nearly full" opportunistic gate below -- for a caller that
-// needs bag space right now (a guild task about to start, or TakeAllLoot finding zero room for
-// whatever it's about to hand the bot) rather than whenever a vendor happens to be nearby anyway.
-// The *destroy-with-no-vendor* safety gate further down stays in effect either way: force never
-// makes this throw away items it wouldn't otherwise have thrown away, it only makes it check
-// sooner.
-void TryMaintainEquipment(Player* bot, BotRole role, bool force)
+// needs bag space right now (a guild task about to start, TakeAllLoot finding zero room, or a
+// player telling the bot to clean its bags). The *destroy-with-no-vendor* safety gate further
+// down stays in effect when allowDestroy is true: force never makes this throw away items it
+// wouldn't otherwise have thrown away, it only makes it check sooner. allowDestroy is false
+// for the command and the "leader opened a vendor" hook, so those paths never destroy in the field.
+// Grouped bots travelling with a real player also skip the nearly-full gate when a vendor is
+// already within VENDOR_SEARCH_RADIUS (CoaBots.Inventory.SellWhenNearVendor).
+BotAI::InventorySweepResult TryMaintainEquipment(Player* bot, BotRole role, bool force, bool allowDestroy = true)
 {
+    BotAI::InventorySweepResult result;
+
     if (HasGearBelowRepairThreshold(bot))
     {
         Creature* repairNpc = nullptr;
@@ -1225,23 +1343,27 @@ void TryMaintainEquipment(Player* bot, BotRole role, bool force)
         }
     }
 
-    if (!force && bot->GetFreeInventorySpace() > BAG_CLEANUP_FREE_SLOT_THRESHOLD)
-        return;
+    // Selling and destroying stay out of combat, trades, teleports, and open loot windows.
+    // Repair above is unchanged: it still runs when an armorer is already in range.
+    if (!CanSweepInventory(bot))
+        return result;
 
     Creature* vendorNpc = nullptr;
     VendorNpcCheck vendorCheck(bot, VENDOR_SEARCH_RADIUS);
     Acore::CreatureLastSearcher<VendorNpcCheck> vendorSearcher(bot, vendorNpc, vendorCheck);
     Cell::VisitObjects(bot, vendorSearcher, VENDOR_SEARCH_RADIUS);
 
-    // No vendor nearby: only force clutter out as a last resort once bags are truly full --
-    // otherwise leave it for a later scan that might catch a vendor instead. This safety gate
-    // applies even when the caller asked for `force`: skipping the opportunistic gate above is
-    // not the same as being allowed to destroy things it wouldn't otherwise destroy.
-    if (!vendorNpc && bot->GetFreeInventorySpace() > 0)
-        return;
+    bool skipNearlyFullGate = force;
+    if (!skipNearlyFullGate && vendorNpc && sBotMgr->InventorySellWhenNearVendor() && GroupedWithRealPlayer(bot))
+        skipNearlyFullGate = true;
+    if (!skipNearlyFullGate && bot->GetFreeInventorySpace() > BAG_CLEANUP_FREE_SLOT_THRESHOLD)
+        return result;
 
-    uint32 totalEarned = 0;
-    uint32 itemsCleared = 0;
+    // No vendor nearby: only force clutter out as a last resort once bags are truly full --
+    // otherwise leave it for a later scan that might catch a vendor instead. The command and
+    // the vendor-open hook set allowDestroy to false so they never take this branch.
+    if (!vendorNpc && (!allowDestroy || bot->GetFreeInventorySpace() > 0))
+        return result;
 
     auto clearIfJunk = [&](Item* item) -> bool
     {
@@ -1251,14 +1373,22 @@ void TryMaintainEquipment(Player* bot, BotRole role, bool force)
         if (item->IsNotEmptyBag() || item->IsRefundable() || bot->GetLootGUID() == item->GetGUID())
             return false;
 
-        if (vendorNpc && proto->SellPrice > 0 && sScriptMgr->OnPlayerCanSellItem(bot, item, vendorNpc))
+        if (vendorNpc)
         {
+            // Honor OnPlayerCanSellItem: if another module (or the core) refuses the sale, leave
+            // the stack alone rather than destroying it for no gold.
+            if (proto->SellPrice <= 0 || !sScriptMgr->OnPlayerCanSellItem(bot, item, vendorNpc))
+                return false;
             uint32 money = proto->SellPrice * item->GetCount();
             bot->ModifyMoney(money);
-            totalEarned += money;
+            result.copperEarned += money;
+            bot->DestroyItem(item->GetBagSlot(), item->GetSlot(), true);
+            ++result.stacksSold;
+            return true;
         }
+
         bot->DestroyItem(item->GetBagSlot(), item->GetSlot(), true);
-        ++itemsCleared;
+        ++result.stacksDestroyed;
         return true;
     };
 
@@ -1274,15 +1404,16 @@ void TryMaintainEquipment(Player* bot, BotRole role, bool force)
             clearIfJunk(pBag->GetItemByPos(j));
     }
 
-    if (itemsCleared)
+    if (result.stacksSold || result.stacksDestroyed)
     {
         if (vendorNpc)
             LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotAI: bot '{}' sold {} junk item stack(s) to '{}' for {} copper.",
-                bot->GetName(), itemsCleared, vendorNpc->GetName(), totalEarned);
+                bot->GetName(), result.stacksSold, vendorNpc->GetName(), result.copperEarned);
         else
             LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotAI: bot '{}' destroyed {} junk item stack(s) (bags full, no vendor nearby).",
-                bot->GetName(), itemsCleared);
+                bot->GetName(), result.stacksDestroyed);
     }
+    return result;
 }
 
 // Confirmed live -- explicit user pushback on the original design: auto-signing the moment a
@@ -1452,6 +1583,8 @@ void TryMaintainProgression(Player* bot, uint32 diff, BotAIState& state)
     }
     TryUpgradeGearOnce(bot, state.role);
     TryMaintainEquipment(bot, state.role, false);
+    BotMaintenance::ServiceNearby(bot, false, false, nullptr);
+    BotMaintenance::MaintainBags(bot);
     TryAutoSignLeaderPetition(bot);
 }
 
@@ -1802,7 +1935,8 @@ bool MoveBotToPoint(Player* bot, MoveOwner owner, float x, float y, float z)
 // Allows bots to systematically path to and loot all trash and boss kills in an encounter.
 bool TryProcessPendingLoot(Player* bot, uint32 /*diff*/, BotAIState& state)
 {
-    if (bot->GetGroup() && !sBotMgr->AutoLootInGroup())
+    // A farming bot loots its own kills even in a group -- picking up the drops is the point of farming.
+    if (bot->GetGroup() && !sBotMgr->AutoLootInGroup() && !state.farmActive)
     {
         state.pendingLootGuids.clear();
         state.lastCombatTargetGuid = ObjectGuid::Empty;
@@ -1834,8 +1968,9 @@ bool TryProcessPendingLoot(Player* bot, uint32 /*diff*/, BotAIState& state)
     if (state.pendingLootGuids.empty())
         return false;
 
-    // If leader is far away or fighting, abort looting to stay with group
-    if (Group* group = bot->GetGroup())
+    // If leader is far away or fighting, abort looting to stay with group (a farming bot has
+    // been told to stay at its farm, so the leader's distance does not matter to it).
+    if (Group* group = state.farmActive ? nullptr : bot->GetGroup())
     {
         if (Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID()))
         {
@@ -2140,6 +2275,112 @@ bool TryGrindWhenSolo(Player* bot, uint32 diff, BotAIState& state)
         return true;
     }
     return false;
+}
+
+// Farm mode (BotAI::StartFarm). Scans are throttled to one a second per bot; the radius is
+// measured from the anchor, not from wherever the last chase left the bot.
+constexpr uint32 FARM_SCAN_INTERVAL_MS = 1000;
+constexpr float FARM_MIN_RADIUS = 10.0f;
+constexpr float FARM_MAX_RADIUS = 100.0f;
+constexpr float FARM_ANCHOR_ARRIVE_DIST = 4.0f;
+
+// Nearest (to the bot) live creature of the farmed entry within the radius of the anchor that
+// the bot may attack and that nobody outside the bot's own group has tapped. Same shrinking-
+// "best so far" shape as GrindHostileUnitCheck, so CreatureLastSearcher ends on the nearest.
+class FarmTargetCheck
+{
+public:
+    FarmTargetCheck(Player const* bot, uint32 entry, float ax, float ay, float az, float radius)
+        : _bot(bot), _entry(entry), _ax(ax), _ay(ay), _az(az), _radius(radius), _best(1.0e9f) { }
+
+    bool operator()(Creature* c)
+    {
+        if (!c || c->GetEntry() != _entry || !c->IsAlive() || c->IsInEvadeMode())
+            return false;
+        if (c->GetDistance(_ax, _ay, _az) > _radius)
+            return false;
+        if (!_bot->IsValidAttackTarget(c))
+            return false;
+        if (c->hasLootRecipient() && !c->isTappedBy(_bot))
+            return false;
+        if (IsIgnoredTarget(_bot->GetGUID(), c->GetGUID()))
+            return false;
+        float dist = _bot->GetDistance(c);
+        if (dist >= _best)
+            return false;
+        _best = dist;
+        return true;
+    }
+
+private:
+    Player const* _bot;
+    uint32 _entry;
+    float _ax, _ay, _az;
+    float _radius;
+    float _best;
+};
+
+void ClearFarmState(BotAIState& state)
+{
+    state.farmActive = false;
+    state.farmEntry = 0;
+    state.farmRadius = 0.0f;
+    state.farmNextScanAtMs = 0;
+}
+
+// Called from UpdateOffensive's idle branch (every role ends up there when idle), after loot
+// and rest have had their turn and before following the leader or the open-world layer.
+// Returns true when farm mode owns this idle tick.
+bool TryFarm(Player* bot, BotAIState& state)
+{
+    if (!state.farmActive)
+        return false;
+
+    if (bot->GetMapId() != state.farmMapId || bot->GetInstanceId() != state.farmInstanceId ||
+        bot->m_logintime != state.farmLoginTime || bot->InBattleground())
+    {
+        LOG_INFO("module.coa-playerbots", "BotAI: bot '{}' stops farming entry {} (left the farm map or relogged).",
+            bot->GetName(), state.farmEntry);
+        ClearFarmState(state);
+        BotMovement::ForceReleaseOwner(bot, MoveOwner::Grind);
+        return false;
+    }
+
+    // Farm owns the bot: the open-world layer steps back (same as for Stay or a group).
+    WorldBrain::Suspend(bot, SuspendReason::ManualCommand);
+
+    uint32 now = getMSTime();
+    if (state.farmNextScanAtMs && int32(now - state.farmNextScanAtMs) < 0)
+        return true;
+    state.farmNextScanAtMs = now + FARM_SCAN_INTERVAL_MS;
+
+    // A buff, pet summon or other cast in progress finishes first; moving or attacking would cut it.
+    if (bot->IsNonMeleeSpellCast(false))
+        return true;
+
+    Creature* target = nullptr;
+    FarmTargetCheck check(bot, state.farmEntry, state.farmAnchorX, state.farmAnchorY, state.farmAnchorZ, state.farmRadius);
+    Acore::CreatureLastSearcher<FarmTargetCheck> searcher(bot, target, check);
+    Cell::VisitObjects(state.farmAnchorX, state.farmAnchorY, bot->GetMap(), searcher, state.farmRadius);
+
+    if (target)
+    {
+        BotMovement::ForceReleaseOwner(bot, MoveOwner::Grind);
+        bot->Attack(target, true);
+        return true;
+    }
+
+    // Nothing up right now: walk back to the anchor and wait there for a respawn.
+    if (bot->GetDistance(state.farmAnchorX, state.farmAnchorY, state.farmAnchorZ) > FARM_ANCHOR_ARRIVE_DIST)
+    {
+        if (!MoveBotToPoint(bot, MoveOwner::Grind, state.farmAnchorX, state.farmAnchorY, state.farmAnchorZ) &&
+            BotMovement::CurrentOwner(bot) == MoveOwner::Travel)
+            ClearActiveFollow(bot); // a leftover follow holds the slot; the walk is retried next scan
+        return true;
+    }
+
+    BotMovement::ForceReleaseOwner(bot, MoveOwner::Grind);
+    return true;
 }
 
 // The tank runs point and the other bots follow it, so a pull that starts while the healer or a damage dealer is out of mana, hurt, dead or far behind
@@ -2677,6 +2918,30 @@ void SetGatherNodeRetryCooldown(BotAIState& state, ObjectGuid nodeGuid)
     state.gatherNodeRetryAtMs[nodeGuid] = nowMs + GATHER_NODE_RETRY_MS;
 }
 
+// One bot at a time per node, shared by solo gathering and gather-while-following, so two
+// grouped companions do not walk to the same herb. Key is the node's guid, value is the
+// claiming bot. Released when the gather finishes, is abandoned, or the bot is Forgotten.
+std::unordered_map<ObjectGuid, ObjectGuid> claimedGatherNodes;
+
+bool IsGatherNodeClaimedByOther(ObjectGuid nodeGuid, ObjectGuid botGuid)
+{
+    auto itr = claimedGatherNodes.find(nodeGuid);
+    return itr != claimedGatherNodes.end() && itr->second != botGuid;
+}
+
+void ClaimGatherNode(ObjectGuid nodeGuid, ObjectGuid botGuid)
+{
+    for (auto itr = claimedGatherNodes.begin(); itr != claimedGatherNodes.end();)
+        itr = (itr->second == botGuid) ? claimedGatherNodes.erase(itr) : std::next(itr);
+    claimedGatherNodes[nodeGuid] = botGuid;
+}
+
+void ReleaseGatherClaim(ObjectGuid botGuid)
+{
+    for (auto itr = claimedGatherNodes.begin(); itr != claimedGatherNodes.end();)
+        itr = (itr->second == botGuid) ? claimedGatherNodes.erase(itr) : std::next(itr);
+}
+
 // Loot ids of chest-type objects whose every loot row requires a quest. Filled once at startup by
 // BotAI::LoadGatherLootData -- the split is static data, so there's no reason to re-derive it.
 std::unordered_set<uint32> _questOnlyGameObjectLoot;
@@ -2765,6 +3030,9 @@ public:
         if (IsGatherNodeOnRetryCooldown(_state, go->GetGUID()))
             return false;
 
+        if (IsGatherNodeClaimedByOther(go->GetGUID(), _bot->GetGUID()))
+            return false;
+
         if (YieldsNothingForBot(go, _bot))
             return false;
 
@@ -2809,6 +3077,7 @@ void TryFinishGathering(Player* bot, BotAIState& state)
 
     ObjectGuid nodeGuid = state.gatherTargetGuid;
     state.gatherTargetGuid = ObjectGuid::Empty; // one-shot regardless of outcome below
+    ReleaseGatherClaim(bot->GetGUID());
 
     GameObject* node = ObjectAccessor::GetGameObject(*bot, nodeGuid);
     if (!node || bot->GetLootGUID() != node->GetGUID())
@@ -2899,6 +3168,7 @@ void AbandonGatherWalk(Player* bot, BotAIState& state, char const* reason)
     LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotAI: bot '{}' abandoned gather walk ({}).", bot->GetName(), reason);
     SetGatherNodeRetryCooldown(state, state.gatherWalkTargetGuid);
     state.gatherWalkTargetGuid = ObjectGuid::Empty;
+    ReleaseGatherClaim(bot->GetGUID());
     // Administrative release: abandoned gather walk
     BotMovement::ForceReleaseOwner(bot, MoveOwner::Gather);
 }
@@ -2916,6 +3186,7 @@ void TryContinueGatherWalk(Player* bot, uint32 diff, BotAIState& state)
     if (!node || !node->isSpawned())
     {
         state.gatherWalkTargetGuid = ObjectGuid::Empty;
+        ReleaseGatherClaim(bot->GetGUID());
         // Administrative release: node despawned
         BotMovement::ForceReleaseOwner(bot, MoveOwner::Gather);
         return;
@@ -2979,7 +3250,7 @@ bool TryStartGathering(Player* bot, uint32 diff, BotAIState& state, uint32 requi
 
     // A targeted order is worth searching further for than idle ambient gathering: the bot was
     // deliberately sent here for this one item, not just topping up materials on the way past.
-    float searchRadius = requiredItemEntry ? GATHER_SEARCH_RADIUS * 2.0f : GATHER_SEARCH_RADIUS;
+    float searchRadius = requiredItemEntry ? GATHER_ORDER_SEARCH_RADIUS : GATHER_SEARCH_RADIUS;
 
     uint32 gatherSpellId = 0;
     GameObject* node = nullptr;
@@ -2989,6 +3260,8 @@ bool TryStartGathering(Player* bot, uint32 diff, BotAIState& state, uint32 requi
 
     if (!node || !gatherSpellId)
         return false;
+
+    ClaimGatherNode(node->GetGUID(), bot->GetGUID());
 
     if (!IsInGatherRange(bot, node, gatherSpellId))
     {
@@ -3005,6 +3278,7 @@ bool TryStartGathering(Player* bot, uint32 diff, BotAIState& state, uint32 requi
         if (!MoveBotToPoint(bot, MoveOwner::Gather, node->GetPositionX(), node->GetPositionY(), node->GetPositionZ()))
         {
             state.gatherWalkTargetGuid = ObjectGuid::Empty;
+            ReleaseGatherClaim(bot->GetGUID());
             return false;
         }
 
@@ -3013,6 +3287,119 @@ bool TryStartGathering(Player* bot, uint32 diff, BotAIState& state, uint32 requi
 
     CastGatherAt(bot, state, node, gatherSpellId);
     return true;
+}
+
+bool GroupMemberInCombat(Group* group)
+{
+    if (!group)
+        return false;
+    for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        if (Player* member = itr->GetSource())
+            if (member->IsInCombat())
+                return true;
+    }
+    return false;
+}
+
+// Grouped companions following a real player pick up herbalism/mining nodes they walk past,
+// using the same GatherSpellForNode / CastGatherAt path as solo gathering (real spells, so
+// skill-ups apply). Not used during farm mode, Stay, group combat, or when the leader is
+// another bot. Returns true while a gather is in progress so the caller can skip follow.
+bool TryGatherWhileFollowing(Player* bot, uint32 diff, BotAIState& state)
+{
+    auto abandonIfBusy = [&]() -> bool
+    {
+        if (!state.gatherTargetGuid.IsEmpty() || !state.gatherWalkTargetGuid.IsEmpty())
+        {
+            if (!state.gatherTargetGuid.IsEmpty())
+            {
+                // Do not interrupt a cast already underway; finish it next ticks if possible.
+                if (bot->IsNonMeleeSpellCast(false))
+                    return true;
+                TryFinishGathering(bot, state);
+            }
+            if (!state.gatherWalkTargetGuid.IsEmpty())
+                AbandonGatherWalk(bot, state, "follow-gather conditions no longer hold");
+            return true;
+        }
+        return false;
+    };
+
+    if (!sBotMgr->GatherWhileFollowing() || state.farmActive)
+        return abandonIfBusy();
+    if (state.manualCommand == BotManualCommand::Stay)
+        return abandonIfBusy();
+    if (!bot->IsAlive() || bot->GetTrader() || bot->IsBeingTeleported())
+        return abandonIfBusy();
+
+    Group* group = bot->GetGroup();
+    if (!group)
+        return abandonIfBusy();
+
+    Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID());
+    if (!leader || leader == bot)
+        return abandonIfBusy();
+    // Only when following a real player, not another bot.
+    if (sBotMgr->FindBotPlayer(leader->GetGUID().GetCounter()))
+        return abandonIfBusy();
+
+    if (bot->GetMap() && (bot->GetMap()->IsDungeon() || bot->GetMap()->IsRaid() || bot->InBattleground()))
+        return abandonIfBusy();
+
+    if (GroupMemberInCombat(group))
+        return abandonIfBusy();
+
+    if (bot->GetDistance(leader) > FOLLOW_GATHER_LEADER_RANGE)
+        return abandonIfBusy();
+
+    if (bot->GetFreeInventorySpace() == 0)
+        return abandonIfBusy();
+
+    if (!state.gatherTargetGuid.IsEmpty())
+    {
+        TryFinishGathering(bot, state);
+        return !state.gatherTargetGuid.IsEmpty() || !state.gatherWalkTargetGuid.IsEmpty() || bot->IsNonMeleeSpellCast(false);
+    }
+    if (!state.gatherWalkTargetGuid.IsEmpty())
+    {
+        TryContinueGatherWalk(bot, diff, state);
+        return !state.gatherTargetGuid.IsEmpty() || !state.gatherWalkTargetGuid.IsEmpty();
+    }
+
+    if (state.nextGatherScanMs > diff)
+    {
+        state.nextGatherScanMs -= diff;
+        return false;
+    }
+    state.nextGatherScanMs = FOLLOW_GATHER_SCAN_INTERVAL_MS;
+
+    float searchRadius = sBotMgr->GatherFollowRadius();
+    uint32 gatherSpellId = 0;
+    GameObject* node = nullptr;
+    GatherableNodeCheck check(bot, searchRadius, gatherSpellId, state);
+    Acore::GameObjectLastSearcher<GatherableNodeCheck> searcher(bot, node, check);
+    Cell::VisitObjects(bot, searcher, searchRadius);
+    if (!node || !gatherSpellId)
+        return false;
+
+    ClaimGatherNode(node->GetGUID(), bot->GetGUID());
+
+    if (!IsInGatherRange(bot, node, gatherSpellId))
+    {
+        state.gatherWalkTargetGuid = node->GetGUID();
+        state.gatherWalkTimeoutMs = FOLLOW_GATHER_WALK_TIMEOUT_MS;
+        if (!MoveBotToPoint(bot, MoveOwner::Gather, node->GetPositionX(), node->GetPositionY(), node->GetPositionZ()))
+        {
+            state.gatherWalkTargetGuid = ObjectGuid::Empty;
+            ReleaseGatherClaim(bot->GetGUID());
+            return false;
+        }
+        return true;
+    }
+
+    CastGatherAt(bot, state, node, gatherSpellId);
+    return !state.gatherTargetGuid.IsEmpty() || !state.gatherWalkTargetGuid.IsEmpty();
 }
 
 bool IsFishingPole(Item const* item)
@@ -3333,6 +3720,11 @@ void ResumeFollowingLeader(Player* bot, BotAIState& state)
     // a non-melee spell (such as a 1.5s mount cast). Issuing movement while casting immediately
     // aborts the spell cast.
     if (BotMovement::GetPendingMountSpell(bot) || bot->IsNonMeleeSpellCast(false, false, /*skipAutorepeat=*/true))
+        return;
+
+    // A follow-gather walk or cast owns movement until it finishes. Travel outranks Gather
+    // in MoveOwner, so issuing follow here would yank the bot off the node every tick.
+    if (!state.gatherTargetGuid.IsEmpty() || !state.gatherWalkTargetGuid.IsEmpty())
         return;
 
     // Stay means exactly this: don't resume following just because there's nothing to fight
@@ -3800,6 +4192,210 @@ Unit* FindAllyThreatenedTarget(Player* tank, float range = 30.0f)
 // real healer doesn't stand still doing nothing just because no one's low), passed
 // BotRole::Dps so no taunt logic applies -- a healer without a Tank role assigned shouldn't
 // be trying to hold aggro.
+// --- Targeted hunting for guild gather orders (cloth/meat/hides) -------------------------
+// A gather order for an item that no node or fishing pool yields, but that some creature's corpse
+// or skinning loot does (BotMgr::GatherSourceInfo::IsHunt), attacks only those creatures near the
+// order's spot and skins the ones whose hide carries the item. Same 45 s stall ->
+// RetryGuildGatherLocation recovery as the node search when nothing matching is around.
+constexpr float HUNT_SEARCH_RADIUS = 50.0f;     // yards around the bot
+constexpr float HUNT_SKIN_SEARCH_RADIUS = 30.0f;
+constexpr float HUNT_LEASH_RADIUS = 80.0f;      // walk back to the order's spot beyond this
+constexpr uint32 HUNT_MAX_LEVEL_ABOVE = 3;      // never pick a fight further above itself
+constexpr uint32 HUNT_SCAN_INTERVAL_MS = 1000;
+constexpr uint32 HUNT_SKIN_CAST_TIMEOUT_MS = 10000;
+constexpr uint32 HUNT_SKIN_IGNORE_MS = 120000;
+
+// Same formula as Spell::EffectSkinning's reqValue.
+uint32 HuntSkinSkillNeeded(uint32 creatureLevel)
+{
+    return creatureLevel < 10 ? 0 : creatureLevel < 20 ? (creatureLevel - 10) * 10 : creatureLevel * 5;
+}
+
+// The Skinning cast to use on a corpse: the highest rank the bot knows, else (a bot that has the
+// skill line from GrantAllProfessions but never learned a rank spell) the apprentice rank, which
+// the server casts fine -- EffectSkinning reads the skill value, not the rank. 0 = can't skin.
+uint32 FindSkinningSpell(Player* bot)
+{
+    static uint32 const ranks[] = { 50305, 32678, 10768, 8618, 8617, 8613 };
+    if (!bot->HasSkill(SKILL_SKINNING))
+        return 0;
+    uint32 fallback = 0;
+    for (uint32 spellId : ranks)
+    {
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+        if (!info || !info->HasEffect(SPELL_EFFECT_SKINNING))
+            continue;
+        if (bot->HasSpell(spellId))
+            return spellId;
+        fallback = spellId; // ends on the lowest valid rank
+    }
+    return fallback;
+}
+
+class HuntTargetCheck
+{
+public:
+    HuntTargetCheck(Player const* bot, BotMgr::GatherSourceInfo const& info, bool canSkin, float range, uint32 maxLevel)
+        : _bot(bot), _info(info), _canSkin(canSkin), _range(range), _maxLevel(maxLevel) { }
+
+    bool operator()(Creature* c)
+    {
+        if (!c || !c->IsAlive() || c->IsInEvadeMode())
+            return false;
+        uint32 const entry = c->GetEntry();
+        if (!_info.huntCorpseEntries.count(entry) && !(_canSkin && _info.huntSkinEntries.count(entry)))
+            return false;
+        if (c->GetLevel() > _maxLevel)
+            return false;
+        if (!_bot->IsWithinDistInMap(c, _range))
+            return false;
+        if (!_bot->IsValidAttackTarget(c))
+            return false;
+        if (c->hasLootRecipient() && !c->isTappedBy(_bot))
+            return false;
+        if (IsIgnoredTarget(_bot->GetGUID(), c->GetGUID()))
+            return false;
+        _range = _bot->GetDistance(c);
+        return true;
+    }
+
+private:
+    Player const* _bot;
+    BotMgr::GatherSourceInfo const& _info;
+    bool _canSkin;
+    float _range;
+    uint32 _maxLevel;
+};
+
+// A corpse this bot killed and looted (AllLootRemovedFromCorpse then sets UNIT_FLAG_SKINNABLE),
+// of a creature whose hide carries the ordered item, that its Skinning skill can open.
+class HuntSkinCheck
+{
+public:
+    HuntSkinCheck(Player const* bot, BotMgr::GatherSourceInfo const& info, uint32 skill, float range)
+        : _bot(bot), _info(info), _skill(skill), _range(range) { }
+
+    bool operator()(Creature* c)
+    {
+        if (!c || c->IsAlive() || !c->HasUnitFlag(UNIT_FLAG_SKINNABLE))
+            return false;
+        if (!_info.huntSkinEntries.count(c->GetEntry()))
+            return false;
+        if (c->GetLootRecipientGUID() != _bot->GetGUID())
+            return false;
+        if (HuntSkinSkillNeeded(c->GetLootSkillLevelFor(_bot)) > _skill)
+            return false;
+        if (!_bot->IsWithinDistInMap(c, _range))
+            return false;
+        if (IsIgnoredTarget(_bot->GetGUID(), c->GetGUID()))
+            return false;
+        _range = _bot->GetDistance(c);
+        return true;
+    }
+
+private:
+    Player const* _bot;
+    BotMgr::GatherSourceInfo const& _info;
+    uint32 _skill;
+    float _range;
+};
+
+// Returns true when the hunt did something this tick (skinning, walking to a corpse, a fight
+// started, or a scan that found something within the last second), false when nothing matching
+// is around -- the caller counts that toward GUILD_GATHER_RETELEPORT_MS. Corpse looting itself is
+// TryProcessPendingLoot's job (it runs before UpdateSoloWorld and loots every kill).
+bool TryHuntForOrder(Player* bot, uint32 diff, BotAIState& state, BotMgr::GatherSourceInfo const& info)
+{
+    // 1. A skinning cast in flight: wait for it, then take the hide and close the loot window.
+    if (!state.huntSkinGuid.IsEmpty())
+    {
+        if (bot->IsNonMeleeSpellCast(false) && getMSTimeDiff(state.huntSkinStartMs, getMSTime()) < HUNT_SKIN_CAST_TIMEOUT_MS)
+            return true;
+        if (bot->IsNonMeleeSpellCast(false))
+            bot->InterruptNonMeleeSpells(false);
+        ObjectGuid const corpseGuid = state.huntSkinGuid;
+        state.huntSkinGuid = ObjectGuid::Empty;
+        Creature* corpse = ObjectAccessor::GetCreature(*bot, corpseGuid);
+        if (corpse && bot->GetLootGUID() == corpseGuid)
+        {
+            BotAI::TakeAllLoot(bot, corpse->loot);
+            WorldPacket releasePacket;
+            releasePacket << corpseGuid;
+            bot->GetSession()->HandleLootReleaseOpcode(releasePacket);
+            LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotAI: bot '{}' skinned '{}' for a guild order.",
+                bot->GetName(), corpse->GetName());
+        }
+        else
+            IgnoreTargetFor(bot->GetGUID(), corpseGuid, HUNT_SKIN_IGNORE_MS);
+        return true;
+    }
+
+    if (bot->IsNonMeleeSpellCast(false))
+        return true; // a buff or pet summon finishes first
+
+    uint32 const skinSpell = info.huntSkinEntries.empty() ? 0 : FindSkinningSpell(bot);
+
+    // 2. Skin our own looted corpses before looking for the next fight.
+    if (skinSpell)
+    {
+        Creature* corpse = nullptr;
+        HuntSkinCheck check(bot, info, bot->GetSkillValue(SKILL_SKINNING), HUNT_SKIN_SEARCH_RADIUS);
+        Acore::CreatureLastSearcher<HuntSkinCheck> searcher(bot, corpse, check);
+        Cell::VisitObjects(bot, searcher, HUNT_SKIN_SEARCH_RADIUS);
+        if (corpse)
+        {
+            if (!bot->IsWithinDistInMap(corpse, INTERACTION_DISTANCE))
+            {
+                MoveBotToPoint(bot, MoveOwner::Gather, corpse->GetPositionX(), corpse->GetPositionY(), corpse->GetPositionZ());
+                return true;
+            }
+            BotMovement::ForceReleaseOwner(bot, MoveOwner::Gather);
+            if (bot->isMoving())
+            {
+                // Spell::CheckCast refuses a cast-time spell while moving (see CastGatherAt).
+                BotMovement::ForceStopOwner(bot, MoveOwner::Gather);
+                return true;
+            }
+            if (bot->IsMounted())
+                BotMovement::RequestDismount(bot, MoveOwner::Gather, DismountReason::ActionForbidden);
+            SpellCastResult const result = bot->CastSpell(corpse, skinSpell, false);
+            if (result == SPELL_CAST_OK)
+            {
+                state.huntSkinGuid = corpse->GetGUID();
+                state.huntSkinStartMs = getMSTime();
+            }
+            else
+            {
+                IgnoreTargetFor(bot->GetGUID(), corpse->GetGUID(), HUNT_SKIN_IGNORE_MS);
+                LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotAI: bot '{}' failed Skinning ({}) on '{}' (result {}).",
+                    bot->GetName(), skinSpell, corpse->GetName(), uint32(result));
+            }
+            return true;
+        }
+    }
+
+    // 3. Attack the nearest live creature that can drop the item (or carry it as a hide we can skin).
+    if (state.nextHuntScanMs > diff)
+    {
+        state.nextHuntScanMs -= diff;
+        return state.huntLastScanFound;
+    }
+    state.nextHuntScanMs = HUNT_SCAN_INTERVAL_MS;
+
+    Creature* target = nullptr;
+    HuntTargetCheck check(bot, info, skinSpell != 0, HUNT_SEARCH_RADIUS, bot->GetLevel() + HUNT_MAX_LEVEL_ABOVE);
+    Acore::CreatureLastSearcher<HuntTargetCheck> searcher(bot, target, check);
+    Cell::VisitObjects(bot, searcher, HUNT_SEARCH_RADIUS);
+    state.huntLastScanFound = target != nullptr;
+    if (!target)
+        return false;
+
+    BotMovement::ForceReleaseOwner(bot, MoveOwner::Gather);
+    BotMovement::ForceReleaseOwner(bot, MoveOwner::Grind);
+    bot->Attack(target, true);
+    return true;
+}
+
 AmbientLean LeanFor(SoloIntent intent)
 {
     switch (intent)
@@ -3845,10 +4441,12 @@ WorldPersona MakeWorldPersona(Player* bot, BotAIState& state)
 }
 
 // The idle-solo tick of an ungrouped bot with no fight, no loot and no rest to do. Order:
-//  1. an explicit guild gather order from a player;
-//  2. the ambient layer's needs (repair, selling) and any errand or flight already in flight --
+//  1. repair and ammo need-trips (and any such trip already underway) -- these also preempt an
+//     active guild gather order; the order stays assigned and resumes when the trip finishes;
+//  2. an explicit guild gather order from a player;
+//  3. the ambient layer's other needs (selling) and any errand or flight already in flight --
 //     they pause the brain's task while they have the bot;
-//  3. the open-world brain (world/WorldBrain.h), which either acts itself (quests, travel) or
+//  4. the open-world brain (world/WorldBrain.h), which either acts itself (quests, travel) or
 //     names the one activity -- gather, fish, grind, ambient life -- that gets this tick.
 // Before the brain existed, SoloIntent's scan order, the quest scans, the long-distance quest walk,
 // the grind anchor and the ambient errands each decided on their own to move the bot; now exactly
@@ -3858,25 +4456,94 @@ void UpdateSoloWorld(Player* bot, uint32 diff, BotAIState& state)
     CoaBotPerf::Scope perfScope(CoaBotPerf::Metric::SoloWorld);
     // Active guild gather order: travel to target area and gather the requested resource
     BotMgr::GuildGatherOrder const* gatherOrder = sBotMgr->GetGuildGatherOrder(bot->GetGUID());
+
+    // Repair and ammo need-trips (and any such trip already underway) preempt gather-order
+    // work. The order stays assigned; when the trip finishes this function runs the gather
+    // branch again and the bot walks or teleports back to its source spot.
+    if (!WorldEncounterDirector::IsBotInEncounter(bot->GetGUID()))
+    {
+        AmbientTick const needTick = BotWorldBehavior::UpdateBeforeSolo(bot, MakeAmbientProfile(bot, state));
+        if (needTick == AmbientTick::Busy)
+        {
+            if (gatherOrder)
+                sBotMgr->PauseGuildGatherWatchdog(bot->GetGUID());
+            WorldBrain::NotifyAmbientBusy(bot);
+            return;
+        }
+        if (needTick == AmbientTick::Relocated)
+            state.hasGrindAnchor = false;
+    }
+
     if (gatherOrder && gatherOrder->remainingCount > 0)
     {
         // An explicit instruction owns the bot: the open-world task steps back with its clocks
         // stopped, exactly as for any other manual command.
         WorldBrain::Suspend(bot, SuspendReason::ManualCommand);
+
+        ObjectGuid const botGuid = bot->GetGUID();
+        auto status = [botGuid](std::string const& text) { sBotMgr->SetGatherOrderStatus(botGuid, text); };
+        // Stall at the current spot: past `limit`, ask BotMgr for a different one.
+        auto stall = [&](uint32 limit, char const* what)
+        {
+            state.gatherOrderStallMs += diff;
+            if (state.gatherOrderStallMs >= limit)
+            {
+                state.gatherOrderStallMs = 0;
+                state.gatherTravelBestDist = 0.0f;
+                state.gatherTravelTeleported = false;
+                status(std::string(what) + " - trying another spot");
+                sBotMgr->RetryGuildGatherLocation(botGuid); // may end the order (gatherOrder dangles)
+                return;
+            }
+            status(std::string(what) + " (" + std::to_string((limit - state.gatherOrderStallMs) / IN_MILLISECONDS) + "s)");
+        };
+
+        // Drop/skin-sourced items (cloth, meat, hides) get a targeted hunt instead of the old
+        // grind-and-hope fallback -- see TryHuntForOrder.
+        BotMgr::GatherSourceInfo const& sourceInfo = sBotMgr->GetGatherSourceInfo(gatherOrder->itemEntry);
+        bool const hunting = sourceInfo.IsHunt();
+        if (hunting && sourceInfo.SkinOnly() && !FindSkinningSpell(bot))
+        {
+            sBotMgr->FailGuildGatherOrder(bot->GetGUID(), "noskinning"); // gatherOrder dangles from here on
+            return;
+        }
+        // A skinning cast in flight finishes before any walk could cancel it.
+        if (hunting && !state.huntSkinGuid.IsEmpty())
+        {
+            status("skinning");
+            TryHuntForOrder(bot, diff, state, sourceInfo);
+            return;
+        }
+
         if (gatherOrder->hasTargetLocation)
         {
             if (bot->GetMapId() != gatherOrder->targetMapId)
             {
+                if (bot->IsBeingTeleported())
+                    return;
+                status("teleporting to the spot");
                 bot->TeleportTo(gatherOrder->targetMapId, gatherOrder->targetX, gatherOrder->targetY, gatherOrder->targetZ, 0.0f);
                 sBotMgr->QueueTeleportAck(bot->GetSession());
                 return;
             }
 
             float dist = bot->GetExactDist2d(gatherOrder->targetX, gatherOrder->targetY);
-            if (dist > 40.0f)
+            // A hunt ranges further from its spot than a node search (mobs wander and get chased).
+            if (dist > (hunting ? HUNT_LEASH_RADIUS : 40.0f))
             {
+                // A new spot restarts the travel watchdog.
+                if (state.gatherTravelForX != gatherOrder->targetX || state.gatherTravelForY != gatherOrder->targetY)
+                {
+                    state.gatherTravelForX = gatherOrder->targetX;
+                    state.gatherTravelForY = gatherOrder->targetY;
+                    state.gatherTravelBestDist = 0.0f;
+                    state.gatherTravelNoGainMs = 0;
+                    state.gatherTravelTeleported = false;
+                }
+
                 if (BotMovement::GetMountState(bot) == MountState::MountCasting)
                 {
+                    status("mounting up");
                     return; // Wait for mount cast to complete; do not count as stall
                 }
 
@@ -3886,30 +4553,72 @@ void UpdateSoloWorld(Player* bot, uint32 diff, BotAIState& state)
                         return; // Mount cast initiated; move will resume next tick
                 }
 
-                // A resolved location can be genuinely unreachable on foot from wherever the
-                // teleport actually landed (across water, inside geometry, etc.) -- MoveBotToPoint
-                // then refuses every single tick with no timeout of its own, which used to leave
-                // the bot retrying the identical impossible walk forever (confirmed live
-                // 2026-09-29: one bot stuck on this exact branch for 2.5+ minutes straight with
-                // zero progress). Route it through the same stall counter TryStartGathering's own
-                // search uses below, so an unreachable spot gets the same "ask for somewhere else"
-                // recovery instead of a silent infinite retry.
-                if (MoveBotToPoint(bot, MoveOwner::Gather, gatherOrder->targetX, gatherOrder->targetY, gatherOrder->targetZ))
+                // Watchdog: the walk has to keep getting closer. A spot across water, inside
+                // geometry, or simply with no path from here used to be retried tick after tick
+                // (MoveBotToPoint refusing, or accepting and never arriving) -- the order sat at 0
+                // with the bot "travelling" for minutes. Not getting GATHER_ORDER_TRAVEL_MIN_GAIN
+                // closer for GATHER_ORDER_TRAVEL_NO_GAIN_MS teleports it the rest of the way once;
+                // if even that doesn't land it near the spot, the spot is given up.
+                if (state.gatherTravelBestDist <= 0.0f || dist + GATHER_ORDER_TRAVEL_MIN_GAIN < state.gatherTravelBestDist)
                 {
-                    state.gatherOrderStallMs = 0;
+                    state.gatherTravelBestDist = dist;
+                    state.gatherTravelNoGainMs = 0;
                 }
                 else
+                    state.gatherTravelNoGainMs += diff;
+
+                if (state.gatherTravelNoGainMs >= GATHER_ORDER_TRAVEL_NO_GAIN_MS)
                 {
-                    state.gatherOrderStallMs += diff;
-                    if (state.gatherOrderStallMs >= GUILD_GATHER_RETELEPORT_MS)
+                    state.gatherTravelNoGainMs = 0;
+                    state.gatherTravelBestDist = 0.0f;
+                    if (!state.gatherTravelTeleported && !bot->IsBeingTeleported())
                     {
-                        state.gatherOrderStallMs = 0;
-                        sBotMgr->RetryGuildGatherLocation(bot->GetGUID());
+                        state.gatherTravelTeleported = true;
+                        status("stuck on the way - teleporting to the spot");
+                        LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotAI: bot '{}' made no headway toward its gather spot ({:.0f} yd) -- teleporting.",
+                            bot->GetName(), dist);
+                        if (bot->IsInCombat())
+                            bot->CombatStop(true);
+                        bot->TeleportTo(gatherOrder->targetMapId, gatherOrder->targetX, gatherOrder->targetY, gatherOrder->targetZ, 0.0f);
+                        sBotMgr->QueueTeleportAck(bot->GetSession());
                     }
+                    else
+                    {
+                        state.gatherTravelTeleported = false;
+                        state.gatherOrderStallMs = 0;
+                        status("can't reach the spot - trying another");
+                        sBotMgr->RetryGuildGatherLocation(botGuid); // may end the order (gatherOrder dangles)
+                    }
+                    return;
                 }
+
+                if (MoveBotToPoint(bot, MoveOwner::Gather, gatherOrder->targetX, gatherOrder->targetY, gatherOrder->targetZ))
+                    status(std::string(bot->IsMounted() ? "riding" : "walking") + " to the spot (" + std::to_string(uint32(dist)) + " yd)");
+                else
+                    status("finding a path to the spot (" + std::to_string(uint32(dist)) + " yd)");
+                state.gatherOrderStallMs = 0;
                 return;
             }
+            state.gatherTravelBestDist = 0.0f;
+            state.gatherTravelNoGainMs = 0;
         }
+        if (hunting)
+        {
+            if (TryHuntForOrder(bot, diff, state, sourceInfo))
+            {
+                state.gatherOrderStallMs = 0;
+                Unit* victim = bot->GetVictim();
+                status(victim ? "hunting - fighting " + victim->GetName() : std::string("hunting"));
+            }
+            else
+            {
+                // Nothing matching alive (or skinnable) around this spot: same stall-and-ask-for-
+                // somewhere-else recovery as the node search below.
+                stall(GUILD_GATHER_RETELEPORT_MS, "no matching creatures here");
+            }
+            return;
+        }
+
         // A fish-only entry (never in any gameobject loot table) gets its own real fishing loop --
         // TryStartGathering has no idea what a fishing rod is. The teleport target for a fishing
         // order is a real GameObjectTemplate type 25 (FISHINGHOLE) spawn -- guaranteed to actually
@@ -3924,55 +4633,47 @@ void UpdateSoloWorld(Player* bot, uint32 diff, BotAIState& state)
             {
                 state.fishlessCastStreak = 0;
                 state.gatherOrderStallMs = 0;
-                sBotMgr->RetryGuildGatherLocation(bot->GetGUID());
+                status("nothing biting - trying another spot");
+                sBotMgr->RetryGuildGatherLocation(botGuid);
                 return;
             }
 
             if (TryStartFishing(bot, diff, state))
             {
                 state.gatherOrderStallMs = 0;
+                status("fishing");
             }
             else
             {
                 // No water in range of wherever the teleport landed, no fishing pole, whatever --
                 // same stall-and-ask-for-somewhere-else recovery as the node search below.
-                state.gatherOrderStallMs += diff;
-                if (state.gatherOrderStallMs >= GUILD_GATHER_RETELEPORT_MS)
-                {
-                    state.gatherOrderStallMs = 0;
-                    sBotMgr->RetryGuildGatherLocation(bot->GetGUID());
-                }
+                stall(GUILD_GATHER_RETELEPORT_MS, "looking for water");
             }
             return;
         }
 
-        // Nodes (herbalism/mining) can be targeted precisely -- see GatherLootIdsByItem. Anything
-        // else this order might ask for (cloth/meat off a kill, a skinned hide) has no equivalent
-        // "seek this specific loot table" search yet, so those items keep the old opportunistic
-        // behavior (whatever's nearest, grind fallback included) rather than going strictly idle
-        // forever waiting for a node type that will never match.
+        // Nodes (herbalism/mining) can be targeted precisely -- see GatherLootIdsByItem. Drop and
+        // skin items were handled by the hunt above; anything left here (an item with no spawned
+        // creature source at all) keeps the old opportunistic behavior (whatever's nearest, grind
+        // fallback included) rather than going strictly idle forever.
         bool itemIsNodeSourced = GatherLootIdsByItem().count(gatherOrder->itemEntry) != 0;
         uint32 targetItem = itemIsNodeSourced ? gatherOrder->itemEntry : 0;
 
         if (TryStartGathering(bot, diff, state, targetItem))
         {
             state.gatherOrderStallMs = 0;
+            status(!state.gatherWalkTargetGuid.IsEmpty() ? "walking to a node" : "gathering a node");
         }
         else if (itemIsNodeSourced)
         {
             // Actively searched for this item's own node type and found nothing in range -- a
-            // node already consumed (respawn pending) or claimed by someone else first, not a
-            // reason to wander off into a fight (see GUILD_GATHER_RETELEPORT_MS's comment for the
-            // stuck case this replaces). After tolerating that for a while, ask for a fresh spot.
-            state.gatherOrderStallMs += diff;
-            if (state.gatherOrderStallMs >= GUILD_GATHER_RETELEPORT_MS)
-            {
-                state.gatherOrderStallMs = 0;
-                sBotMgr->RetryGuildGatherLocation(bot->GetGUID());
-            }
+            // node already consumed (respawn pending), pooled out, or claimed by someone else
+            // first, not a reason to wander off into a fight. After a short while, a fresh spot.
+            stall(GUILD_GATHER_NODE_STALL_MS, "no nodes up here");
         }
         else
         {
+            status("grinding for drops");
             TryGrindWhenSolo(bot, diff, state);
         }
         return;
@@ -4043,6 +4744,139 @@ void UpdateSoloWorld(Player* bot, uint32 diff, BotAIState& state)
 // value, except for Support, which fights like Dps (combatRole) but must still find its own
 // Support-tagged profile (profileRole), not silently fail profile lookup and fall back to the
 // generic spellbook chain forever.
+// Idle watchdog for bots living their own open-world life (ungrouped, or leading a temporary
+// bot party). Every layer above has its own timeouts, but each one only knows about itself: a
+// quest task whose target never shows up waits out its phase budget, a town break lasts minutes,
+// an ambient layer whose every option is on cooldown just stands, and a bot with no work on its
+// map can't be relocated while a real player stands next to it. Taken together that is a bot
+// standing in one spot for minutes on end. This only looks at the result: a bot that has not
+// moved IDLE_WATCHDOG_MOVE_YARDS for IDLE_WATCHDOG_STILL_MS while nothing else had it (no fight,
+// rest, loot, cast, errand, maintenance trip, guild order or encounter) gets pushed, harder each
+// time it happens again soon after:
+//   1. stale gather/fish/grind leftovers are cleared, and the brain lets go of whatever it was
+//      holding the bot on and sends it grinding with an immediate re-plan (WorldBrain::Nudge);
+//   2. still standing: zone progression moves it to a hub for its level (by flight if it can);
+//   3. still standing: the same, forced -- a teleport even with a player close by.
+constexpr uint32 IDLE_WATCHDOG_STILL_MS = 75 * IN_MILLISECONDS;
+constexpr float IDLE_WATCHDOG_MOVE_YARDS = 4.0f;
+constexpr uint32 IDLE_WATCHDOG_GAP_MS = 5 * IN_MILLISECONDS;
+constexpr uint32 IDLE_WATCHDOG_STRIKE_RESET_MS = 6 * MINUTE * IN_MILLISECONDS;
+// Teleports touch the character DB (homebind); a crowd of idle bots is moved a few at a time.
+constexpr uint32 IDLE_WATCHDOG_RELOCATE_SPACING_MS = 250;
+
+void ResetIdleWatch(Player* bot, BotAIState& state, uint32 now)
+{
+    state.idleMapId = bot->GetMapId();
+    state.idleAnchorX = bot->GetPositionX();
+    state.idleAnchorY = bot->GetPositionY();
+    state.idleSinceMs = now;
+}
+
+// What, if anything, legitimately owns a still bot right now; nullptr when nothing does.
+char const* IdleWatchdogExemption(Player* bot, BotAIState const& state)
+{
+    if (!bot->IsAlive())
+        return "dead";
+    if (bot->IsInCombat())
+        return "in combat";
+    if (bot->IsInFlight() || bot->IsBeingTeleported())
+        return "flying or teleporting";
+    if (Map* map = bot->GetMap(); !map || map->Instanceable())
+        return "in an instance";
+    if (bot->IsNonMeleeSpellCast(false))
+        return "casting";
+    if (!state.gatherTargetGuid.IsEmpty() || !state.fishingBobberGuid.IsEmpty() || state.fishingCastInProgress)
+        return "gathering or fishing";
+    // Errands include the repair/ammo maintenance trips; each errand has its own deadline.
+    if (BotWorldBehavior::HasActiveErrand(bot->GetGUID()))
+        return "on an errand or maintenance trip";
+    if (BotEconomy::HasSaleTrip(bot))
+        return "on an economy sale trip";
+    if (sBotMgr->GetGuildGatherOrder(bot->GetGUID()))
+        return "on a guild gather order";
+    if (WorldEncounterDirector::IsBotInEncounter(bot->GetGUID()))
+        return "in an encounter";
+    return nullptr;
+}
+
+void ClearStaleIdleState(Player* bot, BotAIState& state)
+{
+    state.gatherWalkTargetGuid = ObjectGuid::Empty;
+    state.gatherWalkTimeoutMs = 0;
+    state.huntSkinGuid = ObjectGuid::Empty;
+    state.hasGrindAnchor = false;
+    BotMovement::ForceStopOwner(bot, MoveOwner::Gather);
+    BotMovement::ForceStopOwner(bot, MoveOwner::Fish);
+    BotMovement::ForceStopOwner(bot, MoveOwner::Grind);
+}
+
+// Called once per solo-life tick (see UpdateOffensive); anything else that has the bot simply
+// stops calling it, and the gap restarts the clock.
+void UpdateIdleWatchdog(Player* bot, BotAIState& state)
+{
+    uint32 now = uint32(GameTime::GetGameTimeMS().count());
+    bool gap = !state.idleLastSeenMs || now - state.idleLastSeenMs > IDLE_WATCHDOG_GAP_MS;
+    state.idleLastSeenMs = now;
+
+    if (gap || IdleWatchdogExemption(bot, state) || bot->GetMapId() != state.idleMapId ||
+        std::hypot(bot->GetPositionX() - state.idleAnchorX, bot->GetPositionY() - state.idleAnchorY) > IDLE_WATCHDOG_MOVE_YARDS)
+    {
+        ResetIdleWatch(bot, state, now);
+        return;
+    }
+    if (now - state.idleSinceMs < IDLE_WATCHDOG_STILL_MS)
+        return;
+
+    if (now - state.idleLastActionMs > IDLE_WATCHDOG_STRIKE_RESET_MS)
+        state.idleStrikes = 0;
+
+    uint8 strike = std::min<uint8>(uint8(state.idleStrikes + 1), 3);
+    if (strike >= 2)
+    {
+        static uint32 lastRelocateMs = 0;
+        if (lastRelocateMs && now - lastRelocateMs < IDLE_WATCHDOG_RELOCATE_SPACING_MS)
+            return; // next tick
+        lastRelocateMs = now;
+    }
+
+    uint32 stillSec = (now - state.idleSinceMs) / IN_MILLISECONDS;
+    ClearStaleIdleState(bot, state);
+    std::string what = WorldBrain::Nudge(bot);
+    if (strike >= 2)
+    {
+        bool const forced = strike >= 3;
+        if (BotZoneProgression::RelocateBot(bot, forced))
+            what += forced ? "; teleported to a hub for its level" : "; sent to a hub for its level";
+        else
+            what += forced ? "; forced relocation refused" : "; relocation refused (player close by, quest work here, or no hub)";
+    }
+
+    state.idleStrikes = strike;
+    state.idleLastActionMs = now;
+    state.idleLastReason = Acore::StringFormat("strike {} after {}s still: {}", uint32(strike), stillSec, what);
+    LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotAI: idle watchdog: bot '{}' stood still {}s at ({:.0f} {:.0f}) map {} -- strike {}: {}.",
+        bot->GetName(), stillSec, bot->GetPositionX(), bot->GetPositionY(), bot->GetMapId(), uint32(strike), what);
+    ResetIdleWatch(bot, state, now);
+}
+
+// A Stay or Follow is an order for the group the bot was in. Nothing used to clear it when the bot
+// left that group, and an ungrouped bot on Stay never runs its own life again -- it stood where it
+// was told to until the next restart.
+void DropGroupOrdersOnLeave(Player* bot, BotAIState& state)
+{
+    bool const grouped = bot->GetGroup() != nullptr;
+    if (!grouped && state.idleWasGrouped &&
+        (state.manualCommand == BotManualCommand::Stay || state.manualCommand == BotManualCommand::Follow))
+    {
+        LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotAI: bot '{}' left its group; dropping its {} order.",
+            bot->GetName(), state.manualCommand == BotManualCommand::Stay ? "Stay" : "Follow");
+        state.manualCommand = BotManualCommand::None;
+        state.idleLastReason = "left its group: dropped the Stay/Follow order it had";
+        ClearActiveFollow(bot);
+    }
+    state.idleWasGrouped = grouped;
+}
+
 void UpdateOffensive(Player* bot, uint32 diff, BotRole combatRole, BotRole profileRole, BotAIState& state)
 {
     CoaBotPerf::Scope perfScope(CoaBotPerf::Metric::Offensive);
@@ -4074,7 +4908,13 @@ void UpdateOffensive(Player* bot, uint32 diff, BotRole combatRole, BotRole profi
     // below both still apply, since Stay is about not *initiating*, not about refusing to
     // fight at all.
     if (!target && state.manualCommand != BotManualCommand::Stay)
+    {
         target = FindGroupCombatTarget(bot, bot->GetGroup());
+        // A farming bot joins group fights at its farm, not ones across the zone.
+        if (target && state.farmActive && (target->GetMapId() != state.farmMapId ||
+            target->GetDistance(state.farmAnchorX, state.farmAnchorY, state.farmAnchorZ) > state.farmRadius + 10.0f))
+            target = nullptr;
+    }
 
     if (!target && bot->InBattleground())
         target = BotBattlegroundAI::FindHostilePvPTarget(bot, 40.0f);
@@ -4215,11 +5055,25 @@ void UpdateOffensive(Player* bot, uint32 diff, BotRole combatRole, BotRole profi
             if (TryRestIfNeeded(bot, diff, combatRole, state))
                 return;
 
+            DropGroupOrdersOnLeave(bot, state);
+
+            // Farm mode outranks following the leader and the open-world layer below.
+            if (TryFarm(bot, state))
+                return;
+
             bool inEncounter = WorldEncounterDirector::IsBotInEncounter(bot->GetGUID());
             bool inEncounterGroup = bot->GetGroup() &&
                 WorldEncounterDirector::IsEncounterTemporaryGroup(bot->GetGroup()->GetGUID().GetCounter());
 
-            if (!bot->InBattleground() && !inEncounter)
+            // Opportunistic herb/ore gathering while following a real player. Farm already
+            // returned above, so a farm order is never interrupted. Travel outranks Gather,
+            // so follow is skipped while this returns true.
+            bool followGathering = false;
+            if (bot->GetGroup() && !WorldParties::IsLeader(bot->GetGUID()) && !inEncounter
+                && state.manualCommand != BotManualCommand::Stay && !bot->InBattleground())
+                followGathering = TryGatherWhileFollowing(bot, diff, state);
+
+            if (!bot->InBattleground() && !inEncounter && !followGathering)
                 ResumeFollowingLeader(bot, state);
 
             // Ungrouped means no leader to fight alongside or follow -- ResumeFollowingLeader
@@ -4259,6 +5113,7 @@ void UpdateOffensive(Player* bot, uint32 diff, BotRole combatRole, BotRole profi
                     TryWaitForFishingCast(bot, diff, state);
                 else
                     UpdateSoloWorld(bot, diff, state);
+                UpdateIdleWatchdog(bot, state);
             }
             else
             {
@@ -4266,6 +5121,10 @@ void UpdateOffensive(Player* bot, uint32 diff, BotRole combatRole, BotRole profi
                 // drops every claim it holds (movement, reserved mobs, area occupancy) until the
                 // bot is solo and free again.
                 WorldBrain::Suspend(bot, bot->GetGroup() ? SuspendReason::Grouped : SuspendReason::ManualCommand);
+                // A guild gather order can't be worked from here; say why on the Task Board
+                // (BotMgr pauses a grouped bot's order and later hands it on).
+                if (state.manualCommand == BotManualCommand::Stay && sBotMgr->GetGuildGatherOrder(bot->GetGUID()))
+                    sBotMgr->SetGatherOrderStatus(bot->GetGUID(), "paused - told to stay (use Follow or dismiss to resume)");
                 if (combatRole == BotRole::Tank && state.manualCommand != BotManualCommand::Stay)
                     TryAutoPullInInstance(bot);
             }
@@ -5585,6 +6444,7 @@ void Forget(ObjectGuid botGuid)
 {
     CoaBotScheduling::Forget(botGuid);
     CoaBotScheduling::CancelWork(botGuid);
+    ReleaseGatherClaim(botGuid);
     states.erase(botGuid);
     BotAI::ForgetRotationState(botGuid);
     SpellResolver::Invalidate(botGuid);
@@ -5612,11 +6472,13 @@ bool IsQuestOnlyGameObjectLoot(uint32 lootId)
 
 bool NeedsRepair(Player* bot)
 {
-    return HasGearBelowRepairThreshold(bot);
+    return BotMaintenance::NeedsRepair(bot);
 }
 
 bool NeedsVendor(Player* bot)
 {
+    if (BotMaintenance::NeedsSellTrip(bot))
+        return true;
     return bot->GetFreeInventorySpace() <= BAG_CLEANUP_FREE_SLOT_THRESHOLD && HasSellableJunk(bot, GetRole(bot->GetGUID()));
 }
 
@@ -5628,6 +6490,8 @@ uint32 FreeBagSlots(Player* bot, uint32 wanted)
         return bot->GetFreeInventorySpace();
 
     TryMaintainEquipment(bot, GetRole(bot->GetGUID()), true);
+    uint32 orderItem = 0;
+    bool const onOrder = sBotMgr->GetGatherOrderItem(bot->GetGUID(), &orderItem);
 
     struct Candidate
     {
@@ -5643,6 +6507,10 @@ uint32 FreeBagSlots(Player* bot, uint32 wanted)
         if (!proto || proto->Class == ITEM_CLASS_QUEST || proto->StartQuest || proto->Class == ITEM_CLASS_CONTAINER ||
             proto->Class == ITEM_CLASS_CONSUMABLE || proto->Quality >= ITEM_QUALITY_EPIC || IsProfessionTool(proto) ||
             bot->HasQuestForItem(proto->ItemId))
+            return;
+        // A bot on a gather order keeps its materials: the order item and every Trade Good
+        // (BotMgr banks or mails those to make room instead of destroying them).
+        if (onOrder && (proto->ItemId == orderItem || proto->Class == ITEM_CLASS_TRADE_GOODS))
             return;
         stacks.push_back({ item, uint64(proto->SellPrice) * item->GetCount() });
     };
@@ -5675,7 +6543,57 @@ void MaintainEquipmentNow(Player* bot)
 
 void PrepareBagsForTask(Player* bot)
 {
-    TryMaintainEquipment(bot, GetRole(bot->GetGUID()), true);
+    TryMaintainEquipment(bot, GetRole(bot->GetGUID()), true, true);
+}
+
+InventorySweepResult SweepInventory(Player* bot, bool force, bool allowDestroy)
+{
+    InventorySweepResult result;
+    if (!bot)
+        return result;
+    return TryMaintainEquipment(bot, GetRole(bot->GetGUID()), force, allowDestroy);
+}
+
+std::string DescribeInventorySweep(Player const* bot, InventorySweepResult const& result)
+{
+    if (!bot)
+        return "BotMgr: no bot.";
+    if (!result.stacksSold && !result.stacksDestroyed)
+        return Acore::StringFormat("BotMgr: bot '{}' had nothing to sell.", bot->GetName());
+    return Acore::StringFormat("BotMgr: bot '{}' sold {} stack(s) for {}g {}s {}c and destroyed {} stack(s).",
+        bot->GetName(), result.stacksSold, result.copperEarned / 10000, (result.copperEarned / 100) % 100,
+        result.copperEarned % 100, result.stacksDestroyed);
+}
+
+void OnPlayerOpenedVendor(Player* player, Creature* vendor)
+{
+    if (!player || !vendor || !player->GetSession() || !sBotMgr->InventorySellOnLeaderVendor())
+        return;
+    if (BotMgr::IsBotAccountId(player->GetSession()->GetAccountId()))
+        return;
+    if (!vendor->IsAlive() || !vendor->IsVendor())
+        return;
+    Group* group = player->GetGroup();
+    if (!group)
+        return;
+
+    // Gossip hello and SendListInventory can fire back-to-back for the same NPC; don't sweep twice.
+    uint32 const now = getMSTime();
+    static std::unordered_map<ObjectGuid, uint32> lastSweepAt;
+
+    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* member = ref->GetSource();
+        if (!member || member == player || !sBotMgr->FindBotPlayer(member->GetGUID().GetCounter()))
+            continue;
+        if (member->GetMap() != vendor->GetMap() || !member->IsWithinDistInMap(vendor, 20.0f))
+            continue;
+        uint32& lastAt = lastSweepAt[member->GetGUID()];
+        if (lastAt && getMSTimeDiff(lastAt, now) < 2000)
+            continue;
+        lastAt = now;
+        TryMaintainEquipment(member, GetRole(member->GetGUID()), true, false);
+    }
 }
 
 bool IsInCity(Player const* bot)
@@ -5923,6 +6841,14 @@ void SetManualCommand(ObjectGuid botGuid, BotManualCommand command, ObjectGuid p
     state.manualCommand = command;
     state.pullTargetGuid = (command == BotManualCommand::Pull) ? pullTarget : ObjectGuid::Empty;
 
+    // Follow and Stay are explicit movement orders and end farm mode; a one-shot Pull does not.
+    if ((command == BotManualCommand::Follow || command == BotManualCommand::Stay) && state.farmActive)
+    {
+        ClearFarmState(state);
+        if (Player* bot = ObjectAccessor::FindPlayer(botGuid))
+            BotMovement::ForceStopOwner(bot, MoveOwner::Grind);
+    }
+
     if (command == BotManualCommand::Follow)
     {
         state.followWaitingReaction = false;
@@ -5959,9 +6885,368 @@ void StopAttack(ObjectGuid botGuid)
     BotAIState& state = states[botGuid];
     state.manualCommand = BotManualCommand::None;
     state.pullTargetGuid = ObjectGuid::Empty;
+    bool wasFarming = state.farmActive;
+    ClearFarmState(state); // otherwise the next farm scan would pick the fight straight back up
 
     if (Player* bot = ObjectAccessor::FindPlayer(botGuid))
+    {
         bot->AttackStop();
+        if (wasFarming)
+            BotMovement::ForceStopOwner(bot, MoveOwner::Grind);
+    }
+}
+
+namespace
+{
+    char const* ManualCommandName(BotManualCommand command)
+    {
+        switch (command)
+        {
+            case BotManualCommand::Stay:   return "Stay";
+            case BotManualCommand::Follow: return "Follow";
+            case BotManualCommand::None:   return "none";
+            default:                       return "Pull";
+        }
+    }
+
+    // Who decides what the bot does right now, in a few words.
+    std::string IdleOwner(Player* bot, BotAIState const& state)
+    {
+        if (Group* group = bot->GetGroup())
+        {
+            if (WorldParties::IsLeader(bot->GetGUID()))
+                return "leads a temporary bot party";
+            if (WorldParties::IsInParty(bot->GetGUID()))
+                return "member of a temporary bot party (follows its bot leader)";
+            if (WorldEncounterDirector::IsBotInEncounter(bot->GetGUID()))
+                return "in an encounter group";
+            Player* leader = ObjectAccessor::FindConnectedPlayer(group->GetLeaderGUID());
+            if (!leader)
+                return "grouped, leader offline";
+            bool realLeader = !BotMgr::IsBotAccountId(leader->GetSession()->GetAccountId());
+            return Acore::StringFormat("grouped with {} ({})", leader->GetName(), realLeader ? "player" : "bot");
+        }
+        if (state.manualCommand == BotManualCommand::Stay)
+            return "ungrouped but told to Stay (own life paused)";
+        if (state.farmActive)
+            return "farm order";
+        return "own life";
+    }
+}
+
+std::string IdleSummary(Player* bot)
+{
+    if (!bot)
+        return "";
+    auto itr = states.find(bot->GetGUID());
+    if (itr == states.end())
+        return "no AI state yet";
+    BotAIState const& state = itr->second;
+    uint32 now = uint32(GameTime::GetGameTimeMS().count());
+
+    std::string brain = "brain: none";
+    WorldGoal goal = WorldGoal::None;
+    WorldTaskType taskType = WorldTaskType::None;
+    TaskPhase phase = TaskPhase::Planning;
+    bool isBreak = false;
+    if (WorldBrain::GetBrainActivity(bot->GetGUID(), goal, taskType, phase, isBreak))
+        brain = taskType != WorldTaskType::None
+            ? Acore::StringFormat("brain: {} {} ({})", WorldGoalName(goal), WorldTaskTypeName(taskType), TaskPhaseName(phase))
+            : Acore::StringFormat("brain: {}{}", WorldGoalName(goal), isBreak ? " (break)" : "");
+
+    char const* exempt = IdleWatchdogExemption(bot, state);
+    bool watched = state.idleLastSeenMs && now - state.idleLastSeenMs <= IDLE_WATCHDOG_GAP_MS;
+    std::string still = exempt ? std::string(exempt)
+        : watched ? Acore::StringFormat("still {}s", (now - state.idleSinceMs) / IN_MILLISECONDS)
+        : std::string("not on its own life");
+
+    return Acore::StringFormat("{} | order {} | {} | {} | watchdog strikes {}", IdleOwner(bot, state),
+        ManualCommandName(state.manualCommand), brain, still, uint32(state.idleStrikes));
+}
+
+std::vector<std::string> ExplainIdle(Player* bot)
+{
+    std::vector<std::string> lines;
+    if (!bot)
+        return lines;
+    lines.push_back(Acore::StringFormat("Bot '{}' (guid {}, level {}) map {} zone {} at ({:.0f}, {:.0f}, {:.0f}).", bot->GetName(),
+        bot->GetGUID().GetCounter(), uint32(bot->GetLevel()), bot->GetMapId(), bot->GetZoneId(), bot->GetPositionX(),
+        bot->GetPositionY(), bot->GetPositionZ()));
+    lines.push_back("  " + IdleSummary(bot));
+
+    auto itr = states.find(bot->GetGUID());
+    if (itr != states.end())
+    {
+        BotAIState const& state = itr->second;
+        uint32 now = uint32(GameTime::GetGameTimeMS().count());
+        if (!state.idleLastReason.empty())
+            lines.push_back(Acore::StringFormat("  watchdog: {} ({}s ago)", state.idleLastReason,
+                state.idleLastActionMs ? (now - state.idleLastActionMs) / IN_MILLISECONDS : 0));
+        else
+            lines.push_back("  watchdog: has not had to step in");
+        if (!bot->GetGroup() && state.manualCommand == BotManualCommand::Stay)
+            lines.push_back("  hint: `.botcmd follow` or `.botcmd stopattack` with its guid clears the Stay.");
+    }
+
+    std::string errand = BotWorldBehavior::Describe(bot->GetGUID());
+    if (!errand.empty())
+        lines.push_back("  ambient: " + errand);
+    std::string party = WorldParties::Describe(bot->GetGUID());
+    if (!party.empty())
+        lines.push_back("  party: " + party);
+    if (BotMgr::GuildGatherOrder const* order = sBotMgr->GetGuildGatherOrder(bot->GetGUID()))
+        lines.push_back(Acore::StringFormat("  guild gather order: {} left{}", order->remainingCount,
+            order->status.empty() ? "" : " - " + order->status));
+    if (std::string bags = BotMaintenance::DescribeBags(bot); !bags.empty())
+        lines.push_back("  " + bags);
+    lines.push_back("  (`.botcmd brain <guid>` has the full open-world state.)");
+    return lines;
+}
+
+bool StartFarm(Player* bot, uint32 creatureEntry, float radius)
+{
+    if (!bot || !bot->IsInWorld() || !creatureEntry)
+        return false;
+
+    ObjectGuid botGuid = bot->GetGUID();
+    CoaBotPerf::MarkCommand(botGuid.GetRawValue());
+    CoaBotScheduling::Notify(botGuid);
+    BotAIState& state = states[botGuid];
+    state.farmActive = true;
+    state.farmEntry = creatureEntry;
+    state.farmRadius = std::clamp(radius, FARM_MIN_RADIUS, FARM_MAX_RADIUS);
+    state.farmMapId = bot->GetMapId();
+    state.farmInstanceId = bot->GetInstanceId();
+    state.farmLoginTime = bot->m_logintime;
+    state.farmAnchorX = bot->GetPositionX();
+    state.farmAnchorY = bot->GetPositionY();
+    state.farmAnchorZ = bot->GetPositionZ();
+    state.farmNextScanAtMs = 0;
+
+    // Stay/Follow would contradict the order; a pending one-shot Pull is left to fire.
+    if (state.manualCommand == BotManualCommand::Stay || state.manualCommand == BotManualCommand::Follow)
+        state.manualCommand = BotManualCommand::None;
+    state.nextFollowCheckAtMs = 0;
+    ClearActiveFollow(bot);
+    WorldBrain::Suspend(bot, SuspendReason::ManualCommand);
+
+    LOG_INFO("module.coa-playerbots", "BotAI: bot '{}' farms entry {} within {:.0f} yd of ({:.0f} {:.0f} {:.0f}) on map {}.",
+        bot->GetName(), creatureEntry, state.farmRadius, state.farmAnchorX, state.farmAnchorY, state.farmAnchorZ, state.farmMapId);
+    return true;
+}
+
+void StopFarm(ObjectGuid botGuid)
+{
+    auto itr = states.find(botGuid);
+    if (itr == states.end() || !itr->second.farmActive)
+        return;
+
+    ClearFarmState(itr->second);
+    CoaBotScheduling::Notify(botGuid);
+    if (Player* bot = ObjectAccessor::FindPlayer(botGuid))
+        BotMovement::ForceStopOwner(bot, MoveOwner::Grind);
+}
+
+bool GetFarm(ObjectGuid botGuid, uint32& creatureEntry, float& radius, uint32& mapId)
+{
+    auto itr = states.find(botGuid);
+    if (itr == states.end() || !itr->second.farmActive)
+        return false;
+
+    creatureEntry = itr->second.farmEntry;
+    radius = itr->second.farmRadius;
+    mapId = itr->second.farmMapId;
+    return true;
+}
+
+char const* GearActionToken(GearActionResult result)
+{
+    switch (result)
+    {
+        case GearActionResult::Ok:       return "ok";
+        case GearActionResult::Combat:   return "combat";
+        case GearActionResult::Trade:    return "trade";
+        case GearActionResult::Teleport: return "teleport";
+        case GearActionResult::Dead:     return "dead";
+        case GearActionResult::Empty:    return "empty";
+        case GearActionResult::Invalid:  return "invalid";
+        case GearActionResult::Cannot:   return "cannot";
+        case GearActionResult::NoSpace:  return "nospace";
+    }
+    return "invalid";
+}
+
+void LockEquipSlot(ObjectGuid botGuid, uint8 slot)
+{
+    if (slot >= EQUIPMENT_SLOT_END)
+        return;
+    states[botGuid].manualEquipLockMask |= (1u << slot);
+}
+
+void UnlockEquipSlot(ObjectGuid botGuid, uint8 slot)
+{
+    if (slot >= EQUIPMENT_SLOT_END)
+        return;
+    auto itr = states.find(botGuid);
+    if (itr == states.end())
+        return;
+    itr->second.manualEquipLockMask &= ~(1u << slot);
+}
+
+void UnlockAllEquipSlots(ObjectGuid botGuid)
+{
+    auto itr = states.find(botGuid);
+    if (itr == states.end())
+        return;
+    itr->second.manualEquipLockMask = 0;
+}
+
+bool IsEquipSlotLocked(ObjectGuid botGuid, uint8 slot)
+{
+    if (slot >= EQUIPMENT_SLOT_END)
+        return false;
+    auto itr = states.find(botGuid);
+    if (itr == states.end())
+        return false;
+    return (itr->second.manualEquipLockMask & (1u << slot)) != 0;
+}
+
+uint32 GetLockedEquipMask(ObjectGuid botGuid)
+{
+    auto itr = states.find(botGuid);
+    if (itr == states.end())
+        return 0;
+    return itr->second.manualEquipLockMask;
+}
+
+namespace
+{
+GearActionResult CheckGearActionAllowed(Player* bot)
+{
+    if (!bot)
+        return GearActionResult::Invalid;
+    if (!bot->IsAlive())
+        return GearActionResult::Dead;
+    if (bot->IsInCombat())
+        return GearActionResult::Combat;
+    if (bot->GetTrader())
+        return GearActionResult::Trade;
+    if (bot->IsBeingTeleported())
+        return GearActionResult::Teleport;
+    return GearActionResult::Ok;
+}
+
+bool IsBackpackItemSlot(uint8 bag, uint8 slot)
+{
+    return bag == INVENTORY_SLOT_BAG_0
+        && slot >= INVENTORY_SLOT_ITEM_START
+        && slot < INVENTORY_SLOT_ITEM_END;
+}
+
+bool IsWornBagItemSlot(Player* bot, uint8 bag, uint8 slot)
+{
+    if (bag < INVENTORY_SLOT_BAG_START || bag >= INVENTORY_SLOT_BAG_END)
+        return false;
+    Bag* worn = bot->GetBagByPos(bag);
+    return worn && slot < worn->GetBagSize();
+}
+} // namespace
+
+GearActionResult EquipBagItem(Player* bot, uint8 bag, uint8 slot, uint8* outDestSlot)
+{
+    if (outDestSlot)
+        *outDestSlot = NULL_SLOT;
+
+    GearActionResult allowed = CheckGearActionAllowed(bot);
+    if (allowed != GearActionResult::Ok)
+        return allowed;
+
+    if (!IsBackpackItemSlot(bag, slot) && !IsWornBagItemSlot(bot, bag, slot))
+        return GearActionResult::Invalid;
+
+    Item* item = bot->GetItemByPos(bag, slot);
+    if (!item)
+        return GearActionResult::Empty;
+
+    ItemTemplate const* proto = item->GetTemplate();
+    if (!proto)
+        return GearActionResult::Invalid;
+
+    uint8 eslot = bot->FindEquipSlot(proto, NULL_SLOT, true);
+    if (eslot == NULL_SLOT)
+        return GearActionResult::Cannot;
+
+    uint16 dest = uint16(eslot) | (uint16(INVENTORY_SLOT_BAG_0) << 8);
+    if (bot->CanEquipItem(NULL_SLOT, dest, item, true) != EQUIP_ERR_OK)
+        return GearActionResult::Cannot;
+
+    bot->SwapItem(item->GetPos(), dest);
+    LockEquipSlot(bot->GetGUID(), eslot);
+    if (outDestSlot)
+        *outDestSlot = eslot;
+    return GearActionResult::Ok;
+}
+
+GearActionResult UnequipToBags(Player* bot, uint8 equipSlot)
+{
+    GearActionResult allowed = CheckGearActionAllowed(bot);
+    if (allowed != GearActionResult::Ok)
+        return allowed;
+
+    if (equipSlot >= EQUIPMENT_SLOT_END)
+        return GearActionResult::Invalid;
+
+    Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, equipSlot);
+    if (!item)
+        return GearActionResult::Empty;
+
+    ItemPosCountVec dest;
+    if (bot->CanStoreItem(NULL_BAG, NULL_SLOT, dest, item, false) != EQUIP_ERR_OK)
+        return GearActionResult::NoSpace;
+
+    bot->RemoveItem(INVENTORY_SLOT_BAG_0, equipSlot, true);
+    bot->StoreItem(dest, item, true);
+    LockEquipSlot(bot->GetGUID(), equipSlot);
+    return GearActionResult::Ok;
+}
+
+void CollectBagSlots(Player* bot, std::vector<BagSlotInfo>& out)
+{
+    out.clear();
+    if (!bot)
+        return;
+
+    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+    {
+        if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            out.push_back({ INVENTORY_SLOT_BAG_0, slot, item->GetEntry(), item->GetCount() });
+    }
+
+    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+    {
+        Bag* worn = bot->GetBagByPos(bag);
+        if (!worn)
+            continue;
+        for (uint32 i = 0; i < worn->GetBagSize(); ++i)
+        {
+            if (Item* item = worn->GetItemByPos(uint8(i)))
+                out.push_back({ bag, uint8(i), item->GetEntry(), item->GetCount() });
+        }
+    }
+}
+
+void CollectBagSizes(Player* bot, uint8& backpackSlots, uint8 bagSizes[4])
+{
+    backpackSlots = INVENTORY_SLOT_ITEM_END - INVENTORY_SLOT_ITEM_START;
+    for (uint8 i = 0; i < 4; ++i)
+        bagSizes[i] = 0;
+    if (!bot)
+        return;
+    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+    {
+        if (Bag* worn = bot->GetBagByPos(bag))
+            bagSizes[bag - INVENTORY_SLOT_BAG_START] = uint8(worn->GetBagSize());
+    }
 }
 
 void SetSuspended(ObjectGuid botGuid, bool suspended)
@@ -6251,8 +7536,24 @@ void TakeAllLoot(Player* bot, Loot& loot)
     // Force a clutter sweep first so there's at least one slot free for what's about to be handed
     // to the bot -- the only thing this ever throws away is grey vendor trash or gear already
     // superseded in its own slot (see IsClutterItem), never anything actually needed.
-    if (bot->GetFreeInventorySpace() == 0)
+    // GetFreeInventorySpace also counts quiver and profession-bag slots, which most loot can
+    // never use, so "== 0" missed most full bots: test whether each item actually fits.
+    uint32 orderItem = 0;
+    bool const onOrder = sBotMgr->GetGatherOrderItem(bot->GetGUID(), &orderItem);
+    std::vector<std::pair<uint32, uint32>> offered;
+    bool needRoom = bot->GetFreeInventorySpace() == 0;
+    for (LootItem const& li : loot.items)
+    {
+        if (li.is_looted)
+            continue;
+        offered.emplace_back(li.itemid, uint32(li.count));
+        ItemPosCountVec dest;
+        if (!needRoom && bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, li.itemid, li.count) != EQUIP_ERR_OK)
+            needRoom = true;
+    }
+    if (needRoom)
         TryMaintainEquipment(bot, GetRole(bot->GetGUID()), true);
+    uint32 const orderBefore = onOrder ? bot->GetItemCount(orderItem, false) : 0;
 
     // Quest-only drops are not in loot.items: Loot::AddItem files them under quest_items, and a
     // client reaches them through slots numbered after the regular items, one per entry of this
@@ -6268,6 +7569,19 @@ void TakeAllLoot(Player* bot, Loot& loot)
         WorldPacket storePacket;
         storePacket << uint8(slot);
         bot->GetSession()->HandleAutostoreLootItemOpcode(storePacket);
+    }
+
+    // A gather-order bot reports what it got: orderstatus shows it, and loot left behind (bags
+    // full) makes BotMgr clear room right away. What did not fit stays in the node (DoLootRelease
+    // leaves a partly looted node GO_ACTIVATED), it is not destroyed.
+    if (onOrder)
+    {
+        bool leftBehind = false;
+        for (LootItem const& li : loot.items)
+            if (!li.is_looted && !li.freeforall)
+                leftBehind = true;
+        uint32 const orderAfter = bot->GetItemCount(orderItem, false);
+        sBotMgr->NoteGatherLoot(bot, offered, orderAfter > orderBefore ? orderAfter - orderBefore : 0, leftBehind);
     }
 }
 

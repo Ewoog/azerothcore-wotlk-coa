@@ -13,7 +13,11 @@
 #include "Define.h"
 #include "ObjectGuid.h"
 
+#include <string>
+#include <vector>
+
 class ChatHandler;
+class Creature;
 class Player;
 struct ItemTemplate;
 struct Loot;
@@ -81,6 +85,30 @@ namespace BotAI
     bool IsInCity(Player const* bot);
     void TryMountForTravel(Player* bot);
 
+    // One pass of selling or destroying bag clutter. copperEarned is only set for stacks
+    // actually sold to a vendor (OnPlayerCanSellItem passed and the item had a sell price).
+    struct InventorySweepResult
+    {
+        uint32 copperEarned = 0;
+        uint32 stacksSold = 0;
+        uint32 stacksDestroyed = 0;
+    };
+
+    // Sells grey junk and outgrown white/green gear to a vendor within 20 yards. Blue or
+    // better gear is kept unless the bot has two free bag slots or fewer. `force` skips the
+    // "only when bags are nearly full" gate (the .botcmd inventory command and the hook that
+    // fires when a grouped player opens a vendor both use it). Destruction without a vendor
+    // still only happens when bags are completely full, and only when `allowDestroy` is true
+    // -- the command and hook leave that off so they never throw items away in the field.
+    InventorySweepResult SweepInventory(Player* bot, bool force = true, bool allowDestroy = false);
+    // One line for the commander: gold earned and stacks sold or destroyed, or "had nothing to sell".
+    std::string DescribeInventorySweep(Player const* bot, InventorySweepResult const& result);
+
+    // A real (non-bot) player in a group opened a vendor, or gossip on a vendor NPC. Grouped
+    // bots within 20 yards of that vendor sell their junk if CoaBots.Inventory.SellOnLeaderVendor
+    // is on. Silent: the command and the COABOT INVENTORY verb are what report the result.
+    void OnPlayerOpenedVendor(Player* player, Creature* vendor);
+
     // Forces an immediate junk/obsolete-gear sweep (sell to a vendor standing right there, else
     // destroy only if bags are truly out of room), skipping MaintainEquipmentNow's "only bother
     // once nearly full" opportunistic gate. For a caller that needs bag space *now* rather than
@@ -138,11 +166,83 @@ namespace BotAI
     // Training A/B switch: true makes ScoreItemForBot use the old class-only stat guess instead of the spec stat model.
     void SetLegacyGearScoring(bool legacy);
 
+    // Idle diagnostics (`.botcmd idle` / `.botcmd why`): a one-line summary of what has the bot
+    // right now -- its group, standing order, brain activity, errand, how long it has stood still
+    // and what the idle watchdog last did -- and the longer explanation behind it.
+    std::string IdleSummary(Player* bot);
+    std::vector<std::string> ExplainIdle(Player* bot);
+
     // Sets a manual movement/engagement command (see BotManualCommand above). pullTarget is
     // only used for Pull -- the guid of whatever the commanding player currently has
     // selected, resolved by the caller (BotAddonChat.cpp) so this API doesn't need to know
     // anything about who issued the command.
     void SetManualCommand(ObjectGuid botGuid, BotManualCommand command, ObjectGuid pullTarget = ObjectGuid::Empty);
+
+    // Farm mode (`.botcmd farm` / the COABOT FARM verb): the bot keeps hunting one creature
+    // entry around a fixed anchor (the bot's own position and map when the order is given)
+    // until told to stop. Each idle tick, after looting and resting have had their turn, the
+    // bot attacks the nearest live, attackable creature of that entry within `radius` of the
+    // anchor that nobody outside its own group has tapped, and walks back to the anchor and
+    // waits when there is none. Takes priority over the open-world layer (questing,
+    // wandering) and over following the group leader. Radius is clamped to 10-100 yards.
+    // Cleared by StopFarm, by Follow/Stay/StopAttack, by a map change or relog, and on
+    // despawn (Forget). Returns false when the bot or entry is unusable.
+    bool StartFarm(Player* bot, uint32 creatureEntry, float radius);
+    void StopFarm(ObjectGuid botGuid);
+    // True while the bot is farming; fills the farmed entry, radius and anchor map.
+    bool GetFarm(ObjectGuid botGuid, uint32& creatureEntry, float& radius, uint32& mapId);
+
+    // Result codes for EQUIP/UNEQUIP addon verbs. Wire form is "ok" or "err:<token>"
+    // with no colons inside the token (see BotAddonChat.cpp). Do not name a token
+    // "error" -- Windows headers #define ERROR.
+    enum class GearActionResult : uint8
+    {
+        Ok = 0,
+        Combat,
+        Trade,
+        Teleport,
+        Dead,
+        Empty,
+        Invalid,
+        Cannot,
+        NoSpace
+    };
+    char const* GearActionToken(GearActionResult result);
+
+    // Manual equipment locks: EQUIP and UNEQUIP set a bit on the destination / emptied
+    // slot so TryUpgradeGearOnce will not immediately undo the player's choice (swap a
+    // lower-scored item back off, or refill an emptied slot). Locks live only in the
+    // in-memory BotAIState, so they clear when the bot despawns or relogs (Forget).
+    // UNLOCK:<guid>:<slot|all> clears them while the bot stays online. Slot 0-18 only
+    // (EQUIPMENT_SLOT_*); bag containers in slots 19-22 are not locked.
+    void LockEquipSlot(ObjectGuid botGuid, uint8 slot);
+    void UnlockEquipSlot(ObjectGuid botGuid, uint8 slot);
+    void UnlockAllEquipSlots(ObjectGuid botGuid);
+    bool IsEquipSlotLocked(ObjectGuid botGuid, uint8 slot);
+    uint32 GetLockedEquipMask(ObjectGuid botGuid);
+
+    // Equip the bag item at (bag, slot). bag is INVENTORY_SLOT_BAG_0 (255) for the
+    // backpack, or 19-22 for an equipped bag. Locks the destination equipment slot on
+    // success. Refuses in combat, while trading, while teleporting, or when dead.
+    GearActionResult EquipBagItem(Player* bot, uint8 bag, uint8 slot, uint8* outDestSlot = nullptr);
+
+    // Move the item in equipment slot `equipSlot` into bags if there is room, then lock
+    // that slot so auto-upgrade does not refill it. Same combat/trade/teleport/dead
+    // refusals as EquipBagItem. Refuses to unequip a bag that still has items in it.
+    GearActionResult UnequipToBags(Player* bot, uint8 equipSlot);
+
+    // Occupied backpack and equipped-bag slots, no item names (the client uses
+    // GetItemInfo). Caller pages these into BAGS replies under the addon size limit.
+    struct BagSlotInfo
+    {
+        uint8 bag = 0;
+        uint8 slot = 0;
+        uint32 entry = 0;
+        uint32 count = 0;
+    };
+    void CollectBagSlots(Player* bot, std::vector<BagSlotInfo>& out);
+    // Backpack slot count, then the size of each equipped bag (0 if that bag slot is empty).
+    void CollectBagSizes(Player* bot, uint8& backpackSlots, uint8 bagSizes[4]);
 
     // Immediately stops the bot's current attack and reverts any manual command to None
     // (falls back to normal follow/idle behavior next tick).

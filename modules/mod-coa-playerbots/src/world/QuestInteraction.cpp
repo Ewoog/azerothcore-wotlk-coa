@@ -1,8 +1,14 @@
 #include "engine/BotDebugLog.h"
 #include "QuestInteraction.h"
 #include "BotAI.h"
+#include "BotMgr.h"
+#include "Chat.h"
+#include "CellImpl.h"
 #include "Creature.h"
 #include "GameObject.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
+#include "Group.h"
 #include "IQuestObjectiveHandler.h"
 #include "ItemTemplate.h"
 #include "ObjectAccessor.h"
@@ -20,6 +26,7 @@
 #include "WorldPlanner.h"
 #include "WorldSession.h"
 #include <cmath>
+#include <vector>
 
 using namespace WorldBrainInternal;
 
@@ -473,5 +480,330 @@ namespace QuestInteraction
             default:
                 return ExecResult::Failed;
         }
+    }
+
+    constexpr float COMPANION_SHARE_RANGE = 40.0f;
+
+    class NearbyQuestCreatureCheck
+    {
+    public:
+        NearbyQuestCreatureCheck(Player* player, uint32 questId, float range, bool turnIn)
+            : _player(player), _questId(questId), _range(range), _turnIn(turnIn) { }
+
+        bool operator()(Creature* creature)
+        {
+            if (!creature->IsAlive())
+                return false;
+            if (_turnIn ? !creature->hasInvolvedQuest(_questId) : !creature->hasQuest(_questId))
+                return false;
+            if (!_player->IsWithinDistInMap(creature, _range))
+                return false;
+            _range = _player->GetDistance(creature);
+            return true;
+        }
+
+    private:
+        Player* _player;
+        uint32 _questId;
+        float _range;
+        bool _turnIn;
+    };
+
+    class NearbyQuestGameObjectCheck
+    {
+    public:
+        NearbyQuestGameObjectCheck(Player* player, uint32 questId, float range, bool turnIn)
+            : _player(player), _questId(questId), _range(range), _turnIn(turnIn) { }
+
+        bool operator()(GameObject* object)
+        {
+            if (_turnIn ? !object->hasInvolvedQuest(_questId) : !object->hasQuest(_questId))
+                return false;
+            if (!_player->IsWithinDistInMap(object, _range))
+                return false;
+            _range = _player->GetDistance(object);
+            return true;
+        }
+
+    private:
+        Player* _player;
+        uint32 _questId;
+        float _range;
+        bool _turnIn;
+    };
+
+    Object* FindNearbyQuestObject(Player* player, uint32 questId, bool turnIn)
+    {
+        if (Unit* selected = player->GetSelectedUnit())
+        {
+            if (Creature* creature = selected->ToCreature())
+            {
+                bool matches = turnIn ? creature->hasInvolvedQuest(questId) : creature->hasQuest(questId);
+                if (creature->IsAlive() && matches && player->IsWithinDistInMap(creature, COMPANION_SHARE_RANGE))
+                    return creature;
+            }
+        }
+
+        Creature* creature = nullptr;
+        NearbyQuestCreatureCheck creatureCheck(player, questId, COMPANION_SHARE_RANGE, turnIn);
+        Acore::CreatureLastSearcher<NearbyQuestCreatureCheck> creatureSearcher(player, creature, creatureCheck);
+        Cell::VisitObjects(player, creatureSearcher, COMPANION_SHARE_RANGE);
+
+        GameObject* object = nullptr;
+        NearbyQuestGameObjectCheck objectCheck(player, questId, COMPANION_SHARE_RANGE, turnIn);
+        Acore::GameObjectLastSearcher<NearbyQuestGameObjectCheck> objectSearcher(player, object, objectCheck);
+        Cell::VisitObjects(player, objectSearcher, COMPANION_SHARE_RANGE);
+
+        if (creature && object)
+            return player->GetDistance(creature) <= player->GetDistance(object) ? static_cast<Object*>(creature) : static_cast<Object*>(object);
+        if (creature)
+            return creature;
+        if (object)
+            return object;
+        return player;
+    }
+
+    bool IsCompanionShareSource(Player* player)
+    {
+        // A bot can sit on the commander's own account (alts logged in through the addon), so the
+        // account name alone does not tell a bot from the player: also ask BotMgr directly.
+        return player && player->IsAlive() && player->IsInWorld() && player->GetSession()
+            && !BotMgr::IsBotAccountId(player->GetSession()->GetAccountId())
+            && !sBotMgr->FindBotPlayer(player->GetGUID().GetCounter())
+            && player->GetGroup();
+    }
+
+    template<typename Fn>
+    void ForNearbyGroupedBots(Player* player, Fn const& fn)
+    {
+        Group* group = player->GetGroup();
+        if (!group)
+            return;
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* member = ref->GetSource();
+            if (!member || member == player || !member->IsAlive() || !member->IsInWorld())
+                continue;
+            if (member->IsBeingTeleported() || !sBotMgr->FindBotPlayer(member->GetGUID().GetCounter()))
+                continue;
+            if (member->GetMap() != player->GetMap() || !member->IsWithinDistInMap(player, COMPANION_SHARE_RANGE))
+                continue;
+            fn(member);
+        }
+    }
+
+    // Grouped bots follow the commander, so their own quest brain is suspended (BotAI.cpp:
+    // WorldBrain::Suspend(..., SuspendReason::Grouped)) and they never walk to an ender on
+    // their own. Every hand-in a grouped bot ever makes comes from the commander's actions
+    // below. RewardQuest is called directly, so a bot does not need to be in the 5-yard
+    // interaction range of the NPC -- only in the same zone of the fight as the commander.
+    constexpr float COMPANION_TURNIN_RANGE = 80.0f;
+
+    enum class HandInResult
+    {
+        Done,
+        NotTaken,
+        AlreadyRewarded,
+        NotComplete,
+        BagsFull,
+        Blocked,
+    };
+
+    // How chatty a hand-in pass is towards the commander.
+    enum class HandInReport
+    {
+        Everything,   // the commander handed in this exact quest: say why a bot could not
+        Problems,     // the commander talked to an ender: successes and real blockers only
+        SuccessOnly,  // the end-of-RewardQuest safety net: anything else was said already
+    };
+
+    bool HasRewardItems(Quest const* quest)
+    {
+        return quest->GetRewChoiceItemsCount() > 0 || quest->GetRewItemsCount() > 0;
+    }
+
+    HandInResult TryHandIn(Player* bot, Quest const* quest, Object* giver, uint32& rewardOut)
+    {
+        uint32 const questId = quest->GetQuestId();
+        if (bot->GetQuestStatus(questId) == QUEST_STATUS_NONE)
+            return bot->GetQuestRewardStatus(questId) ? HandInResult::AlreadyRewarded : HandInResult::NotTaken;
+        if (bot->GetQuestRewardStatus(questId))
+            return HandInResult::AlreadyRewarded;
+
+        // Report/deliver quests become complete when their dialog opens on the ender; this is
+        // the same step for a bot that never opens the dialog itself.
+        if (bot->CanCompleteQuest(questId))
+            bot->CompleteQuest(questId);
+        if (bot->GetQuestStatus(questId) != QUEST_STATUS_COMPLETE)
+            return HandInResult::NotComplete;
+
+        uint32 reward = PickRewardIndex(bot, quest);
+        rewardOut = reward;
+        if (!bot->CanRewardQuest(quest, reward, false) && HasRewardItems(quest) && bot->GetFreeInventorySpace() < 3)
+            BotAI::FreeBagSlots(bot, 3);
+        if (!bot->CanRewardQuest(quest, reward, false))
+        {
+            LOG_INFO("module.coa-playerbots.quests", "QuestSharedTurnInBlocked: '{}' could not hand in quest {} '{}' (choice {}, {} free bag slots).",
+                bot->GetName(), questId, quest->GetTitle(), reward, bot->GetFreeInventorySpace());
+            return HasRewardItems(quest) ? HandInResult::BagsFull : HandInResult::Blocked;
+        }
+
+        bot->RewardQuest(quest, reward, giver, true);
+        return HandInResult::Done;
+    }
+
+    std::string RewardNote(Quest const* quest, uint32 reward)
+    {
+        if (quest->GetRewChoiceItemsCount() == 0 || reward >= QUEST_REWARD_CHOICES_COUNT)
+            return "";
+        if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(quest->RewardChoiceItemId[reward]))
+            return Acore::StringFormat(", took {}", proto->Name1);
+        return "";
+    }
+
+    void Tell(Player* player, std::string const& text)
+    {
+        if (player && player->GetSession())
+            ChatHandler(player->GetSession()).SendSysMessage("AltBots: " + text);
+    }
+
+    // Completed quests this bot could hand in at `giver` right now (status already complete,
+    // or a report/deliver quest that completes on talking to the ender).
+    bool HasFinishedQuestFor(Player* bot, Object* giver, Quest const* only)
+    {
+        auto finished = [bot](uint32 questId)
+        {
+            QuestStatus const status = bot->GetQuestStatus(questId);
+            if (status == QUEST_STATUS_NONE || bot->GetQuestRewardStatus(questId))
+                return false;
+            return status == QUEST_STATUS_COMPLETE || bot->CanCompleteQuest(questId);
+        };
+        if (only)
+            return finished(only->GetQuestId());
+        if (!giver || giver == bot)
+            return false;
+        QuestRelationBounds involved = InvolvedBounds(giver);
+        for (auto itr = involved.first; itr != involved.second; ++itr)
+            if (finished(itr->second))
+                return true;
+        return false;
+    }
+
+    // Hands in either `only` (the quest the commander just turned in) or every quest the bot
+    // has finished that `giver` ends, for every grouped bot near the commander.
+    void HandInForGroup(Player* player, Object* giver, Quest const* only, HandInReport report)
+    {
+        Group* group = player->GetGroup();
+        if (!group || !giver)
+            return;
+
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* bot = ref->GetSource();
+            if (!bot || bot == player || !bot->IsInWorld() || bot->IsBeingTeleported())
+                continue;
+            if (!sBotMgr->FindBotPlayer(bot->GetGUID().GetCounter()))
+                continue;
+
+            // Out of reach: only worth a word when it actually has something to hand in here.
+            bool const sameMap = bot->GetMap() == player->GetMap();
+            if (!sameMap || !bot->IsWithinDistInMap(player, COMPANION_TURNIN_RANGE) || !bot->IsAlive())
+            {
+                if (report != HandInReport::SuccessOnly && HasFinishedQuestFor(bot, giver, only))
+                {
+                    if (!bot->IsAlive())
+                        Tell(player, Acore::StringFormat("{} is dead and cannot turn in here.", bot->GetName()));
+                    else if (!sameMap)
+                        Tell(player, Acore::StringFormat("{} is not on this map and cannot turn in here.", bot->GetName()));
+                    else
+                        Tell(player, Acore::StringFormat("{} is too far away ({:.0f} yd, max {:.0f}) to turn in here.", bot->GetName(),
+                            bot->GetDistance(player), COMPANION_TURNIN_RANGE));
+                }
+                continue;
+            }
+
+            std::vector<Quest const*> quests;
+            if (only)
+                quests.push_back(only);
+            else
+            {
+                QuestRelationBounds involved = InvolvedBounds(giver);
+                for (auto itr = involved.first; itr != involved.second; ++itr)
+                    if (Quest const* quest = sObjectMgr->GetQuestTemplate(itr->second))
+                        if (bot->GetQuestStatus(quest->GetQuestId()) != QUEST_STATUS_NONE)
+                            quests.push_back(quest);
+            }
+
+            for (Quest const* quest : quests)
+            {
+                uint32 reward = 0;
+                HandInResult const result = TryHandIn(bot, quest, giver, reward);
+                switch (result)
+                {
+                    case HandInResult::Done:
+                        LOG_INFO("module.coa-playerbots.quests", "QuestSharedTurnIn: '{}' handed in quest {} '{}' with '{}' (reward choice {}).",
+                            bot->GetName(), quest->GetQuestId(), quest->GetTitle(), player->GetName(), reward);
+                        Tell(player, Acore::StringFormat("{} turned in \"{}\"{}.", bot->GetName(), quest->GetTitle(), RewardNote(quest, reward)));
+                        break;
+                    case HandInResult::NotComplete:
+                        if (report == HandInReport::Everything)
+                            Tell(player, Acore::StringFormat("{} has not finished \"{}\" yet.", bot->GetName(), quest->GetTitle()));
+                        break;
+                    case HandInResult::BagsFull:
+                        if (report != HandInReport::SuccessOnly)
+                            Tell(player, Acore::StringFormat("{} cannot turn in \"{}\": no bag space for the reward.", bot->GetName(), quest->GetTitle()));
+                        break;
+                    case HandInResult::Blocked:
+                        if (report != HandInReport::SuccessOnly)
+                            Tell(player, Acore::StringFormat("{} cannot turn in \"{}\" (not enough money or a weekly limit).", bot->GetName(), quest->GetTitle()));
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+    }
+
+    void OnCompanionLeaderAccepted(Player* player, Quest const* quest, Object* giver)
+    {
+        if (!sBotMgr->QuestShareAccept() || !quest || !IsCompanionShareSource(player))
+            return;
+
+        Object* source = giver ? giver : FindNearbyQuestObject(player, quest->GetQuestId(), false);
+        ForNearbyGroupedBots(player, [&](Player* bot)
+        {
+            if (bot->GetQuestStatus(quest->GetQuestId()) != QUEST_STATUS_NONE)
+                return;
+            if (!bot->CanTakeQuest(quest, false) || !bot->CanAddQuest(quest, false))
+                return;
+            bot->AddQuestAndCheckCompletion(quest, source);
+            if (uint32 spell = quest->GetSrcSpell())
+                bot->CastSpell(bot, spell, true);
+            LOG_INFO("module.coa-playerbots.quests", "QuestSharedAccept: '{}' took quest {} '{}' because '{}' accepted it.",
+                bot->GetName(), quest->GetQuestId(), quest->GetTitle(), player->GetName());
+        });
+    }
+
+    void OnCompanionLeaderTurnedIn(Player* player, Quest const* quest, Object* giver)
+    {
+        if (!sBotMgr->QuestShareTurnIn() || !quest || !IsCompanionShareSource(player))
+            return;
+
+        // With the giver (the reward dialog) this is the main pass and explains failures; without
+        // it (the end-of-RewardQuest hook) it only catches paths that skipped the dialog hook.
+        Object* source = giver ? giver : FindNearbyQuestObject(player, quest->GetQuestId(), true);
+        HandInForGroup(player, source, quest, giver ? HandInReport::Everything : HandInReport::SuccessOnly);
+    }
+
+    void OnCompanionLeaderTalkedTo(Player* player, Object* giver)
+    {
+        if (!sBotMgr->QuestShareTurnIn() || !giver || !IsCompanionShareSource(player))
+            return;
+        QuestRelationBounds involved = InvolvedBounds(giver);
+        if (involved.first == involved.second)
+            return;
+        // Bots often finish objectives after the commander (their own quest drop, a late kill
+        // credit), so every finished quest this ender takes is handed in, not just the commander's.
+        HandInForGroup(player, giver, nullptr, HandInReport::Problems);
     }
 }

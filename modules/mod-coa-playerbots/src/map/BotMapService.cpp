@@ -379,8 +379,8 @@ std::vector<std::string> BotMapService::HandleMapDetail(Player* commander, std::
             detail.taskType = BotMapTaskType::Gather;
             detail.taskItemEntry = gather->itemEntry;
             detail.taskTargetCount = gather->targetCount;
-            detail.taskCompletedCount = gather->gatheredCount;
-            detail.taskStatus = "In Progress";
+            detail.taskCompletedCount = BotMgr::GatherOrderProgress(*gather);
+            detail.taskStatus = gather->status.empty() ? std::string("In Progress") : gather->status;
         }
         else if (auto const* craft = sBotMgr->GetCraftOrder(bot->GetGUID()))
         {

@@ -89,6 +89,22 @@ namespace BotEconomy
 
     // `.botcmd economy ...` (plan <guid>, journal [n], status, protect <item>, unprotect <item>).
     void HandleCommand(ChatHandler* handler, std::string const& args);
+
+    // True when item_entry is in mod_coa_bot_protected_items and that table has been loaded.
+    // False when the economy tables have not been created yet.
+    bool IsProtectedItem(uint32 itemEntry);
+
+    // CoaBots.Economy.Enable = 1 and DryRun = 0: bots actually trade, not just plan.
+    bool IsLive();
+
+    // True while this bot is travelling to town for an economy sale, or is queued to.
+    bool HasSaleTrip(Player const* bot);
+
+    // CoaBots.Economy.MoneyReserveCopper (default 5g).
+    uint32 MoneyReserveCopper();
+
+    // Write an executed vendor-sale row for a bag-cleanup sell. No-op when the economy is off.
+    void RecordCleanupVendorSale(Player* bot, uint32 itemEntry, uint32 count, uint32 unitCopper, char const* reason);
 }
 
 #endif // COA_PLAYERBOTS_BOT_ECONOMY_H
