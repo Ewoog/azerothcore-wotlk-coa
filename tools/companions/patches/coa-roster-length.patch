@@ -1,0 +1,493 @@
+diff --git a/module/src/BotAddonChat.cpp b/module/src/BotAddonChat.cpp
+index ea3c233..87b94af 100644
+--- a/module/src/BotAddonChat.cpp
++++ b/module/src/BotAddonChat.cpp
+@@ -123,8 +123,21 @@ Player* ResolveAuthorizedBot(Player* commander, ObjectGuid::LowType botGuidLow)
+ // it directly to their own session, since a bot's own null-socket session can't send it and
+ // there's no other recipient involved. Body gets the same "COABOT\t" prefix as an outgoing
+ // client message so one client-side CHAT_MSG_ADDON handler covers both directions.
++// Largest reply body that keeps "COABOT\t" + body at or under COABOT_MAX_REPLY_BYTES (250). The
++// 3.3.5 client's addon-whisper path is only safe up to ~255 bytes; a longer line can crash the
++// client before any addon sees it (seen with the 2.2.0 ROSTER line), so nothing longer ever leaves.
++constexpr std::size_t MAX_REPLY_BODY = COABOT_MAX_REPLY_BYTES - PROTOCOL_PREFIX_LEN;
++
+ void SendCoaBotReply(Player* recipient, std::string const& body)
+ {
++    if (body.size() > MAX_REPLY_BODY)
++    {
++        // Last line of defence: every builder below is sized to fit, so this is a bug worth logging.
++        LOG_ERROR("module.coa-playerbots", "BotAddonChat: reply '{}...' is {} bytes (cap {}); cut to fit.",
++            body.substr(0, 24), body.size() + PROTOCOL_PREFIX_LEN, COABOT_MAX_REPLY_BYTES);
++        SendCoaBotReply(recipient, CoaBotWireText(body, MAX_REPLY_BODY, ""));
++        return;
++    }
+     WorldPacket packet;
+     ChatHandler::BuildChatPacket(packet, CHAT_MSG_WHISPER, LANG_ADDON, recipient->GetGUID(), recipient->GetGUID(),
+         std::string(PROTOCOL_PREFIX) + body, 0, recipient->GetName(), recipient->GetName(), 0, false);
+@@ -137,25 +150,55 @@ void SendCoaBotReply(Player* recipient, std::string const& body)
+ // character boundary so the whole body stays under the addon-whisper length cap.
+ std::string WireText(std::string const& text, std::size_t maxBytes)
+ {
+-    std::string out;
+-    out.reserve(text.size() < maxBytes ? text.size() : maxBytes);
+-    for (char c : text)
+-        out += (c == '|' || c == '\n' || c == '\r') ? ' ' : c;
+-    if (out.size() > maxBytes)
+-    {
+-        std::size_t cut = maxBytes;
+-        while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80)
+-            --cut;
+-        out.resize(cut);
+-    }
+-    return out;
++    return CoaBotWireText(text, maxBytes, "|");
+ }
+ 
+ // Room left for the trailing free-text field of a reply whose fixed part is `head`.
+ std::size_t WireRoom(std::string const& head)
+ {
+-    constexpr std::size_t MAX_BODY = 240; // "COABOT\t" + body must stay under 255
+-    return head.size() >= MAX_BODY ? 0 : MAX_BODY - head.size();
++    return CoaBotWireRoom(head);
++}
++
++// PROFS:<guid>:<skillId>:<value>:<max>|... -- the first line keeps the old verb (older AltBots
++// read it as the whole list); entries that don't fit go on PROFSMORE lines of the same shape,
++// which newer AltBots merge in. 16 professions fit on one line in practice; paging only kicks in
++// for absurd skill values. PROFALLOWED stays one line (16 ids x <= 4 digits).
++void SendProfessionLists(Player* commander, Player* bot, ObjectGuid::LowType botGuidLow)
++{
++    uint32 catalogCount = 0;
++    BotProgression::ProfessionInfo const* catalog = BotProgression::ProfessionCatalog(catalogCount);
++    std::string allowed;
++    std::vector<std::string> learned;
++    for (uint32 i = 0; i < catalogCount; ++i)
++    {
++        uint32 skillId = catalog[i].skillId;
++        if (!allowed.empty())
++            allowed += ",";
++        allowed += std::to_string(skillId);
++        if (!bot->HasSkill(skillId))
++            continue;
++        learned.push_back(std::to_string(skillId) + ":" +
++            std::to_string(uint32(bot->GetSkillValue(skillId))) + ":" +
++            std::to_string(uint32(bot->GetMaxSkillValue(skillId))));
++    }
++    std::string const guid = std::to_string(botGuidLow);
++    SendCoaBotReply(commander, "PROFALLOWED:" + guid + ":0:" + allowed);
++
++    std::string head = "PROFS:" + guid + ":";
++    std::string body;
++    for (std::string const& entry : learned)
++    {
++        if (!body.empty() && head.size() + body.size() + 1 + entry.size() > MAX_REPLY_BODY)
++        {
++            SendCoaBotReply(commander, head + body);
++            head = "PROFSMORE:" + guid + ":";
++            body.clear();
++        }
++        if (!body.empty())
++            body += "|";
++        body += entry;
++    }
++    SendCoaBotReply(commander, head + body);
+ }
+ 
+ // GETQUESTS reply: QUESTHDR, then QUEST + its QOBJ lines per quest-log entry, then QUESTEND.
+@@ -281,6 +324,34 @@ void SendBotQuestLog(Player* commander, Player* bot, ObjectGuid::LowType botGuid
+ void HandleCoaBotMessage(Player* commander, std::string const& body);
+ }
+ 
++std::string CoaBotWireText(std::string const& text, std::size_t maxBytes, char const* bad)
++{
++    std::string out;
++    out.reserve(text.size() < maxBytes ? text.size() : maxBytes);
++    for (char c : text)
++    {
++        bool replace = c == '\n' || c == '\r' || c == '\0';
++        for (char const* b = bad; b && *b && !replace; ++b)
++            replace = (c == *b);
++        out += replace ? ' ' : c;
++    }
++    if (out.size() > maxBytes)
++    {
++        // Cut on a UTF-8 character boundary (never in the middle of a multi-byte name).
++        std::size_t cut = maxBytes;
++        while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80)
++            --cut;
++        out.resize(cut);
++    }
++    return out;
++}
++
++std::size_t CoaBotWireRoom(std::string const& head)
++{
++    std::size_t const maxBody = COABOT_MAX_REPLY_BYTES - (sizeof("COABOT\t") - 1);
++    return head.size() >= maxBody ? 0 : maxBody - head.size();
++}
++
+ void CoaBotSendAddonReply(Player* recipient, std::string const& body)
+ {
+     if (recipient && recipient->GetSession())
+@@ -672,16 +743,18 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
+ 
+         uint32 currentSpecId = bot->GetPlayerSetting("core.ascension_active_spec", 0).value;
+         char const* currentSpecName = BotAI::GetSpecName(bot->getClass(), currentSpecId);
+-        SendCoaBotReply(commander, "ROLES:" + std::to_string(botGuidLow) + ":" + roles + ":" + currentRoleStr + ":" +
+-            std::to_string(currentSpecId) + ":" + (currentSpecName ? currentSpecName : ""));
++        std::string rolesHead = "ROLES:" + std::to_string(botGuidLow) + ":" + roles + ":" + currentRoleStr + ":" +
++            std::to_string(currentSpecId) + ":";
++        SendCoaBotReply(commander, rolesHead + WireText(currentSpecName ? currentSpecName : "", WireRoom(rolesHead)));
+     }
+     else if (verb == "GETSPECS")
+     {
+         static char const* const ROLE_NAMES[] = { "dps", "tank", "healer", "support" };
+         for (BotAI::SpecInfo const& spec : BotAI::GetAllSpecs(bot->getClass()))
+         {
+-            SendCoaBotReply(commander, "SPEC:" + std::to_string(botGuidLow) + ":" + std::to_string(spec.specId) + ":" +
+-                ROLE_NAMES[uint32(spec.role)] + ":" + spec.name);
++            std::string specHead = "SPEC:" + std::to_string(botGuidLow) + ":" + std::to_string(spec.specId) + ":" +
++                ROLE_NAMES[uint32(spec.role)] + ":";
++            SendCoaBotReply(commander, specHead + WireText(spec.name ? spec.name : "", WireRoom(specHead)));
+         }
+     }
+     else if (verb == "SETGEARPREF" && parts.size() >= 4)
+@@ -837,27 +910,8 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
+     {
+         // GETPROFS:<botGuidLow>
+         //   PROFALLOWED:<guid>:<limit>:<skillId>,...   limit 0 = CoA's uncapped list
+-        //   PROFS:<guid>:<skillId>:<value>:<max>|...
+-        uint32 catalogCount = 0;
+-        BotProgression::ProfessionInfo const* catalog = BotProgression::ProfessionCatalog(catalogCount);
+-        std::string allowed;
+-        std::string learned;
+-        for (uint32 i = 0; i < catalogCount; ++i)
+-        {
+-            uint32 skillId = catalog[i].skillId;
+-            if (!allowed.empty())
+-                allowed += ",";
+-            allowed += std::to_string(skillId);
+-            if (!bot->HasSkill(skillId))
+-                continue;
+-            if (!learned.empty())
+-                learned += "|";
+-            learned += std::to_string(skillId) + ":" +
+-                std::to_string(uint32(bot->GetSkillValue(skillId))) + ":" +
+-                std::to_string(uint32(bot->GetMaxSkillValue(skillId)));
+-        }
+-        SendCoaBotReply(commander, "PROFALLOWED:" + std::to_string(botGuidLow) + ":0:" + allowed);
+-        SendCoaBotReply(commander, "PROFS:" + std::to_string(botGuidLow) + ":" + learned);
++        //   PROFS:<guid>:<skillId>:<value>:<max>|...   (PROFSMORE:<guid>:... if it would not fit)
++        SendProfessionLists(commander, bot, botGuidLow);
+     }
+     else if (verb == "SETPROF" && parts.size() >= 3)
+     {
+@@ -897,32 +951,16 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
+             token = BotProgression::LearnProfession(bot, skillId);
+ 
+         bool ok = token && std::string(token) == "ok";
++        // PROFRESULT:<guid>:<ok|err>:<token>:<skillId>:<learn|unlearn>:<value>:<max>
++        // (the last three are new; older addons read only the first five fields).
+         SendCoaBotReply(commander, std::string("PROFRESULT:") + std::to_string(botGuidLow) + ":" +
+-            (ok ? "ok:" : "err:") + (token ? token : "invalid") + ":" + std::to_string(skillId));
+-        if (ok)
+-        {
+-            // Refresh the addon list immediately after a successful change.
+-            uint32 catalogCount = 0;
+-            BotProgression::ProfessionInfo const* catalog = BotProgression::ProfessionCatalog(catalogCount);
+-            std::string allowed;
+-            std::string learned;
+-            for (uint32 i = 0; i < catalogCount; ++i)
+-            {
+-                uint32 id = catalog[i].skillId;
+-                if (!allowed.empty())
+-                    allowed += ",";
+-                allowed += std::to_string(id);
+-                if (!bot->HasSkill(id))
+-                    continue;
+-                if (!learned.empty())
+-                    learned += "|";
+-                learned += std::to_string(id) + ":" +
+-                    std::to_string(uint32(bot->GetSkillValue(id))) + ":" +
+-                    std::to_string(uint32(bot->GetMaxSkillValue(id)));
+-            }
+-            SendCoaBotReply(commander, "PROFALLOWED:" + std::to_string(botGuidLow) + ":0:" + allowed);
+-            SendCoaBotReply(commander, "PROFS:" + std::to_string(botGuidLow) + ":" + learned);
+-        }
++            (ok ? "ok:" : "err:") + (token ? token : "invalid") + ":" + std::to_string(skillId) + ":" +
++            (unlearn ? "unlearn" : "learn") + ":" + std::to_string(uint32(bot->GetSkillValue(skillId))) + ":" +
++            std::to_string(uint32(bot->GetMaxSkillValue(skillId))));
++        LOG_INFO("module.coa-playerbots", "BotAddonChat: '{}' -> SETPROF bot '{}' {} skill {} = {}.",
++            commander->GetName(), bot->GetName(), unlearn ? "unlearn" : "learn", skillId, token ? token : "invalid");
++        // Refresh the addon list after every attempt, so the buttons always show the bot's real state.
++        SendProfessionLists(commander, bot, botGuidLow);
+     }
+ }
+ 
+diff --git a/module/src/BotEconomy.cpp b/module/src/BotEconomy.cpp
+index c35c609..7d1906d 100644
+--- a/module/src/BotEconomy.cpp
++++ b/module/src/BotEconomy.cpp
+@@ -1169,8 +1169,7 @@ namespace BotEconomy
+                 if (auto l = limitsIt->second.find(entry); l != limitsIt->second.end())
+                     limit = l->second;
+             std::string name;
+-            for (char c : proto->Name1)
+-                name.push_back(c == ':' || c == '|' || c == ',' ? ' ' : c);
++            name = CoaBotWireText(proto->Name1, 100, ":|,"); // one row can never outgrow a STOCK line
+             rows.push_back({ entry, count, limit, name });
+         }
+         std::sort(rows.begin(), rows.end(), [](Row const& x, Row const& y) { return x.name < y.name; });
+diff --git a/module/src/BotMgr.cpp b/module/src/BotMgr.cpp
+index b265b11..68431e8 100644
+--- a/module/src/BotMgr.cpp
++++ b/module/src/BotMgr.cpp
+@@ -589,6 +589,7 @@ constexpr ProfessionSkillEntry PROFESSION_SKILLS[] =
+     { 202, "Engineering" },   { 333, "Enchanting" },     { 393, "Skinning" },
+     { 755, "Jewelcrafting" }, { 773, "Inscription" },
+     { 129, "First Aid" },     { 185, "Cooking" },        { 356, "Fishing" },
++    { 732, "Woodcutting" },   { 757, "Woodworking" },    // CoA's own trades (mod-woodworking)
+ };
+ 
+ }
+@@ -2280,14 +2281,15 @@ std::vector<std::string> BotMgr::GetGuildRosterInfo(Player* commander) const
+         if (bot->GetGuildId() != guildId)
+             continue;
+ 
+-        std::string professions;
++        // Professions travel on their own ROSTERPROF line(s) as "<skillId>=<value>" pairs: the
++        // old "Name=value" list inside ROSTER pushed the line to ~290 bytes with every profession
++        // and an active order, past the client's ~255-byte addon-whisper limit.
++        std::vector<std::string> professionPairs;
+         for (ProfessionSkillEntry const& entry : PROFESSION_SKILLS)
+         {
+             if (!bot->HasSkill(entry.skillId))
+                 continue;
+-            if (!professions.empty())
+-                professions += ",";
+-            professions += std::string(entry.name) + "=" + std::to_string(bot->GetSkillValue(entry.skillId));
++            professionPairs.push_back(std::to_string(entry.skillId) + "=" + std::to_string(bot->GetSkillValue(entry.skillId)));
+         }
+ 
+         // "item N" was the raw entry id -- confirmed live this reads as meaningless noise to a
+@@ -2327,10 +2329,34 @@ std::vector<std::string> BotMgr::GetGuildRosterInfo(Player* commander) const
+         // Trailing itemEntry field (added for the task board's item tooltip, see
+         // docs/addon-protocol.md) -- task's item *name* was already resolved server-side above,
+         // but a real GameTooltip needs the id, not just the name, to show icon/stats.
+-        lines.push_back("ROSTER:" + std::to_string(bot->GetGUID().GetCounter()) + ":" + bot->GetName() + ":" +
+-            std::to_string(uint32(bot->getClass())) + ":" + std::to_string(bot->GetLevel()) + ":" + task + ":" +
+-            professions + ":" + std::to_string(taskItemEntry) + ":" + std::to_string(orderGathered) + ":" +
+-            std::to_string(orderTarget) + ":" + (canManage ? "1" : "0"));
++        //   ROSTER:<guid>:<name>:<class>:<level>:<task>:<professions, now always empty>:<itemEntry>:<gathered>:<target>:<canManage>
++        //   ROSTERPROF:<guid>:<skillId>=<value>,...   (more ROSTERPROF lines if one would not fit; the
++        //                                              client merges every line for that guid)
++        // Field order is unchanged so 2.2.x clients still read everything but the professions. The
++        // task is the only free text left on the line, so it gets whatever room the fixed fields leave.
++        std::string const guidStr = std::to_string(bot->GetGUID().GetCounter());
++        std::string const name = CoaBotWireText(bot->GetName(), 24, ":|");
++        std::string const tail = "::" + std::to_string(taskItemEntry) + ":" + std::to_string(orderGathered) + ":" +
++            std::to_string(orderTarget) + ":" + (canManage ? "1" : "0");
++        std::string const head = "ROSTER:" + guidStr + ":" + name + ":" + std::to_string(uint32(bot->getClass())) + ":" +
++            std::to_string(bot->GetLevel()) + ":";
++        std::size_t const room = CoaBotWireRoom(head + tail);
++        lines.push_back(head + CoaBotWireText(task, std::min<std::size_t>(room, 120), ":|") + tail);
++
++        std::string const profHead = "ROSTERPROF:" + guidStr + ":";
++        std::string profBody;
++        for (std::string const& pair : professionPairs)
++        {
++            if (!profBody.empty() && profBody.size() + 1 + pair.size() > CoaBotWireRoom(profHead))
++            {
++                lines.push_back(profHead + profBody);
++                profBody.clear();
++            }
++            if (!profBody.empty())
++                profBody += ",";
++            profBody += pair;
++        }
++        lines.push_back(profHead + profBody); // an empty list is sent too: "knows no professions"
+     }
+ 
+     // Queued gather orders (all eligible bots were busy when they were placed), front first:
+@@ -2343,9 +2369,10 @@ std::vector<std::string> BotMgr::GetGuildRosterInfo(Player* commander) const
+         std::string requesterName;
+         if (!q.requesterLowGuid || !sCharacterCache->GetCharacterNameByGuid(ObjectGuid::Create<HighGuid::Player>(q.requesterLowGuid), requesterName))
+             requesterName = "?";
+-        lines.push_back("QUEUED:" + std::to_string(q.queueId) + ":" + std::to_string(q.itemEntry) + ":" + std::to_string(q.count) + ":" +
++        std::string const queuedHead = "QUEUED:" + std::to_string(q.queueId) + ":" + std::to_string(q.itemEntry) + ":" + std::to_string(q.count) + ":" +
+             std::to_string(++position) + ":" + (CanManageGatherOrder(commander, guildId, q.requesterLowGuid) ? "1" : "0") + ":" +
+-            requesterName + ":" + GatherItemName(q.itemEntry));
++            CoaBotWireText(requesterName, 24, ":|") + ":";
++        lines.push_back(queuedHead + CoaBotWireText(GatherItemName(q.itemEntry), CoaBotWireRoom(queuedHead), "|"));
+     }
+     return lines;
+ }
+@@ -2365,7 +2392,9 @@ void AppendCatalogChunks(std::vector<std::string>& lines, std::string const& pre
+     std::string body;
+     for (GatherCategoryItem const& item : items)
+     {
+-        std::string entryStr = std::to_string(item.entry) + "," + item.name;
++        // Names are cut to 100 bytes and lose any ":", "|" or "," so one entry can never break the
++        // list or, on its own, outgrow the chunk budget.
++        std::string entryStr = std::to_string(item.entry) + "," + CoaBotWireText(item.name, 100, ":|,");
+         if (!body.empty() && body.size() + 1 + entryStr.size() > CATALOG_CHUNK_BUDGET_BYTES)
+         {
+             lines.push_back(prefix + body);
+@@ -3899,7 +3928,7 @@ std::vector<std::string> BotMgr::GetEquippedGearInfo(Player* bot) const
+         ItemTemplate const* proto = item->GetTemplate();
+         std::string name = proto ? proto->Name1 : ("item " + std::to_string(item->GetEntry()));
+         lines.push_back("GEAR:" + std::to_string(bot->GetGUID().GetCounter()) + ":" + std::to_string(uint32(slot)) +
+-            ":" + std::to_string(item->GetEntry()) + ":" + name + ":" +
++            ":" + std::to_string(item->GetEntry()) + ":" + CoaBotWireText(name, 100, ":|") + ":" +
+             std::to_string(proto ? proto->ItemLevel : 0));
+     }
+     return lines;
+diff --git a/module/src/BotMgr.h b/module/src/BotMgr.h
+index d17fa53..9aeb5f7 100644
+--- a/module/src/BotMgr.h
++++ b/module/src/BotMgr.h
+@@ -702,4 +702,14 @@ public:
+ // unsolicited notices such as ORDERDONE / ORDERFAIL to a player running the addon.
+ void CoaBotSendAddonReply(Player* recipient, std::string const& body);
+ 
++// Every COABOT reply, "COABOT\t" prefix included, stays at or under this many bytes (the client's
++// addon-whisper path is only safe to ~255). SendCoaBotReply enforces it as a last resort.
++constexpr std::size_t COABOT_MAX_REPLY_BYTES = 250;
++// Wire-safe copy of free text: newlines and every char in `bad` become spaces, then it is cut to
++// maxBytes on a UTF-8 boundary. Use bad = "|" for a trailing field, ":|" for a middle field, and
++// ":|," inside comma lists.
++std::string CoaBotWireText(std::string const& text, std::size_t maxBytes, char const* bad);
++// Bytes left for a trailing free-text field after `head`.
++std::size_t CoaBotWireRoom(std::string const& head);
++
+ #endif // COA_PLAYERBOTS_BOT_MGR_H
+diff --git a/module/src/BotProgression.cpp b/module/src/BotProgression.cpp
+index 3c27ec6..203fdfc 100644
+--- a/module/src/BotProgression.cpp
++++ b/module/src/BotProgression.cpp
+@@ -3,6 +3,7 @@
+ #include "BotAI.h"
+ #include "Config.h"
+ #include "DatabaseEnv.h"
++#include "DBCStores.h"
+ #include "Item.h"
+ #include "Log.h"
+ #include "ObjectMgr.h"
+@@ -118,6 +119,24 @@ namespace
+         return uint16(std::max<uint32>(1, std::min<uint32>(450, uint32(level) * 6)));
+     }
+ 
++    // CoA's own trades stop at Artisan: the client's SkillLineAbility.dbc chains four ranks for
++    // Woodcutting (732) and Woodworking (757), so their ceiling is 300, not 450.
++    uint16 ProfessionMaxSkill(uint32 skillId)
++    {
++        return (skillId == SKILL_WOODCUTTING || skillId == 757) ? 300 : 450;
++    }
++
++    uint16 ProfessionCapFor(uint32 skillId, uint8 level)
++    {
++        return std::min<uint16>(ProfessionCapFor(level), ProfessionMaxSkill(skillId));
++    }
++
++    // Rank step the client shows for a ceiling (1 Apprentice .. 6 Grand Master), as a trainer sets it.
++    uint16 ProfessionStepFor(uint16 cap)
++    {
++        return uint16(std::max<uint32>(1, std::min<uint32>(6, (uint32(cap) + 74) / 75)));
++    }
++
+     bool HasItem(Player* bot, uint32 itemId)
+     {
+         return bot->HasItemCount(itemId, 1, true);
+@@ -455,11 +474,11 @@ namespace BotProgression
+ 
+         // Caps follow the level; values climb part of the way, so a bot's crafting and gathering
+         // grow while it levels without jumping to the cap.
+-        uint16 cap = ProfessionCapFor(newLevel);
+         for (uint32 skill : PROFESSION_SKILLS)
+         {
+             if (!bot->HasSkill(skill))
+                 continue;
++            uint16 cap = ProfessionCapFor(skill, newLevel);
+             uint16 value = bot->GetSkillValue(skill);
+             uint16 grown = uint16(std::min<uint32>(cap, uint32(value) + 4));
+             bot->SetSkill(uint16(skill), bot->GetSkillStep(uint16(skill)), grown, cap);
+@@ -474,7 +493,10 @@ namespace BotProgression
+ 
+     // Trainer rank spells (Apprentice through Grand Master) for each stock profession. Used so
+     // SetSkill caps are legal the same way a visit to a profession trainer would make them.
+-    // Woodcutting (732) and Woodworking (757) have no trainer ranks listed here; those use SetSkill only.
++    // Every id below was checked against the CoA client's SkillLineAbility.dbc (each spell is an
++    // ability of exactly that skill line). Woodcutting (732) and Woodworking (757) are CoA's own
++    // trades with four ranks (Apprentice..Artisan), chained in that file by SupercededBySpell;
++    // 13977859 and 1005008 are the spells mod-woodworking watches for the apprentice rank.
+     struct ProfessionRankSpells
+     {
+         uint32 skillId;
+@@ -497,6 +519,8 @@ namespace BotProgression
+         { 185, { 2550, 3102, 3413, 18260, 33359, 51296 } }, // Cooking
+         { 129, { 3273, 3274, 7924, 10846, 27028, 45542 } }, // First Aid
+         { 356, { 7620, 7731, 7732, 18248, 33095, 51294 } }, // Fishing
++        { 732, { 13977859, 13977882, 13977883, 13977884, 0, 0 } }, // Woodcutting (CoA)
++        { 757, { 1005008, 1005009, 1005010, 1005011, 0, 0 } },     // Woodworking (CoA)
+     };
+ 
+     constexpr uint32 PROFESSION_RANK_CAPS[6] = { 75, 150, 225, 300, 375, 450 };
+@@ -553,7 +577,8 @@ namespace BotProgression
+         for (uint32 i = 0; i < 6; ++i)
+         {
+             uint32 spellId = ranks->spells[i];
+-            if (spellId && cap > previousCap && !bot->HasSpell(spellId))
++            // A rank spell missing from this realm's Spell.dbc is skipped rather than learned blind.
++            if (spellId && cap > previousCap && !bot->HasSpell(spellId) && sSpellMgr->GetSpellInfo(spellId))
+                 bot->learnSpell(spellId, false);
+             previousCap = PROFESSION_RANK_CAPS[i];
+         }
+@@ -596,7 +621,7 @@ namespace BotProgression
+         if (!known)
+             return "unknown";
+ 
+-        uint16 cap = ProfessionCapFor(bot->GetLevel());
++        uint16 cap = ProfessionCapFor(skillId, bot->GetLevel());
+         uint32 configured = sConfigMgr->GetOption<uint32>("CoaBots.Prof.StartSkill", 0);
+         uint16 value = configured == 0 ? cap : uint16(std::max<uint32>(1, std::min<uint32>(cap, configured)));
+         if (bot->HasSkill(skillId))
+@@ -605,8 +630,14 @@ namespace BotProgression
+             if (current > value)
+                 value = current;
+         }
++        if (value > cap)
++            value = cap;
++        if (!sSkillLineStore.LookupEntry(skillId))
++            return "noskill"; // this realm's SkillLine.dbc has no such line; SetSkill would silently do nothing
+         LearnRankSpells(bot, skillId, cap);
+-        bot->SetSkill(uint16(skillId), 1, value, cap);
++        bot->SetSkill(uint16(skillId), ProfessionStepFor(cap), value, cap);
++        if (!bot->HasSkill(skillId))
++            return "noskill";
+         GrantProfessionTools(bot);
+         LearnRecipesFromBook(bot);
+         return "ok";
+@@ -628,6 +659,8 @@ namespace BotProgression
+             return "missing";
+         ForgetRankSpells(bot, skillId);
+         bot->SetSkill(uint16(skillId), 0, 0, 0);
++        if (bot->HasSkill(skillId))
++            return "invalid";
+         return "ok";
+     }
+ }
+diff --git a/module/src/BotProgression.h b/module/src/BotProgression.h
+index 3843bef..67fcfa5 100644
+--- a/module/src/BotProgression.h
++++ b/module/src/BotProgression.h
+@@ -76,7 +76,9 @@ namespace BotProgression
+     // Woodworking. LearnProfession teaches the trainer rank spells up to the level cap
+     // (level*6, max 450) and sets the starting skill from CoaBots.Prof.StartSkill (0 = the
+     // cap, so gathering of that tier works immediately). UnlearnProfession wipes the skill
+-    // and those rank spells. Tokens: ok, combat, trade, dead, teleport, invalid, unknown, missing.
++    // and those rank spells. Tokens: ok, combat, trade, dead, teleport, invalid, unknown, missing,
++    // noskill (the realm's SkillLine.dbc lacks the line, or the skill did not stick). Woodcutting and
++    // Woodworking cap at 300 (four ranks); every other profession at 450.
+     struct ProfessionInfo
+     {
+         uint32 skillId;

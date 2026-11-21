@@ -1,0 +1,548 @@
+From 4b953cc78c95e04cd9a7a2cb0b17e6f680d67a00 Mon Sep 17 00:00:00 2001
+From: Brendan Juno <brendan@localhost>
+Date: Thu, 19 Nov 2026 21:50:47 -0600
+Subject: [PATCH] Allow the addon to learn professions and to invite grouped
+ bots
+
+GETPROFS/SETPROF let a grouped commander teach or wipe a bot profession.
+CoA does not cap primary professions, so any catalog skill can be learned.
+Starting skill defaults to the level cap (CoaBots.Prof.StartSkill = 0).
+
+Inviting a bot that is already in another group makes it leave and join,
+unless it is in combat, a battleground, or a dungeon/raid instance. This
+covers /invite, INVITEBOT, Quick Fill, and .botcmd invitebot.
+---
+ module/conf/mod_coa_playerbots.conf.dist |  10 ++
+ module/src/BotAddonChat.cpp              |  92 +++++++++++++
+ module/src/BotMgr.cpp                    |  98 +++++++++++++-
+ module/src/BotMgr.h                      |   5 +
+ module/src/BotProgression.cpp            | 159 +++++++++++++++++++++++
+ module/src/BotProgression.h              |  18 +++
+ 6 files changed, 378 insertions(+), 4 deletions(-)
+
+diff --git a/module/conf/mod_coa_playerbots.conf.dist b/module/conf/mod_coa_playerbots.conf.dist
+index 71c0d19..42c7412 100644
+--- a/module/conf/mod_coa_playerbots.conf.dist
++++ b/module/conf/mod_coa_playerbots.conf.dist
+@@ -352,6 +352,16 @@ CoaBots.Quest.ShareAccept = 1
+ CoaBots.Gather.WhileFollowing = 1
+ CoaBots.Gather.FollowRadius = 20
+ 
++#
++#    CoaBots.Prof.StartSkill
++#        Starting skill value when the addon teaches a bot a profession (SETPROF).
++#        0 (default) is level-based: the value is set to the level cap (level * 6,
++#        max 450) so gathering and crafting of that tier work immediately.
++#        Any other number is used as the starting value, clamped between 1 and the cap.
++#        Unlearning a profession always wipes its skill and trainer rank spells.
++#
++CoaBots.Prof.StartSkill = 0
++
+ #
+ #    CoaBots.MarkSessionsAsBots
+ #        Description: Mark companion sessions as bots, so the server skips per-client work they have no client for
+diff --git a/module/src/BotAddonChat.cpp b/module/src/BotAddonChat.cpp
+index 3309118..5d4aa91 100644
+--- a/module/src/BotAddonChat.cpp
++++ b/module/src/BotAddonChat.cpp
+@@ -17,6 +17,7 @@
+ #include "BotEconomy.h"
+ #include "BotFormations.h"
+ #include "BotMgr.h"
++#include "BotProgression.h"
+ #include "Chat.h"
+ #include "ClassSpecRoles.h"
+ #include "Creature.h"
+@@ -629,6 +630,97 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
+         SendCoaBotReply(commander, "GEARLOCKS:" + std::to_string(botGuidLow) + ":" +
+             std::to_string(BotAI::GetLockedEquipMask(bot->GetGUID())));
+     }
++    else if (verb == "GETPROFS")
++    {
++        // GETPROFS:<botGuidLow>
++        //   PROFALLOWED:<guid>:<limit>:<skillId>,...   limit 0 = CoA's uncapped list
++        //   PROFS:<guid>:<skillId>:<value>:<max>|...
++        uint32 catalogCount = 0;
++        BotProgression::ProfessionInfo const* catalog = BotProgression::ProfessionCatalog(catalogCount);
++        std::string allowed;
++        std::string learned;
++        for (uint32 i = 0; i < catalogCount; ++i)
++        {
++            uint32 skillId = catalog[i].skillId;
++            if (!allowed.empty())
++                allowed += ",";
++            allowed += std::to_string(skillId);
++            if (!bot->HasSkill(skillId))
++                continue;
++            if (!learned.empty())
++                learned += "|";
++            learned += std::to_string(skillId) + ":" +
++                std::to_string(uint32(bot->GetSkillValue(skillId))) + ":" +
++                std::to_string(uint32(bot->GetMaxSkillValue(skillId)));
++        }
++        SendCoaBotReply(commander, "PROFALLOWED:" + std::to_string(botGuidLow) + ":0:" + allowed);
++        SendCoaBotReply(commander, "PROFS:" + std::to_string(botGuidLow) + ":" + learned);
++    }
++    else if (verb == "SETPROF" && parts.size() >= 3)
++    {
++        // SETPROF:<botGuidLow>:<skillId>              learn
++        // SETPROF:<botGuidLow>:none:<skillId>         unlearn (wipes the skill)
++        // SETPROF:<botGuidLow>:<skillId>:0            unlearn (alternate)
++        // SETPROF:<botGuidLow>:<1|2>:<skillId|none>   same learn/unlearn; the slot is ignored
++        //                                             because CoA does not cap primary professions.
++        bool unlearn = false;
++        uint32 skillId = 0;
++        if (parts[2] == "none")
++        {
++            unlearn = true;
++            if (parts.size() >= 4)
++                skillId = uint32(std::strtoul(parts[3].c_str(), nullptr, 10));
++        }
++        else if (parts.size() >= 4 && (parts[2] == "1" || parts[2] == "2"))
++        {
++            if (parts[3] == "none")
++                unlearn = true; // no slot-to-skill mapping; treat as invalid unless a third id follows
++            else
++                skillId = uint32(std::strtoul(parts[3].c_str(), nullptr, 10));
++        }
++        else
++        {
++            skillId = uint32(std::strtoul(parts[2].c_str(), nullptr, 10));
++            if (parts.size() >= 4 && parts[3] == "0")
++                unlearn = true;
++        }
++
++        char const* token = "invalid";
++        if (unlearn && !skillId)
++            token = "invalid";
++        else if (unlearn)
++            token = BotProgression::UnlearnProfession(bot, skillId);
++        else
++            token = BotProgression::LearnProfession(bot, skillId);
++
++        bool ok = token && std::string(token) == "ok";
++        SendCoaBotReply(commander, std::string("PROFRESULT:") + std::to_string(botGuidLow) + ":" +
++            (ok ? "ok:" : "err:") + (token ? token : "invalid") + ":" + std::to_string(skillId));
++        if (ok)
++        {
++            // Refresh the addon list immediately after a successful change.
++            uint32 catalogCount = 0;
++            BotProgression::ProfessionInfo const* catalog = BotProgression::ProfessionCatalog(catalogCount);
++            std::string allowed;
++            std::string learned;
++            for (uint32 i = 0; i < catalogCount; ++i)
++            {
++                uint32 id = catalog[i].skillId;
++                if (!allowed.empty())
++                    allowed += ",";
++                allowed += std::to_string(id);
++                if (!bot->HasSkill(id))
++                    continue;
++                if (!learned.empty())
++                    learned += "|";
++                learned += std::to_string(id) + ":" +
++                    std::to_string(uint32(bot->GetSkillValue(id))) + ":" +
++                    std::to_string(uint32(bot->GetMaxSkillValue(id)));
++            }
++            SendCoaBotReply(commander, "PROFALLOWED:" + std::to_string(botGuidLow) + ":0:" + allowed);
++            SendCoaBotReply(commander, "PROFS:" + std::to_string(botGuidLow) + ":" + learned);
++        }
++    }
+ }
+ 
+ class coa_bot_addon_chat_script : public PlayerScript
+diff --git a/module/src/BotMgr.cpp b/module/src/BotMgr.cpp
+index ea0ed6c..6573de2 100644
+--- a/module/src/BotMgr.cpp
++++ b/module/src/BotMgr.cpp
+@@ -2619,10 +2619,22 @@ void BotMgr::QuickFillGroup(Player* commander, ChatHandler* handler)
+     {
+         if (bot == commander)
+             continue; // commander may itself be a tracked bot session (RA/.botcmd testing) -- never a candidate for its own group
+-        if (bot->GetGroup() || !bot->IsInWorld() || !bot->IsAlive())
++        if (!bot->IsInWorld() || !bot->IsAlive())
+             continue;
+         if (bot->GetTeamId() != commander->GetTeamId())
+             continue;
++        if (bot->GetGroup())
++        {
++            if (group && bot->GetGroup() == group)
++                continue;
++            // Probe only: do not leave yet. A bot we will not pick must stay in its group.
++            // CanTake is the same guards as TryRelease without the leave -- check by a dry call
++            // is unsafe, so just skip unsafely-grouped bots below via the same conditions.
++            if (commander->IsInCombat() || bot->IsInCombat() || bot->InBattleground())
++                continue;
++            if (Map const* map = bot->GetMap(); map && (map->IsDungeon() || map->IsRaid() || map->IsBattlegroundOrArena()))
++                continue;
++        }
+         pool.push_back(bot);
+     }
+ 
+@@ -2631,6 +2643,9 @@ void BotMgr::QuickFillGroup(Player* commander, ChatHandler* handler)
+     auto isGuildmate = [&](Player* bot) { return commanderInGuild && bot->GetGuildId() == commander->GetGuildId(); };
+     auto betterCandidate = [&](Player* a, Player* b)
+     {
++        bool aFree = !a->GetGroup(), bFree = !b->GetGroup();
++        if (aFree != bFree)
++            return aFree; // ungrouped bots first; steal only when no free bot fits
+         bool aGuild = isGuildmate(a), bGuild = isGuildmate(b);
+         if (aGuild != bGuild)
+             return aGuild; // guildmates always win, regardless of level/ilvl fit
+@@ -2713,6 +2728,8 @@ void BotMgr::QuickFillGroup(Player* commander, ChatHandler* handler)
+ 
+     for (Player* bot : selected)
+     {
++        if (bot->GetGroup() && !TryReleaseBotFromGroup(commander, bot))
++            continue;
+         WorldPacket packet;
+         packet << bot->GetName();
+         packet << uint32(0);
+@@ -2745,10 +2762,19 @@ void BotMgr::InviteBotForRole(Player* commander, BotRole role, ChatHandler* hand
+     std::vector<Player*> pool;
+     for (Player* bot : GetOnlineBots())
+     {
+-        if (bot == commander || bot->GetGroup() || !bot->IsInWorld() || !bot->IsAlive())
++        if (bot == commander || !bot->IsInWorld() || !bot->IsAlive())
+             continue;
+         if (bot->GetTeamId() != commander->GetTeamId())
+             continue;
++        if (bot->GetGroup())
++        {
++            if (Group* selfGroup = commander->GetGroup(); selfGroup && bot->GetGroup() == selfGroup)
++                continue;
++            if (commander->IsInCombat() || bot->IsInCombat() || bot->InBattleground())
++                continue;
++            if (Map const* map = bot->GetMap(); map && (map->IsDungeon() || map->IsRaid() || map->IsBattlegroundOrArena()))
++                continue;
++        }
+         pool.push_back(bot);
+     }
+ 
+@@ -2757,6 +2783,9 @@ void BotMgr::InviteBotForRole(Player* commander, BotRole role, ChatHandler* hand
+     auto isGuildmate = [&](Player* bot) { return commanderInGuild && bot->GetGuildId() == commander->GetGuildId(); };
+     auto better = [&](Player* a, Player* b)
+     {
++        bool aFree = !a->GetGroup(), bFree = !b->GetGroup();
++        if (aFree != bFree)
++            return aFree;
+         bool aGuild = isGuildmate(a), bGuild = isGuildmate(b);
+         if (aGuild != bGuild)
+             return aGuild;
+@@ -2797,6 +2826,12 @@ void BotMgr::InviteBotForRole(Player* commander, BotRole role, ChatHandler* hand
+         BotAI::SetRole(chosen->GetGUID(), role);
+     }
+ 
++    if (chosen->GetGroup() && !TryReleaseBotFromGroup(commander, chosen))
++    {
++        if (handler)
++            handler->PSendSysMessage("BotMgr: '{}' cannot leave its group right now.", chosen->GetName());
++        return;
++    }
+     WorldPacket packet;
+     packet << chosen->GetName();
+     packet << uint32(0);
+@@ -2884,15 +2919,54 @@ std::vector<std::string> BotMgr::GetBotList(Player* commander, BotListQuery cons
+     return lines;
+ }
+ 
++bool BotMgr::TryReleaseBotFromGroup(Player* inviter, Player* bot)
++{
++    if (!inviter || !bot || bot == inviter)
++        return false;
++    if (FindBotPlayer(bot->GetGUID().GetCounter()) != bot)
++        return false;
++    Group* group = bot->GetGroup();
++    if (!group)
++        return true;
++    if (inviter->GetGroup() && group == inviter->GetGroup())
++        return false;
++    if (inviter->IsInCombat() || bot->IsInCombat())
++        return false;
++    if (bot->InBattleground())
++        return false;
++    if (Map const* map = bot->GetMap())
++        if (map->IsDungeon() || map->IsRaid() || map->IsBattlegroundOrArena())
++            return false;
++    if (group->isBGGroup())
++        return false;
++
++    LOG_INFO("module.coa-playerbots", "BotMgr: bot '{}' leaving group so '{}' can invite it.",
++        bot->GetName(), inviter->GetName());
++    bot->RemoveFromGroup(GROUP_REMOVEMETHOD_LEAVE);
++    return !bot->GetGroup();
++}
++
+ void BotMgr::InviteBotToGroup(Player* commander, ObjectGuid::LowType botGuid, ChatHandler* handler)
+ {
+     Player* bot = commander ? FindBotPlayer(botGuid) : nullptr;
+-    if (!bot || bot == commander || bot->GetGroup() || bot->GetTeamId() != commander->GetTeamId())
++    if (!bot || bot == commander || bot->GetTeamId() != commander->GetTeamId())
+     {
+         if (handler)
+             handler->SendSysMessage("BotMgr: that bot is not available any more.");
+         return;
+     }
++    if (bot->GetGroup() && commander->GetGroup() && bot->GetGroup() == commander->GetGroup())
++    {
++        if (handler)
++            handler->PSendSysMessage("BotMgr: '{}' is already in your group.", bot->GetName());
++        return;
++    }
++    if (bot->GetGroup() && !TryReleaseBotFromGroup(commander, bot))
++    {
++        if (handler)
++            handler->PSendSysMessage("BotMgr: '{}' is in combat, a battleground, or an instance, so it cannot leave its group yet.", bot->GetName());
++        return;
++    }
+     if (Group* group = commander->GetGroup(); group && group->IsFull())
+     {
+         if (handler)
+@@ -3754,12 +3828,28 @@ namespace
+ class coa_bot_restore_group_script : public PlayerScript
+ {
+ public:
+-    coa_bot_restore_group_script() : PlayerScript("coa_bot_restore_group_script", { PLAYERHOOK_ON_LOGIN }) { }
++    coa_bot_restore_group_script() : PlayerScript("coa_bot_restore_group_script",
++        { PLAYERHOOK_ON_LOGIN, PLAYERHOOK_CAN_GROUP_INVITE }) { }
+ 
+     void OnPlayerLogin(Player* player) override
+     {
+         sBotMgr->RestoreGroupBotsOnLogin(player);
+     }
++
++    // HandleGroupInviteOpcode calls this *before* the ERR_ALREADY_IN_GROUP check, so a bot
++    // that is already grouped can leave first and the rest of the invite proceeds normally.
++    // The client /invite path, .botcmd invitebot, Quick Fill and INVITEBOT all go through that opcode.
++    bool OnPlayerCanGroupInvite(Player* player, std::string& membername) override
++    {
++        if (!sBotMgr->BotsEnabled() || !player)
++            return true;
++        Player* target = ObjectAccessor::FindPlayerByName(membername, false);
++        if (!target || !sBotMgr->FindBotPlayer(target->GetGUID().GetCounter()))
++            return true;
++        if (target->GetGroup() && target->GetGroup() != player->GetGroup())
++            sBotMgr->TryReleaseBotFromGroup(player, target);
++        return true;
++    }
+ };
+ }
+ 
+diff --git a/module/src/BotMgr.h b/module/src/BotMgr.h
+index 3b9fac8..bf489e9 100644
+--- a/module/src/BotMgr.h
++++ b/module/src/BotMgr.h
+@@ -323,6 +323,11 @@ public:
+     void InviteBotToGroup(Player* commander, ObjectGuid::LowType botGuid, ChatHandler* handler);
+     void InviteBotToGuild(Player* commander, ObjectGuid::LowType botGuid, ChatHandler* handler);
+ 
++    // If `bot` is a tracked bot already in another group, leave that group so a new invite can
++    // succeed. Returns false (and leaves the group alone) when the bot is in combat, in a
++    // battleground, or on a dungeon/raid map. Returns true when the bot has no group, or left it.
++    bool TryReleaseBotFromGroup(Player* inviter, Player* bot);
++
+     // Toggles autonomous dungeon/raid play for `leader`'s whole group: while enabled, a Tank
+     // bot idle inside an instance (no target, leader not already fighting) scans for the
+     // nearest hostile pack and pulls it on its own -- see BotAI.cpp's TryAutoPullInInstance
+diff --git a/module/src/BotProgression.cpp b/module/src/BotProgression.cpp
+index 6bbfa37..3c27ec6 100644
+--- a/module/src/BotProgression.cpp
++++ b/module/src/BotProgression.cpp
+@@ -471,6 +471,165 @@ namespace BotProgression
+         ProvisionFood(bot, 20);
+         ProvisionPotions(bot, 5);
+     }
++
++    // Trainer rank spells (Apprentice through Grand Master) for each stock profession. Used so
++    // SetSkill caps are legal the same way a visit to a profession trainer would make them.
++    // Woodcutting (732) and Woodworking (757) have no trainer ranks listed here; those use SetSkill only.
++    struct ProfessionRankSpells
++    {
++        uint32 skillId;
++        uint32 spells[6];
++    };
++
++    constexpr ProfessionRankSpells PROFESSION_RANK_SPELLS[] =
++    {
++        { 171, { 2259, 3101, 3464, 11611, 28596, 51304 } }, // Alchemy
++        { 164, { 2018, 3100, 3538,  9785, 29844, 51300 } }, // Blacksmithing
++        { 333, { 7411, 7412, 7413, 13920, 28029, 51313 } }, // Enchanting
++        { 202, { 4036, 4037, 4038, 12656, 30350, 51306 } }, // Engineering
++        { 165, { 2108, 3104, 3811, 10662, 32549, 51302 } }, // Leatherworking
++        { 197, { 3908, 3909, 3910, 12180, 26790, 51309 } }, // Tailoring
++        { 182, { 2366, 2368, 3570, 11993, 28695, 50300 } }, // Herbalism
++        { 186, { 2575, 2576, 3564, 10248, 29354, 50310 } }, // Mining
++        { 393, { 8613, 8617, 8618, 10768, 32678, 50305 } }, // Skinning
++        { 755, { 25229, 25230, 28894, 28895, 28897, 51311 } }, // Jewelcrafting
++        { 773, { 45357, 45358, 45359, 45360, 45361, 45363 } }, // Inscription
++        { 185, { 2550, 3102, 3413, 18260, 33359, 51296 } }, // Cooking
++        { 129, { 3273, 3274, 7924, 10846, 27028, 45542 } }, // First Aid
++        { 356, { 7620, 7731, 7732, 18248, 33095, 51294 } }, // Fishing
++    };
++
++    constexpr uint32 PROFESSION_RANK_CAPS[6] = { 75, 150, 225, 300, 375, 450 };
++
++    constexpr ProfessionInfo PROFESSION_CATALOG[] =
++    {
++        { 171, "Alchemy",        false },
++        { 164, "Blacksmithing",  false },
++        { 333, "Enchanting",     false },
++        { 202, "Engineering",    false },
++        { 165, "Leatherworking", false },
++        { 197, "Tailoring",      false },
++        { 182, "Herbalism",      false },
++        { 186, "Mining",         false },
++        { 393, "Skinning",       false },
++        { 755, "Jewelcrafting",  false },
++        { 773, "Inscription",    false },
++        { 732, "Woodcutting",    false },
++        { 757, "Woodworking",    false },
++        { 185, "Cooking",        true  },
++        { 129, "First Aid",      true  },
++        { 356, "Fishing",        true  },
++    };
++
++    ProfessionRankSpells const* RanksFor(uint32 skillId)
++    {
++        for (ProfessionRankSpells const& row : PROFESSION_RANK_SPELLS)
++            if (row.skillId == skillId)
++                return &row;
++        return nullptr;
++    }
++
++    char const* ProfessionBusyToken(Player* bot)
++    {
++        if (!bot)
++            return "invalid";
++        if (!bot->IsAlive())
++            return "dead";
++        if (bot->IsInCombat())
++            return "combat";
++        if (bot->GetTrader())
++            return "trade";
++        if (bot->IsBeingTeleported())
++            return "teleport";
++        return nullptr;
++    }
++
++    void LearnRankSpells(Player* bot, uint32 skillId, uint16 cap)
++    {
++        ProfessionRankSpells const* ranks = RanksFor(skillId);
++        if (!ranks)
++            return;
++        uint32 previousCap = 0;
++        for (uint32 i = 0; i < 6; ++i)
++        {
++            uint32 spellId = ranks->spells[i];
++            if (spellId && cap > previousCap && !bot->HasSpell(spellId))
++                bot->learnSpell(spellId, false);
++            previousCap = PROFESSION_RANK_CAPS[i];
++        }
++    }
++
++    void ForgetRankSpells(Player* bot, uint32 skillId)
++    {
++        ProfessionRankSpells const* ranks = RanksFor(skillId);
++        if (!ranks)
++            return;
++        for (uint32 i = 0; i < 6; ++i)
++        {
++            uint32 spellId = ranks->spells[i];
++            if (spellId && bot->HasSpell(spellId))
++                bot->removeSpell(spellId, SPEC_MASK_ALL, false);
++        }
++    }
++
++    ProfessionInfo const* ProfessionCatalog(uint32& count)
++    {
++        count = uint32(sizeof(PROFESSION_CATALOG) / sizeof(PROFESSION_CATALOG[0]));
++        return PROFESSION_CATALOG;
++    }
++
++    uint16 ProfessionCapForLevel(uint8 level)
++    {
++        return ProfessionCapFor(level);
++    }
++
++    char const* LearnProfession(Player* bot, uint32 skillId)
++    {
++        if (char const* busy = ProfessionBusyToken(bot))
++            return busy;
++        if (!skillId)
++            return "invalid";
++        bool known = false;
++        for (ProfessionInfo const& info : PROFESSION_CATALOG)
++            if (info.skillId == skillId)
++                known = true;
++        if (!known)
++            return "unknown";
++
++        uint16 cap = ProfessionCapFor(bot->GetLevel());
++        uint32 configured = sConfigMgr->GetOption<uint32>("CoaBots.Prof.StartSkill", 0);
++        uint16 value = configured == 0 ? cap : uint16(std::max<uint32>(1, std::min<uint32>(cap, configured)));
++        if (bot->HasSkill(skillId))
++        {
++            uint16 current = bot->GetSkillValue(skillId);
++            if (current > value)
++                value = current;
++        }
++        LearnRankSpells(bot, skillId, cap);
++        bot->SetSkill(uint16(skillId), 1, value, cap);
++        GrantProfessionTools(bot);
++        LearnRecipesFromBook(bot);
++        return "ok";
++    }
++
++    char const* UnlearnProfession(Player* bot, uint32 skillId)
++    {
++        if (char const* busy = ProfessionBusyToken(bot))
++            return busy;
++        if (!skillId)
++            return "invalid";
++        bool known = false;
++        for (ProfessionInfo const& info : PROFESSION_CATALOG)
++            if (info.skillId == skillId)
++                known = true;
++        if (!known)
++            return "unknown";
++        if (!bot->HasSkill(skillId))
++            return "missing";
++        ForgetRankSpells(bot, skillId);
++        bot->SetSkill(uint16(skillId), 0, 0, 0);
++        return "ok";
++    }
+ }
+ 
+ namespace
+diff --git a/module/src/BotProgression.h b/module/src/BotProgression.h
+index 534817b..3843bef 100644
+--- a/module/src/BotProgression.h
++++ b/module/src/BotProgression.h
+@@ -70,6 +70,24 @@ namespace BotProgression
+     // Raises profession caps to the new level, then relearns abilities, recipes, tools and food.
+     // Talents are applied separately by BotTalentBuilds.
+     void OnLevelUp(Player* bot, uint8 newLevel);
++
++    // Addon-driven profession learn/unlearn (GETPROFS / SETPROF). CoA does not cap primary
++    // professions: a character may hold every profession at once, including Woodcutting and
++    // Woodworking. LearnProfession teaches the trainer rank spells up to the level cap
++    // (level*6, max 450) and sets the starting skill from CoaBots.Prof.StartSkill (0 = the
++    // cap, so gathering of that tier works immediately). UnlearnProfession wipes the skill
++    // and those rank spells. Tokens: ok, combat, trade, dead, teleport, invalid, unknown, missing.
++    struct ProfessionInfo
++    {
++        uint32 skillId;
++        char const* name;
++        bool secondary;
++    };
++    ProfessionInfo const* ProfessionCatalog(uint32& count);
++    uint16 ProfessionCapForLevel(uint8 level);
++    char const* LearnProfession(Player* bot, uint32 skillId);
++    char const* UnlearnProfession(Player* bot, uint32 skillId);
+ }
+ 
++
+ #endif // COA_PLAYERBOTS_BOT_PROGRESSION_H
+-- 
+2.47.3
+

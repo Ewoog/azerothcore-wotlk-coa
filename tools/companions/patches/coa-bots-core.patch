@@ -1,0 +1,1668 @@
+From f018074e5c0d4db7620fbda7e87131993d295274 Mon Sep 17 00:00:00 2001
+From: CoA bots backport <backport@localhost>
+Date: Thu, 19 Nov 2026 13:19:21 -0600
+Subject: [PATCH 1/4] Core: bot hooks for mod-coa-playerbots
+
+Backport of the core changes Corfirean/mod-coa-playerbots needs, taken from
+Corfirean/azerothcore-wotlk-coa branch coa-bots (c3f2fd4b2):
+- LFG queue policy (LfgQueuePolicy / LfgCompositionMode incl. BOT_FILL) and the
+  GlobalScript hooks OnResolveLfgQueuePolicy / HasLfgAutoFillProvider (3d7707ff4, 280b74098)
+- LFGMgr::GetProposalIdForPlayer, PLAYERHOOK_ON_PETITION_OFFERED,
+  Guild "friend class BotMgr" (d57b39bc5)
+- Guild bank helpers used by companions (bd4263d26)
+- Player::IsBot() accessor (c90fe401a, accessor only)
+- CHAR_SEL_COA_BUILD_CREATOR_BY_ID prepared statement (b15838bde)
+- LocalLevelScaling::FlightUnlockLevel (6f7e28225, declaration only, default 60)
+---
+ src/server/coa/AscensionClassServiceBridge.h  |  30 +++
+ src/server/coa/AscensionCompat.cpp            | 255 ++++++++++++++++++
+ src/server/coa/AscensionResourceQuery.h       | 165 ++++++++++++
+ .../Implementation/CharacterDatabase.cpp      |   3 +
+ .../Implementation/CharacterDatabase.h        |   1 +
+ src/server/game/DungeonFinding/LFG.h          |  17 ++
+ src/server/game/DungeonFinding/LFGMgr.cpp     |  27 +-
+ src/server/game/DungeonFinding/LFGMgr.h       |   5 +
+ src/server/game/DungeonFinding/LFGQueue.cpp   |  74 ++++-
+ src/server/game/DungeonFinding/LFGQueue.h     |   1 +
+ src/server/game/Entities/Player/Player.cpp    |   5 +
+ src/server/game/Entities/Player/Player.h      |   1 +
+ src/server/game/Guilds/Guild.cpp              |  57 ++++
+ src/server/game/Guilds/Guild.h                |   8 +
+ src/server/game/Handlers/PetitionsHandler.cpp |   1 +
+ .../game/Miscellaneous/LocalLevelScaling.h    |   3 +
+ .../Scripting/ScriptDefines/GlobalScript.cpp  |  29 ++
+ .../Scripting/ScriptDefines/GlobalScript.h    |  25 ++
+ .../Scripting/ScriptDefines/PlayerScript.cpp  |   5 +
+ .../Scripting/ScriptDefines/PlayerScript.h    |   7 +
+ src/server/game/Scripting/ScriptMgr.h         |   5 +
+ 21 files changed, 712 insertions(+), 12 deletions(-)
+ create mode 100644 src/server/coa/AscensionClassServiceBridge.h
+ create mode 100644 src/server/coa/AscensionResourceQuery.h
+
+diff --git a/src/server/coa/AscensionClassServiceBridge.h b/src/server/coa/AscensionClassServiceBridge.h
+new file mode 100644
+index 000000000..12b26fa01
+--- /dev/null
++++ b/src/server/coa/AscensionClassServiceBridge.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include "Define.h"
++#include "AscensionCoATalentData.h"
++#include <string>
++
++class Player;
++
++// Minimal, deliberately narrow bridge into AscensionClassService, which is entirely
++// private to AscensionCompat.cpp (defined inside a file-local anonymous namespace, no
++// other public header). mod-coa-playerbots needs to actually switch spec and spend a
++// bot's paid (AECost/TECost > 0) Ascension talent points through the same
++// budget-checked, mutually-exclusive-group-aware path a real player's
++// `.localspec`/`.localtalent` commands use, instead of writing PlayerSettings and
++// learnSpell()-ing spells directly and silently bypassing the budget check and the
++// in-memory active-spec bookkeeping GetActiveSpecialization() depends on.
++namespace AscensionClassServiceBridge
++{
++    // Mirrors AscensionClassService::SwitchSpecialization(player, specializationId)
++    // exactly. Returns false if specializationId isn't valid for player's class.
++    bool SwitchSpecialization(Player* player, uint32 specializationId);
++
++    // Mirrors AscensionClassService::SetTalentRank(player, entry, rank, error) exactly --
++    // same validation order, same budget accounting, same free-choice-group mutual
++    // exclusion. Returns false and fills `error` with a human-readable reason on failure
++    // (wrong class, spec mismatch, level too low, over budget, etc.); on success the
++    // player's spellbook and specialization bookkeeping are already updated, no further
++    // action needed by the caller.
++    bool SetTalentRank(Player* player, AscensionCompatData::CoATalentEntry const& entry, uint32 rank, std::string& error);
++}
+diff --git a/src/server/coa/AscensionCompat.cpp b/src/server/coa/AscensionCompat.cpp
+index 3168b2290..c77f5a2c2 100644
+--- a/src/server/coa/AscensionCompat.cpp
++++ b/src/server/coa/AscensionCompat.cpp
+@@ -9,7 +9,9 @@
+ #include "AscensionAccountProgress.h"
+ #include "AscensionClientDbcStream.h"
+ #include "AscensionDisplayPatch.h"
++#include "AscensionClassServiceBridge.h"
+ #include "AscensionFelsworn.h"
++#include "AscensionResourceQuery.h"
+ #include "AscensionHighRiskPolicy.h"
+ #include "AscensionRemovedSpellActionBars.h"
+ #include "AscensionRulesets.h"
+@@ -11956,3 +11958,256 @@ void AddAscensionCompatScripts() {
+   new AscensionCompatAllCreatureScript();
+   new AscensionCompatPetScript();
+ }
++
++// mod-coa-playerbots support (from Corfirean/azerothcore-wotlk-coa coa-bots)
++namespace AscensionCompatData
++{
++    // Additive, read-only implementation of AscensionResourceQuery.h -- see that header for the
++    // contract each function promises. Deliberately placed here, outside the anonymous namespace
++    // above, purely to gain external linkage; it reads the same tables and mirrors the same
++    // per-class special-case constants AscensionResourceService already enforces internally
++    // (GetAuraStacks/CheckCast/OnSpellCast/ModifyAuraStacks, all above), it does not duplicate or
++    // reimplement any of that class's actual mutation logic, and it never changes player state.
++
++    std::vector<ResourceChannel> const& GetResourceChannels(uint8 classId)
++    {
++        static std::unordered_map<uint8, std::vector<ResourceChannel>> cache;
++        auto itr = cache.find(classId);
++        if (itr != cache.end())
++            return itr->second;
++
++        std::vector<ResourceChannel> channels;
++        for (ResourceDisplay const& display : ResourceDisplays)
++            if (display.ClassId == classId)
++                channels.push_back(ResourceChannel{false, 0, display.SpellId, display.Name});
++
++        // Manually-curated additions for resources that exist in a class's own hand-written
++        // Resource()/OnSpellCheckCast code but have no ResourceDisplays row at all -- see
++        // AscensionVenomancer::Resource (Exposed, AscensionVenomancer.cpp) and
++        // xoroth_casts::OnSpellCheckCast (Blood, AscensionXorothAbilities.cpp). Reaper's native
++        // Runic Power is included since AscensionClassMechanics26To32.cpp grants it a real
++        // crit-proc bonus (Soul Generator) outside NativePowerGainRules, making it a load-bearing
++        // part of that class's resource economy rather than an ordinary native bar a caller would
++        // already think to check.
++        if (classId == CLASS_PROPHET) // Venomancer
++            channels.push_back(ResourceChannel{false, 0, 805095, "Exposed"});
++        else if (classId == CLASS_FLESHWARDEN) // Knight of Xoroth
++            channels.push_back(ResourceChannel{false, 0, 800999, "Blood"});
++        else if (classId == CLASS_REAPER)
++            channels.push_back(ResourceChannel{true, POWER_RUNIC_POWER, 0, "Runic Power"});
++
++        return cache.emplace(classId, std::move(channels)).first->second;
++    }
++
++    ResourceState QueryAuraResourceState(Player* player, uint32 resourceSpellId)
++    {
++        ResourceState state;
++        if (!player)
++            return state;
++
++        if (Aura const* aura = player->GetAura(resourceSpellId))
++            state.Current = aura->GetStackAmount();
++
++        // Real caps that diverge from (or aren't represented in) that resource's own
++        // ResourceDisplays row -- these constants live in AscensionCustomResourceData.h and are
++        // the SAME ones AscensionCultist::Resource/AscensionTinker::Resource/AscensionSunCleric::
++        // Resource clamp to, not an independently hardcoded copy (see item 5 of the resource-
++        // engine review: SUN_CLERIC_SOLAR_POWER_MAX etc. used to only exist here).
++        switch (resourceSpellId)
++        {
++            case 500706: // Cultist Insanity
++                state.Maximum = CULTIST_INSANITY_MAX;
++                state.MaximumKnown = true;
++                return state;
++            case 801816: // Tinker Scrap
++                state.Maximum = TINKER_SCRAP_MAX;
++                state.MaximumKnown = true;
++                return state;
++            case 500149: // SunCleric SolarPower
++                state.Maximum = SUN_CLERIC_SOLAR_POWER_MAX;
++                state.MaximumKnown = true;
++                return state;
++            default:
++                break;
++        }
++
++        for (ResourceDisplay const& display : ResourceDisplays)
++        {
++            if (display.SpellId != resourceSpellId)
++                continue;
++            if (display.DisplayMaximum)
++            {
++                state.Maximum = display.DisplayMaximum;
++                state.MaximumKnown = true;
++                return state;
++            }
++            break;
++        }
++
++        // No fixed display cap -- fall back to the spell's own real max stack count (accounting
++        // for any stack-count-modifying talent, unlike a plain DisplayMaximum-or-StackAmount
++        // guess). Matches what AscensionVenomancer::Resource itself uses for Brood/Exposed.
++        if (SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(resourceSpellId))
++        {
++            if (uint8 maxStacks = spellInfo->CalcMaxAuraStacks(player))
++            {
++                state.Maximum = maxStacks;
++                state.MaximumKnown = true;
++                return state;
++            }
++        }
++
++        state.MaximumKnown = false;
++        return state;
++    }
++
++    std::vector<ResourceRequirement> QueryAbilityResourceRequirements(uint8 classId, uint32 resolvedSpellId)
++    {
++        std::vector<ResourceRequirement> out;
++
++        for (ResourceCostRule const& rule : ResourceCostRules)
++        {
++            if (rule.ClassId != classId || resolvedSpellId < rule.FirstSpellId || resolvedSpellId > rule.LastSpellId)
++                continue;
++            out.push_back(ResourceRequirement{rule.ResourceSpellId, rule.Amount, rule.Consumption,
++                rule.PreserveCostAuraSpellId, rule.PreserveCostChancePercent, 0, 0});
++            // ResourceCostRules never defines more than one requirement per spell today -- mirrors
++            // AscensionResourceService::CheckCast/OnSpellCast's own first-match-then-break. This
++            // table is the sole real gate for Felsworn/Stormbringer/Pyromancer -- confirmed by a
++            // full-tree audit of every OnSpellCheckCast/CanPrepare in this module; none of those
++            // three classes has any other custom-resource cast gate anywhere in their own files.
++            break;
++        }
++
++        // Every other hardcoded special-case gate found by that same full-tree audit -- see
++        // AscensionResourceQuery.h's own comment on this function for what each one is.
++        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(resolvedSpellId);
++
++        if (classId == CLASS_REAPER && resolvedSpellId == 805078) // Generate Soul
++            out.push_back(ResourceRequirement{805077, 3, ResourceConsumption::None, 0, 0, 0, 0});
++
++        if (classId == CLASS_RANGER && spellInfo && spellInfo->SpellFamilyName == uint32(CLASS_RANGER) + 6)
++            out.push_back(ResourceRequirement{804329, 1, ResourceConsumption::None, 0, 0, 0, 0});
++
++        if (classId == CLASS_STARCALLER && resolvedSpellId == 800386) // Lunar Phase spender
++            out.push_back(ResourceRequirement{802985, 4, ResourceConsumption::Fixed, 0, 0, 0, 0});
++
++        if (classId == CLASS_FLESHWARDEN && spellInfo)
++        {
++            // Blood spender (two explicit spells, fully drained on cast).
++            if (resolvedSpellId == 520294 || resolvedSpellId == 805679)
++                out.push_back(ResourceRequirement{800999, 1, ResourceConsumption::All, 0, 0, 0, 0});
++            // Demonfire spender -- via the real AscensionXoroth::Spender predicate (an 11-root
++            // spell-chain match), not a hand-copied id list, so this can never drift out of sync
++            // with the actual gameplay gate in AscensionXorothAbilities.cpp. Also fully drained.
++            if (AscensionXoroth::Spender(spellInfo))
++                out.push_back(ResourceRequirement{500906, 1, ResourceConsumption::All, 0, 0, 0, 0});
++        }
++
++        if (classId == CLASS_PROPHET && spellInfo && AscensionVenomancer::Spender(spellInfo))
++            // Brood spender -- via the real AscensionVenomancer::Spender predicate, same reasoning
++            // as Xoroth above. Drains the full current stack (AscensionVenomancerAbilities.cpp's
++            // own OnSpellBeforeEffects: Resource(player, Brood, -int32(Count(player, Brood)))).
++            out.push_back(ResourceRequirement{804972, 1, ResourceConsumption::All, 0, 0, 0, 0});
++
++        if (classId == CLASS_CULTIST && spellInfo && AscensionCultist::IsInsanitySpender(spellInfo))
++            // Conditional: only a real requirement while Madness is ABSENT -- see
++            // AscensionCultist::Resource's own comment on why a decrease silently no-ops under
++            // Madness (AscensionCultistAbilities.cpp:52-53,73-74).
++            out.push_back(ResourceRequirement{500706, 40, ResourceConsumption::Fixed, 0, 0, 0, 803061});
++
++        if (classId == CLASS_SUN_CLERIC && resolvedSpellId == 804584) // DawnCast
++            out.push_back(ResourceRequirement{500149, 20, ResourceConsumption::Fixed, 0, 0, 0, 0});
++
++        if (classId == CLASS_TINKER && resolvedSpellId == 801384) // Mechsuit
++            out.push_back(ResourceRequirement{801816, 1, ResourceConsumption::None, 0, 0, 0, 0});
++
++        return out;
++    }
++
++    std::vector<AuraGate> QueryAbilityAuraGates(uint8 classId, uint32 resolvedSpellId)
++    {
++        std::vector<AuraGate> out;
++
++        // Sun Cleric's DawnCast is blocked outright while Dawn is already up, independent of its
++        // real SolarPower>=20 numeric requirement (see QueryAbilityResourceRequirements) --
++        // AscensionSunClericAbilities.cpp:75-76's own `|| player->HasAura(Dawn)`.
++        if (classId == CLASS_SUN_CLERIC && resolvedSpellId == 804584)
++            out.push_back(AuraGate{807440, true});
++
++        return out;
++    }
++
++    MinionCapacityState QueryMinionCapacityState(Player* player)
++    {
++        MinionCapacityState state;
++        if (!player || !UsesAscensionClassMechanics(player, CLASS_NECROMANCER))
++            return state;
++
++        state.Maximum = AscensionNecromancer::Capacity(player);
++        state.Current = AscensionNecromancer::Used(player);
++        return state;
++    }
++
++    uint32 QueryMinionCapacityCost(Player* player, uint32 resolvedSpellId)
++    {
++        if (!player || !UsesAscensionClassMechanics(player, CLASS_NECROMANCER))
++            return 0;
++        return AscensionNecromancer::Cost(player, resolvedSpellId);
++    }
++
++    std::vector<ResourceGain> QueryAbilityResourceGains(uint8 classId, uint32 resolvedSpellId)
++    {
++        std::vector<ResourceGain> out;
++
++        for (ResourceGainRule const& rule : ResourceGainRules)
++        {
++            if (rule.ClassId != classId)
++                continue;
++            if ((rule.FirstSpellId || rule.LastSpellId) &&
++                (resolvedSpellId < rule.FirstSpellId || resolvedSpellId > rule.LastSpellId))
++                continue;
++
++            ResourceGain gain;
++            gain.IsNative = false;
++            gain.ResourceSpellId = rule.ResourceSpellId;
++            gain.Amount = rule.Amount;
++            gain.Event = rule.Event;
++            gain.RequiredAuraSpellId = rule.RequiredAuraSpellId;
++            gain.ForbiddenAuraSpellId = rule.ForbiddenAuraSpellId;
++            gain.ChancePercent = rule.ChancePercent;
++            out.push_back(gain);
++        }
++
++        for (NativePowerGainRule const& rule : NativePowerGainRules)
++        {
++            if (rule.ClassId != classId)
++                continue;
++            if ((rule.FirstSpellId || rule.LastSpellId) &&
++                (resolvedSpellId < rule.FirstSpellId || resolvedSpellId > rule.LastSpellId))
++                continue;
++
++            ResourceGain gain;
++            gain.IsNative = true;
++            gain.NativePowerType = rule.PowerType;
++            gain.Amount = rule.InternalAmount;
++            gain.Event = rule.Event;
++            gain.RequiredAuraSpellId = rule.RequiredAuraSpellId;
++            gain.ForbiddenAuraSpellId = rule.ForbiddenAuraSpellId;
++            out.push_back(gain);
++        }
++
++        return out;
++    }
++}
++
++
++bool AscensionClassServiceBridge::SwitchSpecialization(Player* player, uint32 specializationId)
++{
++    return AscensionClassService::Instance().SwitchSpecialization(player, specializationId);
++}
++
++bool AscensionClassServiceBridge::SetTalentRank(Player* player, AscensionCompatData::CoATalentEntry const& entry, uint32 rank, std::string& error)
++{
++    return AscensionClassService::Instance().SetTalentRank(player, entry, rank, error);
++}
+diff --git a/src/server/coa/AscensionResourceQuery.h b/src/server/coa/AscensionResourceQuery.h
+new file mode 100644
+index 000000000..4f04b0269
+--- /dev/null
++++ b/src/server/coa/AscensionResourceQuery.h
+@@ -0,0 +1,165 @@
++/*
++ * mod-ascension-compat
++ *
++ * Public, read-only resource metadata & live-state query API.
++ *
++ * AscensionCustomResourceData.h's tables (ResourceDisplays/ResourceGainRules/ResourceCostRules/
++ * NativePowerGainRules) describe *most* of each class's real resource behavior, but several
++ * classes' true gain/spend/cap logic lives in hand-written per-class code (AscensionPyromancer::
++ * Resource, AscensionCultist::Resource, AscensionVenomancer::Resource, AscensionTinker::Resource,
++ * AscensionSunCleric::Resource, HandleAscensionReaperResource, HandleAscensionPrimalistEarthshaping
++ * Gain, and several classes' own OnSpellCheckCast hooks) and is NOT fully reflected in those
++ * tables -- e.g. SunCleric's SolarPower caps at a hardcoded 20 regardless of its ResourceDisplays
++ * row, Venomancer's Brood/Exposed caps come from the spell's own CalcMaxAuraStacks, and a handful
++ * of classes (Reaper, Ranger, Starcaller, Knight of Xoroth) gate specific casts on custom resource
++ * stacks entirely outside ResourceCostRules.
++ *
++ * This header is the single place other modules (bot AI, tooling) should query real resource
++ * state and ability resource requirements from -- never re-derive rules from the raw tables or
++ * from a class's own hardcoded constants independently. Every function here is read-only: none of
++ * them mutate player state or change any gameplay behavior.
++ */
++
++#ifndef ASCENSION_RESOURCE_QUERY_H
++#define ASCENSION_RESOURCE_QUERY_H
++
++#include "AscensionCustomResourceData.h"
++#include "Define.h"
++#include <vector>
++
++class Player;
++
++namespace AscensionCompatData
++{
++    // One resource "channel" a class can have -- either a native Blizzard power bar (identified
++    // by Powers enum value) or a custom stacking aura. A class can have zero, one, or several
++    // simultaneously: e.g. Reaper has 3 aura channels (Reaped Soul/Soul Fragment/Soul Infusion)
++    // plus native Runic Power; Runemaster has 3 aura channels (arcane/fire/frost sigil) and no
++    // resource-shaped native bar; most non-custom classes (13/15/18) have zero aura channels and
++    // rely purely on their native power bar, which callers can already read directly via
++    // Player::getPowerType()/GetPower()/GetMaxPower() without consulting this API at all.
++    struct ResourceChannel
++    {
++        bool IsNative = false;
++        uint8 NativePowerType = 0;  // valid when IsNative (a Powers enum value)
++        uint32 AuraSpellId = 0;     // valid when !IsNative
++        char const* Name = "";
++    };
++
++    // Every resource channel `classId` actually has. Built from ResourceDisplays plus a small,
++    // manually-curated set of additions for resources that exist in the class's own C++ code but
++    // have no ResourceDisplays row at all (Venomancer's second resource "Exposed", Knight of
++    // Xoroth's second resource "Blood") -- see the .cpp for exactly which and why. Reaper's native
++    // Runic Power is included explicitly since it's a real, load-bearing part of that class's
++    // resource economy (crit-proc bonus generation outside NativePowerGainRules); other classes'
++    // native power bars are not listed here since a caller can already read them generically.
++    std::vector<ResourceChannel> const& GetResourceChannels(uint8 classId);
++
++    struct ResourceState
++    {
++        uint32 Current = 0;
++        uint32 Maximum = 0;
++        bool MaximumKnown = false;
++    };
++
++    // Current/maximum for one custom aura-stack resource, matching exactly what that class's own
++    // gain/spend code enforces -- not a generic DisplayMaximum-or-StackAmount guess. See the .cpp
++    // for the specific classes (SunCleric/Cultist/Tinker) whose real cap is a hardcoded literal
++    // that doesn't match their ResourceDisplays row, and Venomancer, whose real cap is dynamic
++    // (SpellInfo::CalcMaxAuraStacks) rather than the row's static number. Returns
++    // MaximumKnown=false (with Current still valid) when no display row exists and the spell's
++    // own CalcMaxAuraStacks resolves to 0 -- callers must not invent a percentage in that case.
++    ResourceState QueryAuraResourceState(Player* player, uint32 resourceSpellId);
++
++    // One custom-resource requirement a specific already-resolved ability has (classId +
++    // resolvedSpellId -- use the resolved rank, not the profile's root spell id, since a rule's
++    // FirstSpellId/LastSpellId range is matched against the real cast spell id). Resolved from
++    // ResourceCostRules (first matching row wins, exactly mirroring AscensionResourceService::
++    // CheckCast/OnSpellCast's own first-match-then-break semantics -- these tables never define
++    // more than one requirement per spell today) PLUS every hardcoded special-case gate found by a
++    // full audit of every OnSpellCheckCast/CanPrepare in this module (see the .cpp for the
++    // per-class list -- Reaper's Generate Soul, Ranger's Advantage, Starcaller's Lunar Phase,
++    // Knight of Xoroth's Demonfire (via the real AscensionXoroth::Spender predicate, not a
++    // hand-copied id list) and Blood, Venomancer's Brood (via the real AscensionVenomancer::
++    // Spender predicate), Cultist's conditional Insanity spend, Sun Cleric's DawnCast, Tinker's
++    // Mechsuit). Returns an empty vector when the ability has no custom resource requirement at
++    // all (most abilities, most classes) -- callers must still separately check the spell's native
++    // DBC power cost via SpellInfo::CalcPowerCost, which this function deliberately does not
++    // duplicate. Does NOT cover Necromancer's minion-capacity gate (a different resource shape --
++    // see QueryMinionCapacityCost) or a pure aura-presence/absence gate with no numeric resource
++    // behind it (see QueryAbilityAuraGates).
++    //
++    // Conditional requirements: RequiredAuraSpellId/ForbiddenAuraSpellId (0 = no condition) say
++    // when this requirement actually applies -- e.g. Cultist's 40-Insanity spend is only a real
++    // requirement while the Madness aura is ABSENT (ForbiddenAuraSpellId = Madness); while Madness
++    // is up the ability needs no Insanity at all (see AscensionCultist::Resource's own comment on
++    // why a decrease is silently dropped there). This function returns the requirement's static
++    // shape unconditionally (cacheable by classId+spellId, independent of which player asks); the
++    // caller evaluates RequiredAuraSpellId/ForbiddenAuraSpellId against the real player to decide
++    // whether it's active right now.
++    struct ResourceRequirement
++    {
++        uint32 ResourceSpellId = 0;
++        uint32 Amount = 0;
++        ResourceConsumption Consumption = ResourceConsumption::None;
++        uint32 PreserveCostAuraSpellId = 0;
++        uint8 PreserveCostChancePercent = 0;
++        uint32 RequiredAuraSpellId = 0;   // requirement only active while this aura IS present
++        uint32 ForbiddenAuraSpellId = 0;  // requirement only active while this aura is ABSENT
++    };
++    std::vector<ResourceRequirement> QueryAbilityResourceRequirements(uint8 classId, uint32 resolvedSpellId);
++
++    // A pure aura-presence/absence cast gate with no numeric resource economy behind it -- e.g.
++    // Sun Cleric's DawnCast additionally requires the Dawn aura to be ABSENT (on top of its real
++    // SolarPower>=20 numeric requirement, which IS in QueryAbilityResourceRequirements). Kept
++    // separate from ResourceRequirement rather than faked as a 0/1 aura-stack resource, per this
++    // module's own review guidance: don't force a binary aura-state check into a numeric-resource
++    // shape just to reuse one model.
++    struct AuraGate
++    {
++        uint32 AuraSpellId = 0;
++        bool RequireAbsent = true;  // true: this gate blocks the cast while the aura IS present;
++                                     // false: blocks while the aura is ABSENT
++    };
++    std::vector<AuraGate> QueryAbilityAuraGates(uint8 classId, uint32 resolvedSpellId);
++
++    // Necromancer's minion-capacity economy (classId 23) is a different resource *shape* entirely
++    // -- an active-summon counter (AscensionNecromancer::Capacity/Used), not an aura-stack or
++    // native power bar -- so it gets its own tiny query pair rather than being forced into
++    // ResourceRequirement. Both call straight through to AscensionNecromancer's own real
++    // Capacity/Used/Cost functions (never reimplemented here); Cost specifically needs a live
++    // Player because at least one spell's real cost depends on a talent aura
++    // (AscensionNecromancer::Cost's own 500331 special case), so it is intentionally NOT
++    // classId+spellId cacheable the way ResourceRequirement is. Returns {0, 0} / 0 for every class
++    // other than Necromancer.
++    struct MinionCapacityState
++    {
++        uint32 Current = 0;  // currently-used capacity (live minion count, already pruned of dead/
++                              // despawned/out-of-map summons)
++        uint32 Maximum = 0;
++    };
++    MinionCapacityState QueryMinionCapacityState(Player* player);
++    uint32 QueryMinionCapacityCost(Player* player, uint32 resolvedSpellId);
++
++    // One resource this ability potentially generates (classId + resolvedSpellId), resolved from
++    // ResourceGainRules (custom aura, IsNative=false) and NativePowerGainRules (native power bar,
++    // IsNative=true), matched by spell id range the same way the runtime event handlers do.
++    // Event-gated gains keep their Event/RequiredAuraSpellId/ForbiddenAuraSpellId/ChancePercent so
++    // a caller can tell "always generates on cast" apart from "may generate depending on what
++    // happens next" -- this is metadata only (what CAN this ability generate), not a prediction of
++    // what it WILL generate on any given cast.
++    struct ResourceGain
++    {
++        bool IsNative = false;
++        uint32 ResourceSpellId = 0;  // valid when !IsNative
++        uint8 NativePowerType = 0;   // valid when IsNative
++        int32 Amount = 0;
++        ResourceGainEvent Event = ResourceGainEvent::Cast;
++        uint32 RequiredAuraSpellId = 0;
++        uint32 ForbiddenAuraSpellId = 0;
++        uint8 ChancePercent = 100;
++    };
++    std::vector<ResourceGain> QueryAbilityResourceGains(uint8 classId, uint32 resolvedSpellId);
++}
++
++#endif // ASCENSION_RESOURCE_QUERY_H
+diff --git a/src/server/database/Database/Implementation/CharacterDatabase.cpp b/src/server/database/Database/Implementation/CharacterDatabase.cpp
+index 0e7ad8956..a5d0c0e3d 100644
+--- a/src/server/database/Database/Implementation/CharacterDatabase.cpp
++++ b/src/server/database/Database/Implementation/CharacterDatabase.cpp
+@@ -207,6 +207,9 @@ void CharacterDatabaseConnection::DoPrepareStatements()
+         "SELECT entry, id, leveling_id, pve_id, pvp_id, class, owner_account, author, name, subtext, description, "
+         "icon, upvotes, created, updated, category, roles, primary_stat, needs_repairs, flags, difficulty "
+         "FROM coa_build_creator", CONNECTION_SYNCH);
++    PrepareStatement(CHAR_SEL_COA_BUILD_CREATOR_BY_ID,
++        "SELECT entry, id, name, roles, primary_stat FROM coa_build_creator WHERE id = ? LIMIT 1",
++        CONNECTION_SYNCH);
+     PrepareStatement(CHAR_SEL_COA_BUILD_CREATOR_SPELLS,
+         "SELECT entry, spell, level, core, optimal, empowering, synergistic, flags, comment "
+         "FROM coa_build_creator_spell ORDER BY entry, slot", CONNECTION_SYNCH);
+diff --git a/src/server/database/Database/Implementation/CharacterDatabase.h b/src/server/database/Database/Implementation/CharacterDatabase.h
+index b06ec423e..61b5b38a1 100644
+--- a/src/server/database/Database/Implementation/CharacterDatabase.h
++++ b/src/server/database/Database/Implementation/CharacterDatabase.h
+@@ -662,6 +662,7 @@ enum CharacterDatabaseStatements : uint32
+     CHAR_UPD_COA_CHARACTER_SURVIVAL_RESET,
+ 
+     CHAR_SEL_COA_BUILD_CREATOR_BUILDS,
++    CHAR_SEL_COA_BUILD_CREATOR_BY_ID,
+     CHAR_SEL_COA_BUILD_CREATOR_SPELLS,
+     CHAR_SEL_COA_BUILD_CREATOR_ENCHANTS,
+     CHAR_SEL_COA_BUILD_CREATOR_ITEM_TYPES,
+diff --git a/src/server/game/DungeonFinding/LFG.h b/src/server/game/DungeonFinding/LFG.h
+index 7941d7988..9268934f7 100644
+--- a/src/server/game/DungeonFinding/LFG.h
++++ b/src/server/game/DungeonFinding/LFG.h
+@@ -108,6 +108,23 @@ namespace lfg
+         RANDOM_DUNGEON_HEROIC_WOTLK                  = 262
+     };
+ 
++    enum class LfgCompositionMode : uint8
++    {
++        MATCHMAKING   = 0,
++        BOT_FILL      = 1,
++        CURRENT_PARTY = 2
++    };
++
++    struct LfgQueuePolicy
++    {
++        LfgCompositionMode compositionMode{LfgCompositionMode::MATCHMAKING};
++        uint8 challengeSize{0}; // 0 = Adaptive
++        bool bypassMatchmaking{false};
++        bool requireStandardRoles{true};
++        uint8 minPlayers{5};
++        uint8 targetPlayers{5};
++    };
++
+     class Lfg5Guids;
+ 
+     typedef std::list<Lfg5Guids> Lfg5GuidsList;
+diff --git a/src/server/game/DungeonFinding/LFGMgr.cpp b/src/server/game/DungeonFinding/LFGMgr.cpp
+index d46210674..e24dd2c7f 100644
+--- a/src/server/game/DungeonFinding/LFGMgr.cpp
++++ b/src/server/game/DungeonFinding/LFGMgr.cpp
+@@ -626,6 +626,17 @@ namespace lfg
+         if (grp && (grp->isBGGroup() || grp->isBFGroup()))
+             return;
+ 
++        if (grp && guid != grp->GetLeaderGUID())
++        {
++            LfgQueuePolicy policy;
++            sScriptMgr->OnResolveLfgQueuePolicy(guid, policy);
++            if (policy.compositionMode == LfgCompositionMode::CURRENT_PARTY)
++            {
++                ChatHandler(player->GetSession()).SendNotification("Only the group leader can initiate a Current Party dungeon queue.");
++                return;
++            }
++        }
++
+         if (!sScriptMgr->OnPlayerCanJoinLfg(player, roles, dungeons, comment))
+             return;
+ 
+@@ -1526,7 +1537,13 @@ namespace lfg
+ 
+             if (itRoles == roleCheck.roles.end())
+             {
+-                roleCheck.state = CheckGroupRoles(roleCheck.roles) ? LFG_ROLECHECK_FINISHED : LFG_ROLECHECK_WRONG_ROLES;
++                LfgQueuePolicy policy;
++                sScriptMgr->OnResolveLfgQueuePolicy(roleCheck.leader, policy);
++
++                if (!policy.requireStandardRoles)
++                    roleCheck.state = LFG_ROLECHECK_FINISHED;
++                else
++                    roleCheck.state = CheckGroupRoles(roleCheck.roles) ? LFG_ROLECHECK_FINISHED : LFG_ROLECHECK_WRONG_ROLES;
+             }
+         }
+ 
+@@ -2550,6 +2567,14 @@ namespace lfg
+         return state;
+     }
+ 
++    uint32 LFGMgr::GetProposalIdForPlayer(ObjectGuid guid) const
++    {
++        for (auto const& [proposalId, proposal] : ProposalsStore)
++            if (proposal.players.find(guid) != proposal.players.end())
++                return proposalId;
++        return 0;
++    }
++
+     LfgState LFGMgr::GetOldState(ObjectGuid guid)
+     {
+         LfgState state;
+diff --git a/src/server/game/DungeonFinding/LFGMgr.h b/src/server/game/DungeonFinding/LFGMgr.h
+index 78a236094..242fe4391 100644
+--- a/src/server/game/DungeonFinding/LFGMgr.h
++++ b/src/server/game/DungeonFinding/LFGMgr.h
+@@ -369,6 +369,7 @@ namespace lfg
+         Lfg5Guids queues;                                      ///< Queue Ids to remove/readd
+         LfgGuidList showorder;                                 ///< Show order in update window
+         LfgProposalPlayerContainer players;                    ///< Players data
++        LfgQueuePolicy policy;                                 ///< Queue policy (composition & challenge size)
+     };
+ 
+     // Stores all rolecheck info of a group that wants to join
+@@ -466,6 +467,10 @@ namespace lfg
+         LfgDungeonSet const& GetSelectedDungeons(ObjectGuid guid);
+         /// Get current lfg state
+         LfgState GetState(ObjectGuid guid);
++        /// Get the pending proposal id a player is a member of (0 if none) -- needed by anything
++        /// that has to call UpdateProposal() without already knowing the id a real client would
++        /// have learned from its own SMSG_LFG_PROPOSAL_UPDATE packet (mod-coa-playerbots).
++        uint32 GetProposalIdForPlayer(ObjectGuid guid) const;
+         /// Get current dungeon
+         uint32 GetDungeon(ObjectGuid guid, bool asId = true);
+         /// Get the map id of the current dungeon
+diff --git a/src/server/game/DungeonFinding/LFGQueue.cpp b/src/server/game/DungeonFinding/LFGQueue.cpp
+index 85f92d1f5..96da380f6 100644
+--- a/src/server/game/DungeonFinding/LFGQueue.cpp
++++ b/src/server/game/DungeonFinding/LFGQueue.cpp
+@@ -107,7 +107,9 @@ namespace lfg
+     void LFGQueue::AddQueueData(ObjectGuid guid, time_t joinTime, LfgDungeonSet const& dungeons, LfgRolesMap const& rolesMap)
+     {
+         LOG_DEBUG("lfg", "JOINED AddQueueData: {}", guid.ToString());
+-        QueueDataStore[guid] = LfgQueueData(joinTime, dungeons, rolesMap);
++        LfgQueueData data(joinTime, dungeons, rolesMap);
++        sScriptMgr->OnResolveLfgQueuePolicy(guid, data.policy);
++        QueueDataStore[guid] = std::move(data);
+         AddToQueue(guid);
+     }
+ 
+@@ -187,7 +189,12 @@ namespace lfg
+ 
+             FindNewGroups(newGuid);
+ 
+-            CompatibleList.splice((pushCompatiblesToFront ? CompatibleList.begin() : CompatibleList.end()), CompatibleTempList);
++            LfgQueueDataContainer::const_iterator itNewQueue = QueueDataStore.find(newGuid);
++            bool const bypassMatchmaking = (itNewQueue != QueueDataStore.end() && itNewQueue->second.policy.bypassMatchmaking);
++            if (!bypassMatchmaking)
++            {
++                CompatibleList.splice((pushCompatiblesToFront ? CompatibleList.begin() : CompatibleList.end()), CompatibleTempList);
++            }
+             CompatibleTempList.clear();
+ 
+             return newGroupsProcessed; // pussywizard: only one per update, shouldn't be a problem
+@@ -197,6 +204,16 @@ namespace lfg
+ 
+     LfgCompatibility LFGQueue::FindNewGroups(ObjectGuid const& newGuid)
+     {
++        LfgQueueDataContainer::const_iterator itNewQueue = QueueDataStore.find(newGuid);
++        bool const bypassMatchmaking = (itNewQueue != QueueDataStore.end() && itNewQueue->second.policy.bypassMatchmaking);
++        if (bypassMatchmaking)
++        {
++            uint64 foundMask = 0;
++            uint32 foundCount = 0;
++            std::set<Lfg5Guids> emptyCompatibles;
++            return CheckCompatibility(Lfg5Guids(), newGuid, foundMask, foundCount, emptyCompatibles);
++        }
++
+         // each combination of dps+heal+tank (tank*8 + heal+4 + dps) has a value assigned 0..15
+         // first 16 bits of the mask are for marking if such combination was found once, second 16 bits for marking second occurence of that combination, etc
+         uint64 foundMask = 0;
+@@ -255,6 +272,18 @@ namespace lfg
+         if (!currentCompatibles.empty() && currentCompatibles.find(strGuids) != currentCompatibles.end())
+             return LFG_INCOMPATIBLES_TOO_MUCH_PLAYERS;
+ 
++        // Ensure bypassMatchmaking queue entries never match with other groups
++        auto itNewQueueData = QueueDataStore.find(newGuid);
++        if (itNewQueueData != QueueDataStore.end() && itNewQueueData->second.policy.bypassMatchmaking && !checkWith.empty())
++            return LFG_INCOMPATIBLES_TOO_MUCH_PLAYERS;
++
++        for (uint8 i = 0; i < 5 && checkWith.guids[i]; ++i)
++        {
++            auto itCheckData = QueueDataStore.find(checkWith.guids[i]);
++            if (itCheckData != QueueDataStore.end() && itCheckData->second.policy.bypassMatchmaking)
++                return LFG_INCOMPATIBLES_TOO_MUCH_PLAYERS;
++        }
++
+         LfgProposal proposal;
+         LfgDungeonSet proposalDungeons;
+         LfgGroupsMap proposalGroups;
+@@ -293,15 +322,21 @@ namespace lfg
+         if (numLfgGroups > 1)
+             return LFG_INCOMPATIBLES_MULTIPLE_LFG_GROUPS;
+ 
+-        // Group with less that MAXGROUPSIZE members always compatible
+-        if (!sLFGMgr->IsTesting() && check.size() == 1 && numPlayers < MAXGROUPSIZE)
++        LfgQueueDataContainer::iterator itFrontQueue = QueueDataStore.find(check.front());
++        LfgQueuePolicy const& policy = itFrontQueue->second.policy;
++
++        // Group with less that MAXGROUPSIZE members always compatible (unless bypassMatchmaking reached target/min players)
++        if (policy.bypassMatchmaking && numPlayers >= policy.minPlayers && numPlayers <= policy.targetPlayers)
+         {
+-            LfgQueueDataContainer::iterator itQueue = QueueDataStore.find(check.front());
+-            LfgRolesMap roles = itQueue->second.roles;
++            // Bypass matchmaking: do not wait for MAXGROUPSIZE, proceed to proposal creation below!
++        }
++        else if (!sLFGMgr->IsTesting() && check.size() == 1 && numPlayers < MAXGROUPSIZE)
++        {
++            LfgRolesMap roles = itFrontQueue->second.roles;
+             uint8 roleCheckResult = LFGMgr::CheckGroupRoles(roles);
+             strGuids.addRoles(roles);
+-            itQueue->second.bestCompatible.clear(); // this may be left after a failed proposal (not cleared, because UpdateQueueTimers would try to generate it with every update)
+-            //UpdateBestCompatibleInQueue(itQueue, strGuids);
++            itFrontQueue->second.bestCompatible.clear(); // this may be left after a failed proposal (not cleared, because UpdateQueueTimers would try to generate it with every update)
++            //UpdateBestCompatibleInQueue(itFrontQueue, strGuids);
+             AddToCompatibles(strGuids);
+             if (roleCheckResult && roleCheckResult <= 15)
+                 foundMask |= ( (((uint64)1) << (roleCheckResult - 1)) | (((uint64)1) << (16 + roleCheckResult - 1)) | (((uint64)1) << (32 + roleCheckResult - 1)) | (((uint64)1) << (48 + roleCheckResult - 1)));
+@@ -387,11 +422,26 @@ namespace lfg
+             LfgQueueData const& queue = QueueDataStore[gguid];
+             proposalDungeons = queue.dungeons;
+             proposalRoles = queue.roles;
+-            LFGMgr::CheckGroupRoles(proposalRoles);          // assing new roles
++            if (queue.policy.requireStandardRoles)
++            {
++                LFGMgr::CheckGroupRoles(proposalRoles);          // assign new roles
++            }
++            else
++            {
++                for (auto& [pguid, pRole] : proposalRoles)
++                {
++                    if (pRole == 0 || pRole == PLAYER_ROLE_NONE)
++                        pRole = PLAYER_ROLE_DAMAGE;
++                }
++            }
+         }
+ 
+         // Enough players?
+-        if (!sLFGMgr->IsTesting() && numPlayers != MAXGROUPSIZE)
++        bool const enoughPlayers = policy.bypassMatchmaking ?
++            (numPlayers >= policy.minPlayers && numPlayers <= policy.targetPlayers) :
++            (numPlayers == MAXGROUPSIZE);
++
++        if (!sLFGMgr->IsTesting() && !enoughPlayers)
+         {
+             strGuids.addRoles(proposalRoles);
+             for (uint8 i = 0; i < 5 && check.guids[i]; ++i)
+@@ -400,7 +450,8 @@ namespace lfg
+                 if (!itr->second.bestCompatible.empty()) // update if groups don't have it empty (for empty it will be generated in UpdateQueueTimers)
+                     UpdateBestCompatibleInQueue(itr, strGuids);
+             }
+-            AddToCompatibles(strGuids);
++            if (!policy.bypassMatchmaking)
++                AddToCompatibles(strGuids);
+             foundMask |= addToFoundMask;
+             ++foundCount;
+             return LFG_COMPATIBLES_WITH_LESS_PLAYERS;
+@@ -408,6 +459,7 @@ namespace lfg
+ 
+         proposal.queues = strGuids;
+         proposal.isNew = numLfgGroups != 1;
++        proposal.policy = policy;
+ 
+         if (!sLFGMgr->AllQueued(check)) // can't create proposal
+             return LFG_COMPATIBILITY_PENDING;
+diff --git a/src/server/game/DungeonFinding/LFGQueue.h b/src/server/game/DungeonFinding/LFGQueue.h
+index 7c6183582..cef6e5b7e 100644
+--- a/src/server/game/DungeonFinding/LFGQueue.h
++++ b/src/server/game/DungeonFinding/LFGQueue.h
+@@ -53,6 +53,7 @@ namespace lfg
+         LfgDungeonSet dungeons;                                // Selected Player/Group Dungeon/s
+         LfgRolesMap roles;                                     // Selected Player Role/s
+         Lfg5Guids bestCompatible;                              // Best compatible combination of people queued
++        LfgQueuePolicy policy;                                 // Policy snapshotted on queue join
+     };
+ 
+     struct LfgWaitTime
+diff --git a/src/server/game/Entities/Player/Player.cpp b/src/server/game/Entities/Player/Player.cpp
+index edcf67c27..1d90a7c07 100644
+--- a/src/server/game/Entities/Player/Player.cpp
++++ b/src/server/game/Entities/Player/Player.cpp
+@@ -17847,3 +17847,8 @@ void Player::SendSystemMessage(std::string_view msg, bool escapeCharacters)
+ {
+     ChatHandler(GetSession()).SendSysMessage(msg, escapeCharacters);
+ }
++
++bool Player::IsBot() const
++{
++    return m_session && m_session->IsBot();
++}
+diff --git a/src/server/game/Entities/Player/Player.h b/src/server/game/Entities/Player/Player.h
+index b6332a64d..0de25bd22 100644
+--- a/src/server/game/Entities/Player/Player.h
++++ b/src/server/game/Entities/Player/Player.h
+@@ -2068,6 +2068,7 @@ public:
+     void RemovedInsignia(Player* looterPlr);
+ 
+     [[nodiscard]] WorldSession* GetSession() const { return m_session; }
++    [[nodiscard]] bool IsBot() const;
+     void SetSession(WorldSession* sess) { m_session = sess; }
+ 
+     void BuildCreateUpdateBlockForPlayer(UpdateData* data, Player* target) override;
+diff --git a/src/server/game/Guilds/Guild.cpp b/src/server/game/Guilds/Guild.cpp
+index e360e8b4e..5cff1353a 100644
+--- a/src/server/game/Guilds/Guild.cpp
++++ b/src/server/game/Guilds/Guild.cpp
+@@ -2459,6 +2459,63 @@ void Guild::SetBankTabText(uint8 tabId, std::string_view text)
+ }
+ 
+ // Private methods
++bool Guild::EnsureFirstBankTab()
++{
++    if (_GetPurchasedTabsSize() != 0)
++        return false;
++
++    _CreateNewBankTab();
++    return true;
++}
++
++Item const* Guild::GetBankItem(uint8 tabId, uint8 slotId) const
++{
++    if (tabId >= m_bankTabs.size() || slotId >= GUILD_BANK_MAX_SLOTS)
++        return nullptr;
++    return m_bankTabs[tabId].GetItem(slotId);
++}
++
++void Guild::EnsureRankBankRights(uint8 rankId, uint8 minRights, uint32 minSlotsPerDay, uint32 minMoneyPerDay)
++{
++    if (rankId >= _GetRanksSize())
++        return;
++
++    RankInfo* rankInfo = GetRankInfo(rankId);
++    if (!rankInfo)
++        return;
++
++    for (uint8 tabId = 0; tabId < _GetPurchasedTabsSize(); ++tabId)
++    {
++        int8 currentRights = rankInfo->GetBankTabRights(tabId);
++        int32 currentSlots = rankInfo->GetBankTabSlotsPerDay(tabId);
++
++        bool needsUpdate = false;
++        uint8 newRights = currentRights;
++        uint32 newSlots = currentSlots > 0 ? uint32(currentSlots) : minSlotsPerDay;
++
++        if ((currentRights & minRights) != minRights)
++        {
++            newRights |= minRights;
++            needsUpdate = true;
++        }
++
++        if (currentSlots == 0)
++        {
++            newSlots = minSlotsPerDay;
++            needsUpdate = true;
++        }
++
++        if (needsUpdate)
++        {
++            GuildBankRightsAndSlots rightsAndSlots(tabId, newRights, newSlots);
++            rankInfo->SetBankTabSlotsAndRights(rightsAndSlots, true);
++        }
++    }
++
++    if (minMoneyPerDay > 0 && rankInfo->GetBankMoneyPerDay() == 0)
++        rankInfo->SetBankMoneyPerDay(minMoneyPerDay);
++}
++
+ void Guild::_CreateNewBankTab()
+ {
+     uint8 tabId = _GetPurchasedTabsSize();                      // Next free id
+diff --git a/src/server/game/Guilds/Guild.h b/src/server/game/Guilds/Guild.h
+index 84716d60f..8e3ef02f8 100644
+--- a/src/server/game/Guilds/Guild.h
++++ b/src/server/game/Guilds/Guild.h
+@@ -290,8 +290,12 @@ private:
+ 
+ using SlotIds = std::set<uint8>;
+ 
++class BotMgr;
++
+ class Guild
+ {
++    friend class BotMgr;
++
+ public: // pussywizard: public class Member
+     // Class representing guild member
+     class Member
+@@ -688,6 +692,10 @@ public:
+     uint32 GetId() const { return m_id; }
+     ObjectGuid GetLeaderGUID() const { return m_leaderGuid; }
+     uint8 GetBankTabCount() const { return _GetPurchasedTabsSize(); }
++    bool EnsureFirstBankTab();
++    uint8 GetPurchasedTabsSize() const { return _GetPurchasedTabsSize(); }
++    Item const* GetBankItem(uint8 tabId, uint8 slotId) const;
++    void EnsureRankBankRights(uint8 rankId, uint8 minRights, uint32 minSlotsPerDay, uint32 minMoneyPerDay = 0);
+     std::string const& GetName() const { return m_name; }
+     std::string const& GetMOTD() const { return m_motd; }
+     std::string const& GetInfo() const { return m_info; }
+diff --git a/src/server/game/Handlers/PetitionsHandler.cpp b/src/server/game/Handlers/PetitionsHandler.cpp
+index ed55395d6..76cc93746 100644
+--- a/src/server/game/Handlers/PetitionsHandler.cpp
++++ b/src/server/game/Handlers/PetitionsHandler.cpp
+@@ -654,6 +654,7 @@ void WorldSession::HandleOfferPetitionOpcode(WorldPacket& recvData)
+         }
+ 
+     player->SendDirectMessage(&data);
++    sScriptMgr->OnPetitionOffered(player, petitionguid);
+ }
+ 
+ void WorldSession::HandleTurnInPetitionOpcode(WorldPacket& recvData)
+diff --git a/src/server/game/Miscellaneous/LocalLevelScaling.h b/src/server/game/Miscellaneous/LocalLevelScaling.h
+index 1748898cf..1b5ff985a 100644
+--- a/src/server/game/Miscellaneous/LocalLevelScaling.h
++++ b/src/server/game/Miscellaneous/LocalLevelScaling.h
+@@ -26,6 +26,9 @@ struct ItemTemplate;
+ 
+ namespace LocalLevelScaling
+ {
++// Level at which companion bots (mod-coa-playerbots) may use flying mounts.
++inline std::atomic<std::uint8_t> FlightUnlockLevel{60};
++
+ using PersonalInstanceScalingResolver = bool (*)(Map const*, Player const*);
+ inline std::atomic<PersonalInstanceScalingResolver> PersonalInstanceScalingOwner{nullptr};
+ 
+diff --git a/src/server/game/Scripting/ScriptDefines/GlobalScript.cpp b/src/server/game/Scripting/ScriptDefines/GlobalScript.cpp
+index c8536d7c4..fd39d9db6 100644
+--- a/src/server/game/Scripting/ScriptDefines/GlobalScript.cpp
++++ b/src/server/game/Scripting/ScriptDefines/GlobalScript.cpp
+@@ -151,6 +151,35 @@ void ScriptMgr::AfterInstanceGameObjectCreate(Map* instance, GameObject* go)
+     CALL_ENABLED_HOOKS(GlobalScript, GLOBALHOOK_AFTER_INSTANCE_GAME_OBJECT_CREATE, script->AfterInstanceGameObjectCreate(instance, go));
+ }
+ 
++void ScriptMgr::OnResolveLfgQueuePolicy(ObjectGuid const& guid, lfg::LfgQueuePolicy& policy)
++{
++    CALL_ENABLED_HOOKS(GlobalScript, GLOBALHOOK_ON_RESOLVE_LFG_QUEUE_POLICY, script->OnResolveLfgQueuePolicy(guid, policy));
++}
++
++void ScriptMgr::OnLfgProposalMadeGroup(lfg::LfgProposal const& proposal, Group* group)
++{
++    CALL_ENABLED_HOOKS(GlobalScript, GLOBALHOOK_ON_LFG_PROPOSAL_MADE_GROUP, script->OnLfgProposalMadeGroup(proposal, group));
++}
++
++void ScriptMgr::OnInstanceMapCreated(InstanceMap* instanceMap, Player* player)
++{
++    CALL_ENABLED_HOOKS(GlobalScript, GLOBALHOOK_ON_INSTANCE_MAP_CREATED, script->OnInstanceMapCreated(instanceMap, player));
++}
++
++bool ScriptMgr::HasLfgAutoFillProvider() const
++{
++    bool hasProvider = false;
++    CALL_ENABLED_HOOKS(GlobalScript, GLOBALHOOK_HAS_LFG_AUTO_FILL_PROVIDER,
++    {
++        if (script->HasLfgAutoFillProvider())
++        {
++            hasProvider = true;
++            break;
++        }
++    });
++    return hasProvider;
++}
++
+ GlobalScript::GlobalScript(char const* name, std::vector<uint16> enabledHooks)
+     : ScriptObject(name, GLOBALHOOK_END)
+ {
+diff --git a/src/server/game/Scripting/ScriptDefines/GlobalScript.h b/src/server/game/Scripting/ScriptDefines/GlobalScript.h
+index 99f7288e7..c5c553a9a 100644
+--- a/src/server/game/Scripting/ScriptDefines/GlobalScript.h
++++ b/src/server/game/Scripting/ScriptDefines/GlobalScript.h
+@@ -25,6 +25,15 @@
+ #include <map>
+ #include <vector>
+ 
++class Group;
++class InstanceMap;
++class Player;
++namespace lfg
++{
++    struct LfgQueuePolicy;
++    struct LfgProposal;
++}
++
+ enum GlobalHook
+ {
+     GLOBALHOOK_ON_ITEM_DEL_FROM_DB,
+@@ -47,6 +56,10 @@ enum GlobalHook
+     GLOBALHOOK_ON_INSTANCEID_REMOVED,
+     GLOBALHOOK_ON_BEFORE_SET_BOSS_STATE,
+     GLOBALHOOK_AFTER_INSTANCE_GAME_OBJECT_CREATE,
++    GLOBALHOOK_ON_RESOLVE_LFG_QUEUE_POLICY,
++    GLOBALHOOK_ON_LFG_PROPOSAL_MADE_GROUP,
++    GLOBALHOOK_ON_INSTANCE_MAP_CREATED,
++    GLOBALHOOK_HAS_LFG_AUTO_FILL_PROVIDER,
+     GLOBALHOOK_ON_SPELL_MOD_FAMILY_MASK,
+     GLOBALHOOK_END
+ };
+@@ -106,6 +119,18 @@ public:
+ 
+     // Called when a gameobject is created by an instance
+     virtual void AfterInstanceGameObjectCreate(Map* /*instance*/, GameObject* /*go*/) { }
++
++    // Called when LFG queue policy is resolved for a player or group
++    virtual void OnResolveLfgQueuePolicy(ObjectGuid const& /*guid*/, lfg::LfgQueuePolicy& /*policy*/) { }
++
++    // Called when an LFG proposal successfully forms a group and creates an instance
++    virtual void OnLfgProposalMadeGroup(lfg::LfgProposal const& /*proposal*/, Group* /*group*/) { }
++
++    // Called when an instance map is created for a player before grids are loaded
++    virtual void OnInstanceMapCreated(InstanceMap* /*instanceMap*/, Player* /*player*/) { }
++
++    // Returns true if an auto-fill bot provider is active for LFG
++    virtual bool HasLfgAutoFillProvider() const { return false; }
+ };
+ 
+ #endif
+diff --git a/src/server/game/Scripting/ScriptDefines/PlayerScript.cpp b/src/server/game/Scripting/ScriptDefines/PlayerScript.cpp
+index 00db5e1ce..c311c348b 100644
+--- a/src/server/game/Scripting/ScriptDefines/PlayerScript.cpp
++++ b/src/server/game/Scripting/ScriptDefines/PlayerScript.cpp
+@@ -410,6 +410,11 @@ void ScriptMgr::OnPlayerJoinArena(Player* player)
+     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_PLAYER_JOIN_ARENA, script->OnPlayerJoinArena(player));
+ }
+ 
++void ScriptMgr::OnPetitionOffered(Player* player, ObjectGuid petitionGuid)
++{
++    CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_PETITION_OFFERED, script->OnPetitionOffered(player, petitionGuid));
++}
++
+ void ScriptMgr::OnPlayerGetMaxPersonalArenaRatingRequirement(Player const* player, uint32 minSlot, uint32& maxArenaRating) const
+ {
+     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_GET_MAX_PERSONAL_ARENA_RATING_REQUIREMENT, script->OnPlayerGetMaxPersonalArenaRatingRequirement(player, minSlot, maxArenaRating));
+diff --git a/src/server/game/Scripting/ScriptDefines/PlayerScript.h b/src/server/game/Scripting/ScriptDefines/PlayerScript.h
+index bdf36df6b..7055cb90d 100644
+--- a/src/server/game/Scripting/ScriptDefines/PlayerScript.h
++++ b/src/server/game/Scripting/ScriptDefines/PlayerScript.h
+@@ -245,6 +245,7 @@ enum PlayerHook
+     PLAYERHOOK_ON_HAS_NO_BONUS_EXPERIENCE,
+     PLAYERHOOK_ON_HONORABLE_KILLING_BLOW,
+     PLAYERHOOK_ON_BANKER_ACTIVATE,
++    PLAYERHOOK_ON_PETITION_OFFERED,
+     PLAYERHOOK_ON_BANK_WITHDRAW,
+     PLAYERHOOK_ON_LEARN_PET_TALENT,
+     PLAYERHOOK_ON_LEARN_TRAINER_SPELL,
+@@ -483,6 +484,12 @@ public:
+     virtual void OnPlayerSendSpellChargeStates(Player const* /*player*/) { }
+     virtual void OnPlayerSpellCooldownCalculated(Player* /*player*/, SpellInfo const* /*spellInfo*/, Spell* /*spell*/, uint32 /*recoveryMs*/) { }
+ 
++    // Fires when a petition (guild charter or arena team charter) is offered to a specific
++    // player via HandleOfferPetitionOpcode (the real "Request Signature" action) -- lets a
++    // module react to "this specific player was just explicitly asked to sign," as opposed to
++    // guessing intent from group membership alone.
++    virtual void OnPetitionOffered(Player* /*player*/, ObjectGuid /*petitionGuid*/) { }
++
+     // Called when a player is bound to an instance
+     virtual void OnPlayerBindToInstance(Player* /*player*/, Difficulty /*difficulty*/, uint32 /*mapId*/, bool /*permanent*/) { }
+ 
+diff --git a/src/server/game/Scripting/ScriptMgr.h b/src/server/game/Scripting/ScriptMgr.h
+index 3804ded91..e71a48ef5 100644
+--- a/src/server/game/Scripting/ScriptMgr.h
++++ b/src/server/game/Scripting/ScriptMgr.h
+@@ -396,6 +396,7 @@ public: /* PlayerScript */
+     void OnPlayerUnequip(Player* player, Item* it);
+     void OnPlayerJoinBG(Player* player);
+     void OnPlayerJoinArena(Player* player);
++    void OnPetitionOffered(Player* player, ObjectGuid petitionGuid);
+     void OnPlayerGetMaxPersonalArenaRatingRequirement(Player const* player, uint32 minSlot, uint32& maxArenaRating) const;
+     void OnPlayerLootItem(Player* player, Item* item, uint32 count, ObjectGuid lootguid);
+     void OnPlayerBeforeFillQuestLootItem(Player* player, LootItem& item);
+@@ -612,6 +613,10 @@ public: /* GlobalScript */
+     void OnInstanceIdRemoved(uint32 instanceId);
+     void OnBeforeSetBossState(uint32 id, EncounterState newState, EncounterState oldState, Map* instance);
+     void AfterInstanceGameObjectCreate(Map* instance, GameObject* go);
++    void OnResolveLfgQueuePolicy(ObjectGuid const& guid, lfg::LfgQueuePolicy& policy);
++    void OnLfgProposalMadeGroup(lfg::LfgProposal const& proposal, Group* group);
++    void OnInstanceMapCreated(InstanceMap* instanceMap, Player* player);
++    bool HasLfgAutoFillProvider() const;
+ 
+ public: /* Scheduled scripts */
+     uint32 IncreaseScheduledScriptsCount() { return ++_scheduledScripts; }
+-- 
+2.47.3
+
+
+From dba34829a12e4d7c09d8428bc3708537a02e2d8d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=D0=94=D0=BC=D0=B8=D1=82=D1=80=D0=B8=D0=B9?=
+ <corfirean@gmail.com>
+Date: Mon, 16 Nov 2026 00:14:26 +0500
+Subject: [PATCH 2/4] Wildcard archetype builds, Reborn level gating and Mystic
+ Enchant picks for companion bots
+
+From feat/multirealm-playerbots-release (5b9020e80, e1740be09), without its test runner,
+.env example and build scripts (the runner held local passwords):
+- AscensionWildcard::ApplyArchetypeBuild sets a whole build for one specialization
+  (primary stat, ranks the level allows) and records the build id; Save takes a spec.
+- AscensionWarcraftReborn::ForgetClassSpellsAbove also forgets the twin copy (+1100000)
+  and uses the higher of SpellLevel/BaseLevel. Prestige resets use it too.
+- AscensionMysticEnchant::RecommendEnchants picks up to seven fitting enchants; GuideFits
+  is public for it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit b6c3617ab793e5bd533b0051a4dd830f72ff508b)
+---
+ ...0261116-companions-wildcard-reborn-core.md |   7 +
+ src/server/coa/AscensionMysticEnchant.cpp     |  61 +++++++
+ src/server/coa/AscensionMysticEnchant.h       |   2 +
+ .../coa/AscensionMysticEnchantRules.cpp       |   2 +-
+ src/server/coa/AscensionMysticEnchantRules.h  |   1 +
+ src/server/coa/AscensionWarcraftReborn.cpp    |  17 +-
+ src/server/coa/AscensionWildcard.cpp          | 163 +++++++++++++++++-
+ src/server/coa/AscensionWildcard.h            |  10 ++
+ 8 files changed, 255 insertions(+), 8 deletions(-)
+ create mode 100644 changelog.d/20261116-companions-wildcard-reborn-core.md
+
+diff --git a/changelog.d/20261116-companions-wildcard-reborn-core.md b/changelog.d/20261116-companions-wildcard-reborn-core.md
+new file mode 100644
+index 000000000..c12268de4
+--- /dev/null
++++ b/changelog.d/20261116-companions-wildcard-reborn-core.md
+@@ -0,0 +1,7 @@
++---
++area: server
++type: added
++audience: admins
++title: Server support for companion bots on Wildcard and Warcraft Reborn
++---
++Wildcard bots get a whole archetype build, Reborn bots get the abilities of their level and a Mystic Enchant set. A Reborn level reset also removes the twin copies of spells above the new level.
+diff --git a/src/server/coa/AscensionMysticEnchant.cpp b/src/server/coa/AscensionMysticEnchant.cpp
+index 447468c3a..5a9fc93e0 100644
+--- a/src/server/coa/AscensionMysticEnchant.cpp
++++ b/src/server/coa/AscensionMysticEnchant.cpp
+@@ -1219,6 +1219,67 @@ bool ApplyGuide(Player* player, std::vector<GuideEnchant> const& guide, bool lea
+     return true;
+ }
+ 
++std::vector<GuideEnchant> RecommendEnchants(Player const* player, uint32 maxCount)
++{
++    std::vector<GuideEnchant> result;
++    if (!player || !Ready)
++        return result;
++
++    ClientConfig const config = CurrentClientConfig();
++    Character character = Describe(player, config);
++    if (character.Wildcard())
++        return result;
++
++    Slots slots{};
++    std::vector<uint32> candidateSpells;
++
++    for (Enchant const& enchant : Loaded.Rows)
++    {
++        if (!enchant.Spell || enchant.Quality < QUALITY_UNCOMMON)
++            continue;
++        if (!ClassAllowed(enchant, character.Class))
++            continue;
++        if (!RealmAllows(enchant, character.RealmGates))
++            continue;
++        if (enchant.RequiredLevel > character.Level)
++            continue;
++        if (enchant.Worldforged)
++            continue;
++        candidateSpells.push_back(enchant.Spell);
++    }
++
++    if (candidateSpells.empty())
++        return result;
++
++    uint32 const seed = player->GetGUID().GetCounter();
++    std::size_t const total = candidateSpells.size();
++
++    for (std::size_t i = 0; i < total && result.size() < maxCount; ++i)
++    {
++        std::size_t const idx = (seed + i * 7) % total;
++        uint32 const spell = candidateSpells[idx];
++
++        Character charCopy = character;
++        std::vector<uint32> knownSpells = { spell };
++        charCopy.Known = &knownSpells;
++
++        if (GuideFits(Loaded, charCopy, slots, spell))
++        {
++            for (uint32 slot = 0; slot < SLOT_COUNT; ++slot)
++            {
++                if (slots[slot] == 0)
++                {
++                    slots[slot] = spell;
++                    result.push_back(GuideEnchant{ spell, 1, 0 });
++                    break;
++                }
++            }
++        }
++    }
++
++    return result;
++}
++
+ uint32 ClearActivePreset(Player* player)
+ {
+     State* state = Ready ? Find(player) : nullptr;
+diff --git a/src/server/coa/AscensionMysticEnchant.h b/src/server/coa/AscensionMysticEnchant.h
+index f6bc3e8a7..782a0fb50 100644
+--- a/src/server/coa/AscensionMysticEnchant.h
++++ b/src/server/coa/AscensionMysticEnchant.h
+@@ -25,6 +25,8 @@ struct Collection
+ 
+ bool ApplyGuide(Player* player, std::vector<GuideEnchant> const& guide, bool learnMissing = false);
+ 
++std::vector<GuideEnchant> RecommendEnchants(Player const* player, uint32 maxCount = 7);
++
+ uint32 ClearActivePreset(Player* player);
+ 
+ std::optional<Collection> Summarize(Player const* player);
+diff --git a/src/server/coa/AscensionMysticEnchantRules.cpp b/src/server/coa/AscensionMysticEnchantRules.cpp
+index 25965ce4a..3a4c13e2e 100644
+--- a/src/server/coa/AscensionMysticEnchantRules.cpp
++++ b/src/server/coa/AscensionMysticEnchantRules.cpp
+@@ -724,6 +724,7 @@ std::string QualityTier(std::uint32_t quality)
+         "ARTIFACT", "" };
+     return TIERS[quality];
+ }
++}
+ 
+ bool GuideFits(Catalog const& catalog, Character const& character, Slots const& slots, std::uint32_t spell)
+ {
+@@ -749,7 +750,6 @@ bool GuideFits(Catalog const& catalog, Character const& character, Slots const&
+     return sameSpell <= stackLimit && sameQuality <= QualityCap(character, quality) &&
+         !(quality == QUALITY_RARE && enchant->Worldforged && rareWorldforged > RARE_WORLDFORGED_LIMIT);
+ }
+-}
+ 
+ Slots GuideSlots(Catalog const& catalog, Character const& character, Slots const& current,
+     std::vector<GuideEnchant> const& guide)
+diff --git a/src/server/coa/AscensionMysticEnchantRules.h b/src/server/coa/AscensionMysticEnchantRules.h
+index 5097e5634..d63c87ec0 100644
+--- a/src/server/coa/AscensionMysticEnchantRules.h
++++ b/src/server/coa/AscensionMysticEnchantRules.h
+@@ -405,6 +405,7 @@ struct GuideEnchant
+     std::uint32_t Level = 0;
+ };
+ 
++bool GuideFits(Catalog const& catalog, Character const& character, Slots const& slots, std::uint32_t spell);
+ Slots GuideSlots(Catalog const& catalog, Character const& character, Slots const& current,
+     std::vector<GuideEnchant> const& guide);
+ std::vector<std::uint32_t> GuideLessons(Catalog const& catalog, Character const& character,
+diff --git a/src/server/coa/AscensionWarcraftReborn.cpp b/src/server/coa/AscensionWarcraftReborn.cpp
+index 90a0cf43f..ea7a1493a 100644
+--- a/src/server/coa/AscensionWarcraftReborn.cpp
++++ b/src/server/coa/AscensionWarcraftReborn.cpp
+@@ -460,17 +460,24 @@ std::unordered_set<uint32> ForgetClassSpellsAbove(Player* player, uint8 level)
+     std::vector<uint32> forget;
+     for (auto const& [spellId, spell] : player->GetSpellMap())
+     {
+-        SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+-        if (spell->State != PLAYERSPELL_REMOVED && info && info->SpellLevel > level && !GetTalentSpellPos(spellId) &&
+-            player->HasSpell(spellId) && onClassSkill(spellId))
++        uint32 baseId = (spellId >= 1100000) ? (spellId - 1100000) : spellId;
++        SpellInfo const* info = sSpellMgr->GetSpellInfo(baseId);
++        uint32 const reqLvl = info ? std::max(info->SpellLevel, info->BaseLevel) : 0;
++        if (spell->State != PLAYERSPELL_REMOVED && info && reqLvl > level && !GetTalentSpellPos(baseId) &&
++            player->HasSpell(spellId) && onClassSkill(baseId))
+             forget.push_back(spellId);
+     }
+     for (uint32 spellId : forget)
+     {
+-        uint32 const firstRank = sSpellMgr->GetFirstSpellInChain(spellId);
+-        if (firstRank != spellId)
++        uint32 baseId = (spellId >= 1100000) ? (spellId - 1100000) : spellId;
++        uint32 const firstRank = sSpellMgr->GetFirstSpellInChain(baseId);
++        if (firstRank != baseId)
+             chains.insert(firstRank);
+         player->removeSpell(spellId, SPEC_MASK_ALL, false);
++        if (spellId < 1100000)
++            player->removeSpell(spellId + 1100000, SPEC_MASK_ALL, false);
++        else
++            player->removeSpell(baseId, SPEC_MASK_ALL, false);
+     }
+ 
+     LearnMissing(player, StartingSpells(Loaded, CurrentRealm, player->getClass(), StartLevel(player)));
+diff --git a/src/server/coa/AscensionWildcard.cpp b/src/server/coa/AscensionWildcard.cpp
+index 28f941068..4936102bc 100644
+--- a/src/server/coa/AscensionWildcard.cpp
++++ b/src/server/coa/AscensionWildcard.cpp
+@@ -891,13 +891,18 @@ std::string SpecSource(Player const* player, char const* source)
+     return SpecSettingSource(source, ActiveSpec(player));
+ }
+ 
+-void Save(Player* player, std::vector<Slot> const& slots)
++void Save(Player* player, std::uint32_t spec, std::vector<Slot> const& slots)
+ {
+-    std::string const source = SpecSource(player, SLOTS_SETTING);
++    std::string const source = SpecSettingSource(SLOTS_SETTING, spec);
+     for (std::size_t index = 0; index < slots.size(); ++index)
+         player->UpdatePlayerSetting(source, uint32(index), Encode(slots[index]));
+ }
+ 
++void Save(Player* player, std::vector<Slot> const& slots)
++{
++    Save(player, ActiveSpec(player), slots);
++}
++
+ void SendKnownEntries(Player* player, std::vector<Slot> const& slots)
+ {
+     std::vector<uint8> const body =
+@@ -3570,6 +3575,160 @@ BuildChoice ApplyBuildUpload(Player* player, std::vector<AscensionCoATalentState
+     return choice;
+ }
+ 
++WildcardArchetypeResult ApplyArchetypeBuild(Player* player, std::uint32_t spec, std::uint32_t primaryStatEntry,
++    std::vector<std::pair<std::uint32_t, std::uint8_t>> const& spells, std::string const& buildId)
++{
++    if (!player || (!IsWildcardHero(player) && player->getClass() != CLASS_HERO))
++        return { false, "NOT_WILDCARD_HERO", 0, 0 };
++
++    if (spec >= SPECIALIZATION_COUNT)
++        spec = ActiveSpec(player);
++
++    constexpr uint32 STRENGTH_ENTRY = 1149;
++    constexpr uint32 AGILITY_ENTRY = 1150;
++    constexpr uint32 INTELLECT_ENTRY = 1151;
++    constexpr uint32 SPIRIT_ENTRY = 1152;
++    constexpr std::array<uint32, 5> ENTRY_OF_STAT_INDEX = { STRENGTH_ENTRY, AGILITY_ENTRY, STRENGTH_ENTRY,
++        INTELLECT_ENTRY, SPIRIT_ENTRY };
++    if (primaryStatEntry < ENTRY_OF_STAT_INDEX.size())
++        primaryStatEntry = ENTRY_OF_STAT_INDEX[primaryStatEntry];
++    else if (!PrimaryStatSpell(primaryStatEntry))
++        primaryStatEntry = STRENGTH_ENTRY;
++
++    uint32 const currentStat = PrimaryStat(player, spec);
++    if (currentStat != primaryStatEntry)
++    {
++        if (uint32 const prevSpell = PrimaryStatSpell(currentStat))
++            player->removeSpell(prevSpell, SPEC_MASK_ALL, false);
++        if (uint32 const newSpell = PrimaryStatSpell(primaryStatEntry))
++            player->learnSpell(newSpell);
++        player->UpdatePlayerSetting(SpecSettingSource(PRIMARY_STAT_SETTING, spec), 0, primaryStatEntry);
++    }
++
++    std::unordered_map<uint32, uint32> const before = RankSpells(Slots(player, spec), currentStat);
++
++    std::vector<Slot> newSlots;
++    std::unordered_map<uint32, std::size_t> entryToSlotIndex;
++
++    uint8 const playerLevel = player->GetLevel();
++
++    for (auto const& [spellId, reqLevel] : spells)
++    {
++        if (!spellId || reqLevel > playerLevel)
++            continue;
++
++        uint32 rootSpell = spellId;
++        if (auto const rootItr = Loaded.RankRoots.find(spellId); rootItr != Loaded.RankRoots.end())
++            rootSpell = rootItr->second;
++
++        Entry const* matchedEntry = nullptr;
++        uint32 matchedRank = 1;
++
++        for (Entry const& entry : Loaded.Entries)
++        {
++            if (entry.EntryId == spellId)
++            {
++                matchedEntry = &entry;
++                matchedRank = 1;
++                break;
++            }
++            for (std::size_t r = 0; r < entry.RankSpells.size(); ++r)
++            {
++                if (entry.RankSpells[r] == spellId || entry.RankSpells[r] == rootSpell)
++                {
++                    matchedEntry = &entry;
++                    matchedRank = uint32(r + 1);
++                    break;
++                }
++            }
++            if (matchedEntry)
++                break;
++        }
++
++        if (!matchedEntry)
++            continue;
++
++        if (matchedEntry->MinLevel > playerLevel)
++            continue;
++
++        if (!matchedEntry->Talent && !matchedEntry->RankSpells.empty())
++        {
++            uint32 highestValidRank = 0;
++            for (std::size_t r = 0; r < matchedEntry->RankSpells.size(); ++r)
++            {
++                if (SpellInfo const* sInfo = sSpellMgr->GetSpellInfo(matchedEntry->RankSpells[r]))
++                {
++                    uint32 const reqLevel = std::max(sInfo->SpellLevel, sInfo->BaseLevel);
++                    if (reqLevel <= playerLevel)
++                        highestValidRank = uint32(r + 1);
++                }
++            }
++            if (highestValidRank == 0)
++                continue;
++            matchedRank = highestValidRank;
++        }
++
++        auto const existing = entryToSlotIndex.find(matchedEntry->EntryId);
++        if (existing == entryToSlotIndex.end())
++        {
++            entryToSlotIndex[matchedEntry->EntryId] = newSlots.size();
++            newSlots.push_back(Slot{ matchedEntry->EntryId, true, matchedRank, matchedEntry->Talent });
++        }
++        else
++        {
++            if (matchedRank > newSlots[existing->second].Rank)
++                newSlots[existing->second].Rank = matchedRank;
++        }
++    }
++
++    if (newSlots.empty())
++        return { false, "NO_VALID_SPELLS", 0, primaryStatEntry };
++
++    ClearSetting(player, SpecSettingSource(SLOTS_SETTING, spec));
++    Save(player, spec, newSlots);
++
++    std::unordered_map<uint32, uint32> const after = RankSpells(newSlots, primaryStatEntry);
++
++    std::unordered_set<uint32> released;
++    for (auto const& [entryId, spellId] : before)
++    {
++        auto const kept = after.find(entryId);
++        if (kept != after.end() && kept->second == spellId)
++            continue;
++        std::vector<uint32> const ranks = RankSpellsOf(entryId);
++        released.insert(ranks.begin(), ranks.end());
++        released.insert(spellId);
++    }
++    for (uint32 spellId : released)
++        player->removeSpell(spellId, SPEC_MASK_ALL, false);
++
++    uint32 appliedCount = 0;
++    for (auto const& [entryId, spellId] : after)
++    {
++        if (!player->HasSpell(spellId))
++            player->learnSpell(spellId);
++        ++appliedCount;
++    }
++
++    SendKnownEntries(player, newSlots);
++
++    if (!buildId.empty())
++    {
++        CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_COA_BUILD_CREATOR_ACTIVE);
++        stmt->SetData(0, player->GetGUID().GetCounter());
++        stmt->SetData(1, uint8(spec));
++        stmt->SetData(2, buildId);
++        stmt->SetData(3, 1);
++        stmt->SetData(4, 0);
++        CharacterDatabase.Execute(stmt);
++    }
++
++    LOG_INFO("coa", "Wildcard: applied archetype build '{}' (spec {}, primaryStat {}) to {} - {} slots, {} spells",
++        buildId, spec, primaryStatEntry, player->GetName(), newSlots.size(), appliedCount);
++
++    return { true, "APPLY_ARCHETYPE_OK", appliedCount, primaryStatEntry };
++}
++
+ void DraftBuild(Player* player, StarterPick const& pickStarters, std::uint32_t starterDraws)
+ {
+     std::vector<Slot> const slots = Slots(player);
+diff --git a/src/server/coa/AscensionWildcard.h b/src/server/coa/AscensionWildcard.h
+index 8b9bc7a6e..3600c45ed 100644
+--- a/src/server/coa/AscensionWildcard.h
++++ b/src/server/coa/AscensionWildcard.h
+@@ -551,6 +551,16 @@ std::vector<AscensionCoATalentState::KnownEntry> KnownEntries(Player const* play
+ std::vector<AscensionCoATalentState::KnownEntry> KnownEntries(Player const* player, std::uint32_t spec);
+ BuildChoice ApplyBuildUpload(Player* player, std::vector<AscensionCoATalentState::KnownEntry> const& upload);
+ using StarterPick = std::function<std::size_t(std::vector<std::vector<Slot>> const& candidates)>;
++struct WildcardArchetypeResult
++{
++    bool Success = false;
++    std::string Reason;
++    std::uint32_t AppliedSpells = 0;
++    std::uint32_t PrimaryStat = 0;
++};
++
++WildcardArchetypeResult ApplyArchetypeBuild(Player* player, std::uint32_t spec, std::uint32_t primaryStatEntry,
++    std::vector<std::pair<std::uint32_t, std::uint8_t>> const& spells, std::string const& buildId = "");
+ void DraftBuild(Player* player, StarterPick const& pickStarters = {}, std::uint32_t starterDraws = 1);
+ void ClaimLevelingScrolls(Player* player);
+ bool UnlearnForReroll(Player* player, std::uint32_t entryId);
+-- 
+2.47.3
+
+
+From 3aef70d9a340c563823039d7e6adedeaa4b6306b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=D0=94=D0=BC=D0=B8=D1=82=D1=80=D0=B8=D0=B9?=
+ <corfirean@gmail.com>
+Date: Thu, 19 Nov 2026 13:19:28 -0600
+Subject: [PATCH 3/4] fix(CoA/MysticEnchant): header and slot saves keep their
+ quality
+
+Mystic Enchant part of coa-bots b15838bde (its prepared statement is in the first patch).
+---
+ src/server/coa/AscensionMysticEnchant.cpp | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src/server/coa/AscensionMysticEnchant.cpp b/src/server/coa/AscensionMysticEnchant.cpp
+index 5a9fc93e0..6194c2866 100644
+--- a/src/server/coa/AscensionMysticEnchant.cpp
++++ b/src/server/coa/AscensionMysticEnchant.cpp
+@@ -1197,11 +1197,15 @@ public:
+ 
+ bool ApplyGuide(Player* player, std::vector<GuideEnchant> const& guide, bool learnMissing)
+ {
+-    State* state = Ready ? Find(player) : nullptr;
+-    if (!state || guide.empty())
++    if (!player || !Ready || guide.empty())
+         return false;
++    State* state = Find(player);
++    if (!state)
++        state = &Load(player);
+     ClientConfig const config = CurrentClientConfig();
+     Character character = Describe(player, config);
++    if (character.Wildcard())
++        return false;
+     character.Known = &state->Known;
+     if (learnMissing)
+         for (uint32 spell : GuideLessons(Loaded, character, guide))
+@@ -1211,6 +1215,7 @@ bool ApplyGuide(Player* player, std::vector<GuideEnchant> const& guide, bool lea
+     if (after == before)
+         return false;
+     state->Active() = after;
++    SaveHeader(player, *state);
+     for (uint32 slot = 0; slot < SLOT_COUNT; ++slot)
+         if (before[slot] != after[slot])
+             SaveSlot(player, state->ActivePreset, slot, after[slot]);
+@@ -1235,7 +1240,8 @@ std::vector<GuideEnchant> RecommendEnchants(Player const* player, uint32 maxCoun
+ 
+     for (Enchant const& enchant : Loaded.Rows)
+     {
+-        if (!enchant.Spell || enchant.Quality < QUALITY_UNCOMMON)
++        uint32 const quality = QualityOf(enchant, character.Class);
++        if (!enchant.Spell || quality < QUALITY_UNCOMMON || quality >= QUALITY_MAX)
+             continue;
+         if (!ClassAllowed(enchant, character.Class))
+             continue;
+-- 
+2.47.3
+
+
+From 3c7e6161375601b0ac54fcd5185e7eca2396ce71 Mon Sep 17 00:00:00 2001
+From: CoA bots backport <backport@localhost>
+Date: Thu, 19 Nov 2026 13:19:22 -0600
+Subject: [PATCH 4/4] Core: CoA class-service bridge and resource query API for
+ mod-coa-playerbots
+
+From coa-bots 52f0aa74d: AscensionClassServiceBridge.h, AscensionResourceQuery.h and
+their implementation appended to AscensionCompat.cpp, AscensionCultist::IsInsanitySpender,
+and the resource caps in AscensionCustomResourceData.h.
+UsesAscensionClassMechanics() (a mod-subclass feature that is not in official main)
+is replaced by a plain class check.
+---
+ src/server/coa/AscensionCompat.cpp           |  5 +++--
+ src/server/coa/AscensionCultist.cpp          |  4 ++++
+ src/server/coa/AscensionCultist.h            |  4 ++++
+ src/server/coa/AscensionCustomResourceData.h | 10 ++++++++++
+ 4 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/src/server/coa/AscensionCompat.cpp b/src/server/coa/AscensionCompat.cpp
+index c77f5a2c2..96deda9bf 100644
+--- a/src/server/coa/AscensionCompat.cpp
++++ b/src/server/coa/AscensionCompat.cpp
+@@ -12,6 +12,7 @@
+ #include "AscensionClassServiceBridge.h"
+ #include "AscensionFelsworn.h"
+ #include "AscensionResourceQuery.h"
++#include "AscensionNecromancer.h"
+ #include "AscensionHighRiskPolicy.h"
+ #include "AscensionRemovedSpellActionBars.h"
+ #include "AscensionRulesets.h"
+@@ -12141,7 +12142,7 @@ namespace AscensionCompatData
+     MinionCapacityState QueryMinionCapacityState(Player* player)
+     {
+         MinionCapacityState state;
+-        if (!player || !UsesAscensionClassMechanics(player, CLASS_NECROMANCER))
++        if (!player || !player->getClass() == CLASS_NECROMANCER)
+             return state;
+ 
+         state.Maximum = AscensionNecromancer::Capacity(player);
+@@ -12151,7 +12152,7 @@ namespace AscensionCompatData
+ 
+     uint32 QueryMinionCapacityCost(Player* player, uint32 resolvedSpellId)
+     {
+-        if (!player || !UsesAscensionClassMechanics(player, CLASS_NECROMANCER))
++        if (!player || !player->getClass() == CLASS_NECROMANCER)
+             return 0;
+         return AscensionNecromancer::Cost(player, resolvedSpellId);
+     }
+diff --git a/src/server/coa/AscensionCultist.cpp b/src/server/coa/AscensionCultist.cpp
+index 2f9f35807..6bcecdd22 100644
+--- a/src/server/coa/AscensionCultist.cpp
++++ b/src/server/coa/AscensionCultist.cpp
+@@ -59,6 +59,10 @@ bool Derived(SpellInfo const* info)
+                 return true;
+     return false;
+ }
++bool IsInsanitySpender(SpellInfo const* info)
++{
++    return Any(info, {805116, 804152});
++}
+ uint32 Count(Unit const* unit, uint32 id)
+ {
+     Aura const* aura = unit ? unit->GetAura(id) : nullptr;
+diff --git a/src/server/coa/AscensionCultist.h b/src/server/coa/AscensionCultist.h
+index 3c18882c2..505d7550f 100644
+--- a/src/server/coa/AscensionCultist.h
++++ b/src/server/coa/AscensionCultist.h
+@@ -43,6 +43,10 @@ CultistState& State(Player* player);
+ bool Named(SpellInfo const* info, uint32 root);
+ bool Any(SpellInfo const* info, std::initializer_list<uint32> roots);
+ bool Derived(SpellInfo const* info);
++// True for the two abilities that spend a full 40-Insanity bar (see the OnSpellCheckCast/
++// OnSpellBeforeEffects gate in AscensionCultistAbilities.cpp) -- extracted so
++// AscensionResourceQuery.h can ask the same question without hardcoding the spell ids itself.
++bool IsInsanitySpender(SpellInfo const* info);
+ uint32 Count(Unit const* unit, uint32 id);
+ int32 Amount(uint32 id, uint8 slot = 0, Unit* caster = nullptr);
+ float Radius(uint32 id, uint8 slot = 0);
+diff --git a/src/server/coa/AscensionCustomResourceData.h b/src/server/coa/AscensionCustomResourceData.h
+index 6e76cb2da..0689da28b 100644
+--- a/src/server/coa/AscensionCustomResourceData.h
++++ b/src/server/coa/AscensionCustomResourceData.h
+@@ -603,6 +603,16 @@ inline constexpr std::array<ResourceCostRule, 75> ResourceCostRules =
+     {22, 807952, 807952, 804455, 1, ResourceConsumption::All},
+     {22, 807953, 807953, 804455, 1, ResourceConsumption::All}
+ }};
++
++// Real enforced caps for custom resources whose hand-written Resource() function clamps to a
++// hardcoded value not reliably reflected in that resource's own ResourceDisplays row / DBC
++// StackAmount (see AscensionCultist::Resource, AscensionTinker::Resource, AscensionSunCleric::
++// Resource) -- shared by that gameplay code and AscensionResourceQuery.h's QueryAuraResourceState
++// so both read the exact same number instead of two independently hardcoded literals that could
++// silently drift apart from each other over time.
++constexpr std::uint32_t CULTIST_INSANITY_MAX = 100;
++constexpr std::uint32_t TINKER_SCRAP_MAX = 100;
++constexpr std::uint32_t SUN_CLERIC_SOLAR_POWER_MAX = 20;
+ }
+ 
+ #endif
+-- 
+2.47.3
+

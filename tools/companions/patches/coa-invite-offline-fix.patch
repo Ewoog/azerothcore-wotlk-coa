@@ -1,0 +1,47 @@
+From 5764d602c217e9afcb76f8ea85336deeeb5dde0a Mon Sep 17 00:00:00 2001
+From: Azeroth Workshop <bot@local>
+Date: Thu, 19 Nov 2026 22:26:40 -0600
+Subject: [PATCH] Log an offline alt in before inviting it
+
+---
+ module/src/BotMgr.cpp | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/module/src/BotMgr.cpp b/module/src/BotMgr.cpp
+index 6573de2..c560223 100644
+--- a/module/src/BotMgr.cpp
++++ b/module/src/BotMgr.cpp
+@@ -2949,6 +2949,30 @@ bool BotMgr::TryReleaseBotFromGroup(Player* inviter, Player* bot)
+ void BotMgr::InviteBotToGroup(Player* commander, ObjectGuid::LowType botGuid, ChatHandler* handler)
+ {
+     Player* bot = commander ? FindBotPlayer(botGuid) : nullptr;
++    if (commander && !bot && botGuid && botGuid != commander->GetGUID().GetCounter())
++    {
++        // Not logged in as a companion (AltBots can think an alt is still out after it logged off).
++        // Log it in first, then invite, but only for the commander's own characters or for a GM.
++        ObjectGuid charGuid = ObjectGuid::Create<HighGuid::Player>(botGuid);
++        uint32 accountId = sCharacterCache->GetCharacterAccountIdByGuid(charGuid);
++        bool allowed = accountId && (accountId == commander->GetSession()->GetAccountId() ||
++            commander->GetSession()->GetSecurity() >= SEC_GAMEMASTER);
++        if (allowed && !ObjectAccessor::FindPlayer(charGuid))
++        {
++            if (handler)
++                handler->SendSysMessage("BotMgr: that character was offline; logging it in, then inviting.");
++            ObjectGuid commanderGuid = commander->GetGUID();
++            SpawnBot(botGuid, nullptr, [commanderGuid, botGuid](Player* /*ready*/)
++            {
++                if (Player* leader = ObjectAccessor::FindPlayer(commanderGuid))
++                {
++                    ChatHandler leaderHandler(leader->GetSession());
++                    sBotMgr->InviteBotToGroup(leader, botGuid, &leaderHandler);
++                }
++            });
++            return;
++        }
++    }
+     if (!bot || bot == commander || bot->GetTeamId() != commander->GetTeamId())
+     {
+         if (handler)
+-- 
+2.47.3
+

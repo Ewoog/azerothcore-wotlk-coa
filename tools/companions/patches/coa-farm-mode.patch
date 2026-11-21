@@ -1,0 +1,530 @@
+From 348e521ff2d2b44c6ec92a054ff1e9ec6c503eac Mon Sep 17 00:00:00 2001
+From: Brendan Juno <brendan@localhost>
+Date: Thu, 19 Nov 2026 16:25:49 -0600
+Subject: [PATCH 1/3] Add farm mode: .botcmd farm/farmstop and
+ FARM/FARMSTOP/GETFARM addon verbs
+
+A bot ordered to farm keeps attacking the nearest live, attackable,
+untapped creature of the commanding player's selected entry within a
+radius (default 40, clamped 10-100) of an anchor taken from the bot's
+position when the order is given. The scan runs from UpdateOffensive's
+idle branch after looting and resting and before following the leader
+or the open-world layer, at most once a second per bot. With nothing up
+the bot walks back to the anchor and waits. A farming bot loots its
+own kills even in a group. Follow, Stay, StopAttack, map/instance
+change, relog and despawn (Forget) end farm mode.
+---
+ module/src/BotAI.cpp        | 201 +++++++++++++++++++++++++++++++++++-
+ module/src/BotAI.h          |  14 +++
+ module/src/BotAddonChat.cpp |  31 ++++++
+ module/src/BotCommand.cpp   |  60 +++++++++++
+ 4 files changed, 303 insertions(+), 3 deletions(-)
+
+diff --git a/module/src/BotAI.cpp b/module/src/BotAI.cpp
+index 399f919..c863222 100644
+--- a/module/src/BotAI.cpp
++++ b/module/src/BotAI.cpp
+@@ -223,6 +223,19 @@ struct BotAIState
+     BotManualCommand manualCommand = BotManualCommand::None;
+     ObjectGuid pullTargetGuid;
+ 
++    // Farm mode -- see BotAI::StartFarm in BotAI.h and TryFarm below. The anchor is where the
++    // bot stood when the order was given; map, instance and login time pin it to that one
++    // place and session, so a teleport, map change or relog ends the order instead of sending
++    // the bot back across the world.
++    bool farmActive = false;
++    uint32 farmEntry = 0;
++    float farmRadius = 0.0f;
++    uint32 farmMapId = 0;
++    uint32 farmInstanceId = 0;
++    time_t farmLoginTime = 0;
++    float farmAnchorX = 0.0f, farmAnchorY = 0.0f, farmAnchorZ = 0.0f;
++    uint32 farmNextScanAtMs = 0;
++
+     // See BotAI::SetSuspended's comment in BotAI.h.
+     bool suspended = false;
+ 
+@@ -1802,7 +1815,8 @@ bool MoveBotToPoint(Player* bot, MoveOwner owner, float x, float y, float z)
+ // Allows bots to systematically path to and loot all trash and boss kills in an encounter.
+ bool TryProcessPendingLoot(Player* bot, uint32 /*diff*/, BotAIState& state)
+ {
+-    if (bot->GetGroup() && !sBotMgr->AutoLootInGroup())
++    // A farming bot loots its own kills even in a group -- picking up the drops is the point of farming.
++    if (bot->GetGroup() && !sBotMgr->AutoLootInGroup() && !state.farmActive)
+     {
+         state.pendingLootGuids.clear();
+         state.lastCombatTargetGuid = ObjectGuid::Empty;
+@@ -1834,8 +1848,9 @@ bool TryProcessPendingLoot(Player* bot, uint32 /*diff*/, BotAIState& state)
+     if (state.pendingLootGuids.empty())
+         return false;
+ 
+-    // If leader is far away or fighting, abort looting to stay with group
+-    if (Group* group = bot->GetGroup())
++    // If leader is far away or fighting, abort looting to stay with group (a farming bot has
++    // been told to stay at its farm, so the leader's distance does not matter to it).
++    if (Group* group = state.farmActive ? nullptr : bot->GetGroup())
+     {
+         if (Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID()))
+         {
+@@ -2142,6 +2157,112 @@ bool TryGrindWhenSolo(Player* bot, uint32 diff, BotAIState& state)
+     return false;
+ }
+ 
++// Farm mode (BotAI::StartFarm). Scans are throttled to one a second per bot; the radius is
++// measured from the anchor, not from wherever the last chase left the bot.
++constexpr uint32 FARM_SCAN_INTERVAL_MS = 1000;
++constexpr float FARM_MIN_RADIUS = 10.0f;
++constexpr float FARM_MAX_RADIUS = 100.0f;
++constexpr float FARM_ANCHOR_ARRIVE_DIST = 4.0f;
++
++// Nearest (to the bot) live creature of the farmed entry within the radius of the anchor that
++// the bot may attack and that nobody outside the bot's own group has tapped. Same shrinking-
++// "best so far" shape as GrindHostileUnitCheck, so CreatureLastSearcher ends on the nearest.
++class FarmTargetCheck
++{
++public:
++    FarmTargetCheck(Player const* bot, uint32 entry, float ax, float ay, float az, float radius)
++        : _bot(bot), _entry(entry), _ax(ax), _ay(ay), _az(az), _radius(radius), _best(1.0e9f) { }
++
++    bool operator()(Creature* c)
++    {
++        if (!c || c->GetEntry() != _entry || !c->IsAlive() || c->IsInEvadeMode())
++            return false;
++        if (c->GetDistance(_ax, _ay, _az) > _radius)
++            return false;
++        if (!_bot->IsValidAttackTarget(c))
++            return false;
++        if (c->hasLootRecipient() && !c->isTappedBy(_bot))
++            return false;
++        if (IsIgnoredTarget(_bot->GetGUID(), c->GetGUID()))
++            return false;
++        float dist = _bot->GetDistance(c);
++        if (dist >= _best)
++            return false;
++        _best = dist;
++        return true;
++    }
++
++private:
++    Player const* _bot;
++    uint32 _entry;
++    float _ax, _ay, _az;
++    float _radius;
++    float _best;
++};
++
++void ClearFarmState(BotAIState& state)
++{
++    state.farmActive = false;
++    state.farmEntry = 0;
++    state.farmRadius = 0.0f;
++    state.farmNextScanAtMs = 0;
++}
++
++// Called from UpdateOffensive's idle branch (every role ends up there when idle), after loot
++// and rest have had their turn and before following the leader or the open-world layer.
++// Returns true when farm mode owns this idle tick.
++bool TryFarm(Player* bot, BotAIState& state)
++{
++    if (!state.farmActive)
++        return false;
++
++    if (bot->GetMapId() != state.farmMapId || bot->GetInstanceId() != state.farmInstanceId ||
++        bot->m_logintime != state.farmLoginTime || bot->InBattleground())
++    {
++        LOG_INFO("module.coa-playerbots", "BotAI: bot '{}' stops farming entry {} (left the farm map or relogged).",
++            bot->GetName(), state.farmEntry);
++        ClearFarmState(state);
++        BotMovement::ForceReleaseOwner(bot, MoveOwner::Grind);
++        return false;
++    }
++
++    // Farm owns the bot: the open-world layer steps back (same as for Stay or a group).
++    WorldBrain::Suspend(bot, SuspendReason::ManualCommand);
++
++    uint32 now = getMSTime();
++    if (state.farmNextScanAtMs && int32(now - state.farmNextScanAtMs) < 0)
++        return true;
++    state.farmNextScanAtMs = now + FARM_SCAN_INTERVAL_MS;
++
++    // A buff, pet summon or other cast in progress finishes first; moving or attacking would cut it.
++    if (bot->IsNonMeleeSpellCast(false))
++        return true;
++
++    Creature* target = nullptr;
++    FarmTargetCheck check(bot, state.farmEntry, state.farmAnchorX, state.farmAnchorY, state.farmAnchorZ, state.farmRadius);
++    Acore::CreatureLastSearcher<FarmTargetCheck> searcher(bot, target, check);
++    Cell::VisitObjects(state.farmAnchorX, state.farmAnchorY, bot->GetMap(), searcher, state.farmRadius);
++
++    if (target)
++    {
++        BotMovement::ForceReleaseOwner(bot, MoveOwner::Grind);
++        bot->Attack(target, true);
++        return true;
++    }
++
++    // Nothing up right now: walk back to the anchor and wait there for a respawn.
++    if (bot->GetDistance(state.farmAnchorX, state.farmAnchorY, state.farmAnchorZ) > FARM_ANCHOR_ARRIVE_DIST)
++    {
++        if (!MoveBotToPoint(bot, MoveOwner::Grind, state.farmAnchorX, state.farmAnchorY, state.farmAnchorZ) &&
++            BotMovement::CurrentOwner(bot) == MoveOwner::Travel)
++            ClearActiveFollow(bot); // a leftover follow holds the slot; the walk is retried next scan
++        return true;
++    }
++
++    BotMovement::ForceReleaseOwner(bot, MoveOwner::Grind);
++    return true;
++}
++
+ // The tank runs point and the other bots follow it, so a pull that starts while the healer or a damage dealer is out of mana, hurt, dead or far behind
+ // ends in a wipe. Why the tank should stand still instead of walking on or pulling, empty when the group is fit to go. Starts waiting a little earlier
+ // than it stops (hysteresis) so the group is not left half recovered, and gives up after 150 s so one bot that never recovers cannot hold the run
+@@ -4215,6 +4336,10 @@ void UpdateOffensive(Player* bot, uint32 diff, BotRole combatRole, BotRole profi
+             if (TryRestIfNeeded(bot, diff, combatRole, state))
+                 return;
+ 
++            // Farm mode outranks following the leader and the open-world layer below.
++            if (TryFarm(bot, state))
++                return;
++
+             bool inEncounter = WorldEncounterDirector::IsBotInEncounter(bot->GetGUID());
+             bool inEncounterGroup = bot->GetGroup() &&
+                 WorldEncounterDirector::IsEncounterTemporaryGroup(bot->GetGroup()->GetGUID().GetCounter());
+@@ -5923,6 +6048,14 @@ void SetManualCommand(ObjectGuid botGuid, BotManualCommand command, ObjectGuid p
+     state.manualCommand = command;
+     state.pullTargetGuid = (command == BotManualCommand::Pull) ? pullTarget : ObjectGuid::Empty;
+ 
++    // Follow and Stay are explicit movement orders and end farm mode; a one-shot Pull does not.
++    if ((command == BotManualCommand::Follow || command == BotManualCommand::Stay) && state.farmActive)
++    {
++        ClearFarmState(state);
++        if (Player* bot = ObjectAccessor::FindPlayer(botGuid))
++            BotMovement::ForceStopOwner(bot, MoveOwner::Grind);
++    }
++
+     if (command == BotManualCommand::Follow)
+     {
+         state.followWaitingReaction = false;
+@@ -5959,9 +6092,71 @@ void StopAttack(ObjectGuid botGuid)
+     BotAIState& state = states[botGuid];
+     state.manualCommand = BotManualCommand::None;
+     state.pullTargetGuid = ObjectGuid::Empty;
++    bool wasFarming = state.farmActive;
++    ClearFarmState(state); // otherwise the next farm scan would pick the fight straight back up
+ 
+     if (Player* bot = ObjectAccessor::FindPlayer(botGuid))
++    {
+         bot->AttackStop();
++        if (wasFarming)
++            BotMovement::ForceStopOwner(bot, MoveOwner::Grind);
++    }
++}
++
++bool StartFarm(Player* bot, uint32 creatureEntry, float radius)
++{
++    if (!bot || !bot->IsInWorld() || !creatureEntry)
++        return false;
++
++    ObjectGuid botGuid = bot->GetGUID();
++    CoaBotPerf::MarkCommand(botGuid.GetRawValue());
++    CoaBotScheduling::Notify(botGuid);
++    BotAIState& state = states[botGuid];
++    state.farmActive = true;
++    state.farmEntry = creatureEntry;
++    state.farmRadius = std::clamp(radius, FARM_MIN_RADIUS, FARM_MAX_RADIUS);
++    state.farmMapId = bot->GetMapId();
++    state.farmInstanceId = bot->GetInstanceId();
++    state.farmLoginTime = bot->m_logintime;
++    state.farmAnchorX = bot->GetPositionX();
++    state.farmAnchorY = bot->GetPositionY();
++    state.farmAnchorZ = bot->GetPositionZ();
++    state.farmNextScanAtMs = 0;
++
++    // Stay/Follow would contradict the order; a pending one-shot Pull is left to fire.
++    if (state.manualCommand == BotManualCommand::Stay || state.manualCommand == BotManualCommand::Follow)
++        state.manualCommand = BotManualCommand::None;
++    state.nextFollowCheckAtMs = 0;
++    ClearActiveFollow(bot);
++    WorldBrain::Suspend(bot, SuspendReason::ManualCommand);
++
++    LOG_INFO("module.coa-playerbots", "BotAI: bot '{}' farms entry {} within {:.0f} yd of ({:.0f} {:.0f} {:.0f}) on map {}.",
++        bot->GetName(), creatureEntry, state.farmRadius, state.farmAnchorX, state.farmAnchorY, state.farmAnchorZ, state.farmMapId);
++    return true;
++}
++
++void StopFarm(ObjectGuid botGuid)
++{
++    auto itr = states.find(botGuid);
++    if (itr == states.end() || !itr->second.farmActive)
++        return;
++
++    ClearFarmState(itr->second);
++    CoaBotScheduling::Notify(botGuid);
++    if (Player* bot = ObjectAccessor::FindPlayer(botGuid))
++        BotMovement::ForceStopOwner(bot, MoveOwner::Grind);
++}
++
++bool GetFarm(ObjectGuid botGuid, uint32& creatureEntry, float& radius, uint32& mapId)
++{
++    auto itr = states.find(botGuid);
++    if (itr == states.end() || !itr->second.farmActive)
++        return false;
++
++    creatureEntry = itr->second.farmEntry;
++    radius = itr->second.farmRadius;
++    mapId = itr->second.farmMapId;
++    return true;
+ }
+ 
+ void SetSuspended(ObjectGuid botGuid, bool suspended)
+diff --git a/module/src/BotAI.h b/module/src/BotAI.h
+index 2e7eda4..61cd7bc 100644
+--- a/module/src/BotAI.h
++++ b/module/src/BotAI.h
+@@ -144,6 +144,20 @@ namespace BotAI
+     // anything about who issued the command.
+     void SetManualCommand(ObjectGuid botGuid, BotManualCommand command, ObjectGuid pullTarget = ObjectGuid::Empty);
+ 
++    // Farm mode (`.botcmd farm` / the COABOT FARM verb): the bot keeps hunting one creature
++    // entry around a fixed anchor (the bot's own position and map when the order is given)
++    // until told to stop. Each idle tick, after looting and resting have had their turn, the
++    // bot attacks the nearest live, attackable creature of that entry within `radius` of the
++    // anchor that nobody outside its own group has tapped, and walks back to the anchor and
++    // waits when there is none. Takes priority over the open-world layer (questing,
++    // wandering) and over following the group leader. Radius is clamped to 10-100 yards.
++    // Cleared by StopFarm, by Follow/Stay/StopAttack, by a map change or relog, and on
++    // despawn (Forget). Returns false when the bot or entry is unusable.
++    bool StartFarm(Player* bot, uint32 creatureEntry, float radius);
++    void StopFarm(ObjectGuid botGuid);
++    // True while the bot is farming; fills the farmed entry, radius and anchor map.
++    bool GetFarm(ObjectGuid botGuid, uint32& creatureEntry, float& radius, uint32& mapId);
++
+     // Immediately stops the bot's current attack and reverts any manual command to None
+     // (falls back to normal follow/idle behavior next tick).
+     void StopAttack(ObjectGuid botGuid);
+diff --git a/module/src/BotAddonChat.cpp b/module/src/BotAddonChat.cpp
+index 9151beb..e9707ba 100644
+--- a/module/src/BotAddonChat.cpp
++++ b/module/src/BotAddonChat.cpp
+@@ -19,6 +19,7 @@
+ #include "BotMgr.h"
+ #include "Chat.h"
+ #include "ClassSpecRoles.h"
++#include "Creature.h"
+ #include "Group.h"
+ #include "ItemTemplate.h"
+ #include "map/BotMapService.h"
+@@ -406,6 +407,36 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
+     }
+     else if (verb == "STOPATTACK")
+         BotAI::StopAttack(bot->GetGUID());
++    else if (verb == "FARM")
++    {
++        // FARM:<botGuidLow>[:<radius>] -- the creature type is whatever the commanding player has
++        // selected, resolved server-side exactly like PULL. Replies with the GETFARM shape.
++        Unit* target = commander->GetSelectedUnit();
++        Creature* creature = target ? target->ToCreature() : nullptr;
++        if (creature && creature->GetMap() == bot->GetMap())
++        {
++            float radius = parts.size() >= 3 ? float(std::strtod(parts[2].c_str(), nullptr)) : 40.0f;
++            if (radius <= 0.0f)
++                radius = 40.0f;
++            BotAI::StartFarm(bot, creature->GetEntry(), radius);
++        }
++        uint32 entry = 0, mapId = 0;
++        float radius = 0.0f;
++        BotAI::GetFarm(bot->GetGUID(), entry, radius, mapId);
++        SendCoaBotReply(commander, "FARM:" + std::to_string(botGuidLow) + ":" + std::to_string(entry) + ":" + std::to_string(uint32(radius)));
++    }
++    else if (verb == "FARMSTOP")
++    {
++        BotAI::StopFarm(bot->GetGUID());
++        SendCoaBotReply(commander, "FARM:" + std::to_string(botGuidLow) + ":0:0");
++    }
++    else if (verb == "GETFARM")
++    {
++        uint32 entry = 0, mapId = 0;
++        float radius = 0.0f;
++        BotAI::GetFarm(bot->GetGUID(), entry, radius, mapId);
++        SendCoaBotReply(commander, "FARM:" + std::to_string(botGuidLow) + ":" + std::to_string(entry) + ":" + std::to_string(uint32(radius)));
++    }
+     else if (verb == "SETROLE" && parts.size() >= 3)
+         sBotMgr->SetRole(botGuidLow, parts[2], nullptr);
+     else if (verb == "LEARNSPEC" && parts.size() >= 3)
+diff --git a/module/src/BotCommand.cpp b/module/src/BotCommand.cpp
+index 20c79ba..2a9745a 100644
+--- a/module/src/BotCommand.cpp
++++ b/module/src/BotCommand.cpp
+@@ -21,6 +21,7 @@
+ #include "BotTalentBuilds.h"
+ #include "Chat.h"
+ #include "CommandScript.h"
++#include "Creature.h"
+ #include "GameTime.h"
+ #include "LFGMgr.h"
+ #include "ObjectAccessor.h"
+@@ -84,6 +85,8 @@ public:
+             { "follow",       HandleBotFollowCommand,       rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+             { "stay",         HandleBotStayCommand,         rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+             { "stopattack",   HandleBotStopAttackCommand,   rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
++            { "farm",         HandleBotFarmCommand,         rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
++            { "farmstop",     HandleBotFarmStopCommand,     rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+             { "kill",         HandleBotKillCommand,         rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+             { "suspend",      HandleBotSuspendCommand,      rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+             { "resume",       HandleBotResumeCommand,       rbac::RBAC_PERM_COMMAND_DEBUG, Console::Yes },
+@@ -847,6 +850,63 @@ public:
+         return true;
+     }
+ 
++    // Farm mode: the bot keeps killing the creature type the commanding player has selected,
++    // within `radius` yards (default 40, clamped 10-100) of where the bot stands now, until
++    // `.botcmd farmstop` (or Follow/Stay/stopattack, a map change, relog or despawn). In-game
++    // only -- the target is read from the player's selection, like the addon's PULL verb.
++    static bool HandleBotFarmCommand(ChatHandler* handler, ObjectGuid::LowType charLowGuid, Optional<float> radius)
++    {
++        Player* commander = handler->GetPlayer();
++        if (!commander)
++        {
++            handler->SendSysMessage("BotMgr: .botcmd farm needs an in-game player with a creature selected.");
++            return true;
++        }
++
++        Player* bot = sBotMgr->FindBotPlayer(charLowGuid);
++        if (!bot)
++        {
++            handler->PSendSysMessage("BotMgr: no online bot with guid {}.", charLowGuid);
++            return true;
++        }
++
++        Unit* selected = commander->GetSelectedUnit();
++        Creature* creature = selected ? selected->ToCreature() : nullptr;
++        if (!creature)
++        {
++            handler->SendSysMessage("BotMgr: select the creature to farm first (a creature, not a player).");
++            return true;
++        }
++
++        if (creature->GetMap() != bot->GetMap())
++        {
++            handler->PSendSysMessage("BotMgr: bot '{}' is not on the same map as '{}'.", bot->GetName(), creature->GetName());
++            return true;
++        }
++
++        float wanted = radius.value_or(40.0f);
++        if (!BotAI::StartFarm(bot, creature->GetEntry(), wanted))
++        {
++            handler->PSendSysMessage("BotMgr: bot '{}' could not start farming.", bot->GetName());
++            return true;
++        }
++
++        uint32 entry = 0, mapId = 0;
++        float actualRadius = wanted;
++        BotAI::GetFarm(bot->GetGUID(), entry, actualRadius, mapId);
++        handler->PSendSysMessage("BotMgr: bot '{}' now farms '{}' (entry {}) within {:.0f} yards of its current spot. Stop with .botcmd farmstop {}.",
++            bot->GetName(), creature->GetName(), entry, actualRadius, charLowGuid);
++        return true;
++    }
++
++    static bool HandleBotFarmStopCommand(ChatHandler* handler, ObjectGuid::LowType charLowGuid)
++    {
++        BotAI::StopFarm(ObjectGuid::Create<HighGuid::Player>(charLowGuid));
++        if (handler)
++            handler->PSendSysMessage("BotMgr: guid {} farm mode stopped.", charLowGuid);
++        return true;
++    }
++
+     static bool HandleBotKillCommand(ChatHandler* handler, ObjectGuid::LowType charLowGuid)
+     {
+         sBotMgr->Kill(charLowGuid, handler);
+-- 
+2.47.3
+
+
+From 5cda857154b94b3c6f0f08924c1da9b90b7fcd6c Mon Sep 17 00:00:00 2001
+From: Brendan Juno <brendan@localhost>
+Date: Thu, 19 Nov 2026 16:25:49 -0600
+Subject: [PATCH 2/3] Document farm mode commands and addon verbs
+
+---
+ changelog.d/20261119-farm-mode-for-companion-bots.md | 7 +++++++
+ docs/addon-protocol.md                               | 3 +++
+ docs/capabilities.md                                 | 2 +-
+ 3 files changed, 11 insertions(+), 1 deletion(-)
+ create mode 100644 changelog.d/20261119-farm-mode-for-companion-bots.md
+
+diff --git a/changelog.d/20261119-farm-mode-for-companion-bots.md b/changelog.d/20261119-farm-mode-for-companion-bots.md
+new file mode 100644
+index 0000000..71ae5d2
+--- /dev/null
++++ b/changelog.d/20261119-farm-mode-for-companion-bots.md
+@@ -0,0 +1,7 @@
++---
++area: bots
++type: added
++audience: players
++title: Bots can farm one kind of creature around a spot until told to stop
++---
++Select a creature and use .botcmd farm (or the addon FARM verb): the bot keeps killing and looting that creature type within a radius of where it stands, and waits there for respawns. Stop it with .botcmd farmstop.
+diff --git a/docs/addon-protocol.md b/docs/addon-protocol.md
+index 051dfbd..24a8585 100644
+--- a/docs/addon-protocol.md
++++ b/docs/addon-protocol.md
+@@ -38,6 +38,9 @@ so both sides can be developed independently against the same interface.
+ | `STAY` | botGuidLow | new `BotAI::SetManualCommand(guid, Stay)` | Bot holds current position -- no follow, no auto-engage on the leader's target, still self-defends if attacked (reuses the existing attacker-retaliation fallback). |
+ | `PULL` | botGuidLow | new `BotAI::SetManualCommand(guid, Pull)`, target = sender's current target | Bot immediately engages whatever unit the *commanding player* currently has selected (read via the WHISPER sender's `GetSelectedUnit()`server-side, not a guid over the wire -- avoids the addon needing to resolve/transmit a target guid itself). |
+ | `STOPATTACK` | botGuidLow | `Unit::AttackStop()` + clear any manual Pull state, fall back to `Follow` | |
++| `FARM` | botGuidLow, radius (optional, default 40, clamped 10-100) | `BotAI::StartFarm(bot, selectedCreature->GetEntry(), radius)` | Farm mode: the bot keeps killing creatures of the same entry as the *commanding player's* current selection (resolved server-side, like `PULL`) within `radius` yards of where the bot stands now, loots them, and walks back to that spot to wait when none are up. Outranks following the leader and the open-world layer. Ended by `FARMSTOP`, `FOLLOW`, `STAY`, `STOPATTACK`, a map change, relog or despawn. Replies `FARM:<botGuidLow>:<entry>:<radius>` (`0:0` when not farming). |
++| `FARMSTOP` | botGuidLow | `BotAI::StopFarm` | Replies `FARM:<botGuidLow>:0:0`. |
++| `GETFARM` | botGuidLow | server replies `FARM:<botGuidLow>:<entry>:<radius>`, no state change | `0:0` when the bot is not farming. |
+ | `SETROLE` | botGuidLow, role name (`dps`/`tank`/`healer`/`support`/`auto`) | existing `BotMgr::SetRole`/`ClearRoleOverride` | Reuses code already live-tested this session. As of 2026-09-15: also auto-switches the bot's Ascension spec to match the requested role (via `BotMgr::LearnSpecialization`) if its current spec doesn't already map to that role, and silently refuses the whole request (spec+role both left unchanged) if the bot's class has no spec at all for that role -- see `ClassSpecRoles::FindSpecForRole`. `handler` is always `nullptr` on this wire path (see `BotAddonChat.cpp`), so refusal produces no message back to the player; the addon should pre-filter role options per bot rather than rely on server feedback (see "Addon UX expectations"). |
+ | `LEARNSPEC` | botGuidLow, specId | existing `BotMgr::LearnSpecialization` | |
+ | `GETROLES` | botGuidLow | server replies (see below), no bot state change | Added 2026-09-15. Query verb: ask which roles this bot's class can actually hold, so the addon can grey out impossible role buttons before the player ever clicks one (`SETROLE` refuses silently -- see its note above). |
+diff --git a/docs/capabilities.md b/docs/capabilities.md
+index a9cc1e7..4181065 100644
+--- a/docs/capabilities.md
++++ b/docs/capabilities.md
+@@ -131,7 +131,7 @@ need the "why," not just the "what."
+ ## Operator tooling (GM/RA commands)
+ 
+ `.botcmd spawnbot`, `spawnrandom`, `spawnleveled`, `despawn`, `acceptinvite`,
+-`invite`, `follow`, `stay`, `attack`, `stopattack`, `kill`, `suspend`,
++`invite`, `follow`, `stay`, `attack`, `stopattack`, `farm`, `farmstop`, `kill`, `suspend`,
+ `resume`, `setrole`, `checkrole`, `learnspec`, `listauras`, `hasspells`,
+ `runchat`, `quickfill`, `geartrainer`, `joinbg`, `joinlfg`,
+ `guildcreate`/`guildinvite`/`acceptguildinvite`/`guildgather`/`guilddeposit`/
+-- 
+2.47.3
+
+
+From 80121466df225e20c09cf5c327e666d5c518d642 Mon Sep 17 00:00:00 2001
+From: Brendan Juno <brendan@localhost>
+Date: Thu, 19 Nov 2026 16:26:42 -0600
+Subject: [PATCH 3/3] Farm mode: ignore group fights far from the farm
+
+A grouped farming bot no longer runs off to a groupmate's fight
+unless that fight is within the farm radius (+10 yd) of the anchor.
+---
+ module/src/BotAI.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/module/src/BotAI.cpp b/module/src/BotAI.cpp
+index c863222..0c81114 100644
+--- a/module/src/BotAI.cpp
++++ b/module/src/BotAI.cpp
+@@ -4195,7 +4195,13 @@ void UpdateOffensive(Player* bot, uint32 diff, BotRole combatRole, BotRole profi
+     // below both still apply, since Stay is about not *initiating*, not about refusing to
+     // fight at all.
+     if (!target && state.manualCommand != BotManualCommand::Stay)
++    {
+         target = FindGroupCombatTarget(bot, bot->GetGroup());
++        // A farming bot joins group fights at its farm, not ones across the zone.
++        if (target && state.farmActive && (target->GetMapId() != state.farmMapId ||
++            target->GetDistance(state.farmAnchorX, state.farmAnchorY, state.farmAnchorZ) > state.farmRadius + 10.0f))
++            target = nullptr;
++    }
+ 
+     if (!target && bot->InBattleground())
+         target = BotBattlegroundAI::FindHostilePvPTarget(bot, 40.0f);
+-- 
+2.47.3
+

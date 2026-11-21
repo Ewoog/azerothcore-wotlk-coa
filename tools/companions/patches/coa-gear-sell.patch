@@ -1,0 +1,912 @@
+diff --git a/module/src/BotAI.cpp b/module/src/BotAI.cpp
+index 76c5617..07b3fee 100644
+--- a/module/src/BotAI.cpp
++++ b/module/src/BotAI.cpp
+@@ -4790,6 +4790,8 @@ char const* IdleWatchdogExemption(Player* bot, BotAIState const& state)
+     // Errands include the repair/ammo maintenance trips; each errand has its own deadline.
+     if (BotWorldBehavior::HasActiveErrand(bot->GetGUID()))
+         return "on an errand or maintenance trip";
++    if (BotEconomy::HasSaleTrip(bot))
++        return "on an economy sale trip";
+     if (sBotMgr->GetGuildGatherOrder(bot->GetGUID()))
+         return "on a guild gather order";
+     if (WorldEncounterDirector::IsBotInEncounter(bot->GetGUID()))
+diff --git a/module/src/BotEconomy.cpp b/module/src/BotEconomy.cpp
+index acdd14c..8fb4bcf 100644
+--- a/module/src/BotEconomy.cpp
++++ b/module/src/BotEconomy.cpp
+@@ -1666,4 +1666,37 @@ namespace BotEconomy
+     {
+         return g_protected.count(itemEntry) != 0;
+     }
++
++    bool IsLive()
++    {
++        return g_settings.enable && !g_settings.dryRun;
++    }
++
++    bool HasSaleTrip(Player const* bot)
++    {
++        if (!bot || !IsLive())
++            return false;
++        ObjectGuid const guid = bot->GetGUID();
++        return g_trips.count(guid) || g_wantsTrip.count(guid);
++    }
++
++    uint32 MoneyReserveCopper()
++    {
++        return g_settings.moneyReserveCopper;
++    }
++
++    void RecordCleanupVendorSale(Player* bot, uint32 itemEntry, uint32 count, uint32 unitCopper, char const* reason)
++    {
++        if (!bot || !g_settings.enable || !count)
++            return;
++        EnsureTables();
++        Line line;
++        line.entry = itemEntry;
++        line.count = count;
++        line.reason = reason && reason[0] ? reason : "bag-cleanup";
++        line.verdict = Verdict::Vendor;
++        line.unitCopper = unitCopper;
++        line.priceSource = "bag-cleanup";
++        JournalDone(bot, line, count, unitCopper, "vendor", "bag-cleanup");
++    }
+ }
+diff --git a/module/src/BotEconomy.h b/module/src/BotEconomy.h
+index b31e69c..460e570 100644
+--- a/module/src/BotEconomy.h
++++ b/module/src/BotEconomy.h
+@@ -93,6 +93,18 @@ namespace BotEconomy
+     // True when item_entry is in mod_coa_bot_protected_items and that table has been loaded.
+     // False when the economy tables have not been created yet.
+     bool IsProtectedItem(uint32 itemEntry);
++
++    // CoaBots.Economy.Enable = 1 and DryRun = 0: bots actually trade, not just plan.
++    bool IsLive();
++
++    // True while this bot is travelling to town for an economy sale, or is queued to.
++    bool HasSaleTrip(Player const* bot);
++
++    // CoaBots.Economy.MoneyReserveCopper (default 5g).
++    uint32 MoneyReserveCopper();
++
++    // Write an executed vendor-sale row for a bag-cleanup sell. No-op when the economy is off.
++    void RecordCleanupVendorSale(Player* bot, uint32 itemEntry, uint32 count, uint32 unitCopper, char const* reason);
+ }
+ 
+ #endif // COA_PLAYERBOTS_BOT_ECONOMY_H
+diff --git a/module/src/BotMaintenance.cpp b/module/src/BotMaintenance.cpp
+index 006c9c1..dd85379 100644
+--- a/module/src/BotMaintenance.cpp
++++ b/module/src/BotMaintenance.cpp
+@@ -28,6 +28,7 @@
+ #include <cmath>
+ #include <cstring>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <vector>
+ 
+ namespace
+@@ -261,6 +262,8 @@ namespace
+         {
+             if (!creature->IsAlive() || !creature->IsVendor())
+                 return false;
++            if (creature->IsHostileTo(_bot) || _bot->IsHostileTo(creature))
++                return false;
+             if (!_bot->IsWithinDistInMap(creature, _range))
+                 return false;
+             if (!BotMaintenance::VendorSellsUsableAmmo(creature->GetEntry(), _bot, _subClass))
+@@ -532,6 +535,507 @@ namespace
+         return false;
+     }
+ 
++
++    // CoA custom gathering profession / tool. The axe itself is granted by a
++    // world update rather than the base item_template dump.
++    constexpr uint32 SKILL_WOODCUTTING_COA = 732;
++    constexpr uint32 SKILL_WOODWORKING_COA = 757;
++    constexpr uint32 LUMBER_AXE_ENTRY = 6954;
++
++    constexpr uint32 TOOL_FAMILY_MINING      = 0x001;
++    constexpr uint32 TOOL_FAMILY_SKINNING    = 0x002;
++    constexpr uint32 TOOL_FAMILY_BLACKSMITH  = 0x004;
++    constexpr uint32 TOOL_FAMILY_ENGINEERING = 0x008;
++    constexpr uint32 TOOL_FAMILY_ENCHANTING  = 0x010;
++    constexpr uint32 TOOL_FAMILY_INSCRIPTION = 0x020;
++    constexpr uint32 TOOL_FAMILY_FISHING     = 0x040;
++    constexpr uint32 TOOL_FAMILY_WOODCUTTING = 0x080;
++    constexpr uint32 TOOL_FAMILY_ALCHEMY     = 0x100;
++    constexpr uint32 TOOL_FAMILY_COOKING     = 0x200;
++    constexpr uint32 TOOL_FAMILY_HERBALISM   = 0x400;
++    constexpr uint32 TOOL_FAMILY_CLASS       = 0x800;
++
++    uint32 OrderGatherSkill(Player const* bot)
++    {
++        if (!bot || !sBotMgr)
++            return 0;
++        BotMgr::GuildGatherOrder const* order = sBotMgr->GetGuildGatherOrder(bot->GetGUID());
++        if (!order || !order->itemEntry)
++            return 0;
++        BotMgr::GatherSourceInfo const& info = sBotMgr->GetGatherSourceInfo(order->itemEntry);
++        if (info.nodeSourced && info.nodeSkillId)
++            return info.nodeSkillId;
++        if (info.fishSourced)
++            return SKILL_FISHING;
++        if (!info.huntSkinEntries.empty())
++            return SKILL_SKINNING;
++        return 0;
++    }
++
++    uint32 ToolFamiliesOf(ItemTemplate const* proto)
++    {
++        if (!proto)
++            return 0;
++        uint32 families = 0;
++        uint32 const cat = proto->TotemCategory;
++        switch (cat)
++        {
++            case TC_EARTH_TOTEM:
++            case TC_AIR_TOTEM:
++            case TC_FIRE_TOTEM:
++            case TC_WATER_TOTEM:
++            case TC_MASTER_TOTEM:
++                return TOOL_FAMILY_CLASS;
++            case TC_MINING_PICK:
++            case TC_MINING_PICK_OLD:
++                families |= TOOL_FAMILY_MINING;
++                break;
++            case TC_SKINNING_KNIFE:
++            case TC_SKINNING_SKIFE_OLD:
++                families |= TOOL_FAMILY_SKINNING;
++                break;
++            case TC_BLACKSMITH_HAMMER:
++            case TC_BLACKSMITH_HAMMER_OLD:
++                families |= TOOL_FAMILY_BLACKSMITH;
++                break;
++            case TC_ARCLIGHT_SPANNER:
++            case TC_GYROMATIC_MA:
++                families |= TOOL_FAMILY_ENGINEERING;
++                break;
++            case TC_GNOMISH_ARMY_KNIFE:
++                families |= TOOL_FAMILY_MINING | TOOL_FAMILY_SKINNING
++                    | TOOL_FAMILY_BLACKSMITH | TOOL_FAMILY_ENGINEERING;
++                break;
++            case TC_HAMMER_PICK:
++                families |= TOOL_FAMILY_MINING | TOOL_FAMILY_BLACKSMITH;
++                break;
++            case TC_BLADED_PICKAXE:
++                families |= TOOL_FAMILY_MINING | TOOL_FAMILY_SKINNING;
++                break;
++            case TC_COPPER_ROD:
++            case TC_SILVER_ROD:
++            case TC_GOLDEN_ROD:
++            case TC_TRUESILVER_ROD:
++            case TC_ARCANITE_ROD:
++            case TC_FEL_IRON_ROD:
++            case TC_ADAMANTITE_ROD:
++            case TC_ETERNIUM_ROD:
++            case TC_RUNED_AZURITE_ROD:
++            case TC_RUNED_COBALT_ROD:
++            case TC_RUNED_TITANIUM_ROD:
++                families |= TOOL_FAMILY_ENCHANTING;
++                break;
++            case TC_HOLLOW_QUILL:
++            case TC_VIRTUOSO_INKING_SET:
++                families |= TOOL_FAMILY_INSCRIPTION;
++                break;
++            case TC_PHILOSOPHERS_STONE:
++                families |= TOOL_FAMILY_ALCHEMY;
++                break;
++            case TC_FLINT_AND_TINDER:
++                families |= TOOL_FAMILY_COOKING;
++                break;
++            default:
++                break;
++        }
++
++        if (proto->Class == ITEM_CLASS_WEAPON && proto->SubClass == ITEM_SUBCLASS_WEAPON_FISHING_POLE)
++            families |= TOOL_FAMILY_FISHING;
++
++        if (proto->ItemId == LUMBER_AXE_ENTRY || proto->RequiredSkill == SKILL_WOODCUTTING_COA
++            || proto->RequiredSkill == SKILL_WOODWORKING_COA)
++            families |= TOOL_FAMILY_WOODCUTTING;
++
++        if (proto->RequiredSkill == SKILL_HERBALISM
++            && (cat || (proto->Class == ITEM_CLASS_WEAPON && proto->SubClass == ITEM_SUBCLASS_WEAPON_MISC)))
++            families |= TOOL_FAMILY_HERBALISM;
++
++        if (!families && BotAI::IsProfessionTool(proto))
++            families = TOOL_FAMILY_CLASS;
++        return families;
++    }
++
++    uint32 NeededToolFamilies(Player const* bot)
++    {
++        if (!bot)
++            return 0;
++        uint32 needed = 0;
++        if (bot->HasSkill(SKILL_MINING))
++            needed |= TOOL_FAMILY_MINING;
++        if (bot->HasSkill(SKILL_SKINNING))
++            needed |= TOOL_FAMILY_SKINNING;
++        if (bot->HasSkill(SKILL_BLACKSMITHING))
++            needed |= TOOL_FAMILY_BLACKSMITH;
++        if (bot->HasSkill(SKILL_ENGINEERING))
++            needed |= TOOL_FAMILY_ENGINEERING;
++        if (bot->HasSkill(SKILL_ENCHANTING))
++            needed |= TOOL_FAMILY_ENCHANTING;
++        if (bot->HasSkill(SKILL_INSCRIPTION))
++            needed |= TOOL_FAMILY_INSCRIPTION;
++        if (bot->HasSkill(SKILL_FISHING))
++            needed |= TOOL_FAMILY_FISHING;
++        if (bot->HasSkill(SKILL_WOODCUTTING_COA) || bot->HasSkill(SKILL_WOODWORKING_COA))
++            needed |= TOOL_FAMILY_WOODCUTTING;
++        if (bot->HasSkill(SKILL_ALCHEMY))
++            needed |= TOOL_FAMILY_ALCHEMY;
++        if (bot->HasSkill(SKILL_COOKING))
++            needed |= TOOL_FAMILY_COOKING;
++        if (bot->HasSkill(SKILL_HERBALISM))
++            needed |= TOOL_FAMILY_HERBALISM;
++
++        uint32 const orderSkill = OrderGatherSkill(bot);
++        if (orderSkill == SKILL_MINING)
++            needed |= TOOL_FAMILY_MINING;
++        else if (orderSkill == SKILL_SKINNING)
++            needed |= TOOL_FAMILY_SKINNING;
++        else if (orderSkill == SKILL_FISHING)
++            needed |= TOOL_FAMILY_FISHING;
++        else if (orderSkill == SKILL_HERBALISM)
++            needed |= TOOL_FAMILY_HERBALISM;
++        else if (orderSkill == SKILL_WOODCUTTING_COA || orderSkill == SKILL_WOODWORKING_COA)
++            needed |= TOOL_FAMILY_WOODCUTTING;
++        return needed;
++    }
++
++    uint32 ToolScore(Item const* item)
++    {
++        if (!item || !item->GetTemplate())
++            return 0;
++        ItemTemplate const* proto = item->GetTemplate();
++        uint32 score = proto->Quality * 10000u + proto->ItemLevel * 100u + proto->RequiredSkillRank;
++        if (proto->TotemCategory == TC_GNOMISH_ARMY_KNIFE)
++            score += 50000u;
++        switch (proto->TotemCategory)
++        {
++            case TC_COPPER_ROD: score += 1000u; break;
++            case TC_SILVER_ROD: score += 2000u; break;
++            case TC_GOLDEN_ROD: score += 3000u; break;
++            case TC_TRUESILVER_ROD: score += 4000u; break;
++            case TC_ARCANITE_ROD: score += 5000u; break;
++            case TC_FEL_IRON_ROD: score += 6000u; break;
++            case TC_ADAMANTITE_ROD: score += 7000u; break;
++            case TC_ETERNIUM_ROD: score += 8000u; break;
++            case TC_RUNED_AZURITE_ROD: score += 8500u; break;
++            case TC_RUNED_COBALT_ROD: score += 9000u; break;
++            case TC_RUNED_TITANIUM_ROD: score += 10000u; break;
++            default: break;
++        }
++        // An already-equipped fishing pole or weapon-tool always wins its family.
++        if (item->IsEquipped())
++            score += 1000000u;
++        return score;
++    }
++
++    struct ToolPlan
++    {
++        std::unordered_set<ObjectGuid> keep;
++        std::unordered_set<ObjectGuid> sell;
++    };
++
++    ToolPlan ClassifyTools(Player* bot)
++    {
++        ToolPlan plan;
++        if (!bot)
++            return plan;
++        uint32 const needed = NeededToolFamilies(bot);
++        struct ToolItem
++        {
++            Item* item;
++            uint32 families;
++            uint32 score;
++        };
++        std::vector<ToolItem> tools;
++        auto considerTool = [&](Item* item)
++        {
++            if (!item || !item->GetTemplate())
++                return;
++            uint32 families = ToolFamiliesOf(item->GetTemplate());
++            if (!families)
++                return;
++            tools.push_back({ item, families, ToolScore(item) });
++        };
++        ForEachInventoryItem(bot, considerTool);
++        // Include equipped tools so the bag copy of a worse pick or pole is sold.
++        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
++            considerTool(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
++
++        std::unordered_set<ObjectGuid> winners;
++        static constexpr uint32 kFamilies[] = {
++            TOOL_FAMILY_MINING, TOOL_FAMILY_SKINNING, TOOL_FAMILY_BLACKSMITH,
++            TOOL_FAMILY_ENGINEERING, TOOL_FAMILY_ENCHANTING, TOOL_FAMILY_INSCRIPTION,
++            TOOL_FAMILY_FISHING, TOOL_FAMILY_WOODCUTTING, TOOL_FAMILY_ALCHEMY,
++            TOOL_FAMILY_COOKING, TOOL_FAMILY_HERBALISM
++        };
++        for (uint32 family : kFamilies)
++        {
++            if (!(needed & family))
++                continue;
++            ToolItem const* best = nullptr;
++            for (ToolItem const& tool : tools)
++            {
++                if (!(tool.families & family))
++                    continue;
++                if (!best || tool.score > best->score)
++                    best = &tool;
++            }
++            if (best)
++                winners.insert(best->item->GetGUID());
++        }
++
++        for (ToolItem const& tool : tools)
++        {
++            ObjectGuid const guid = tool.item->GetGUID();
++            // Class totems and similar stay. An equipped fishing pole is never sold.
++            bool const classTool = (tool.families & TOOL_FAMILY_CLASS) != 0;
++            bool const equippedPole = tool.item->IsEquipped()
++                && tool.item->GetTemplate()->Class == ITEM_CLASS_WEAPON
++                && tool.item->GetTemplate()->SubClass == ITEM_SUBCLASS_WEAPON_FISHING_POLE;
++            if (classTool || equippedPole || winners.count(guid))
++                plan.keep.insert(guid);
++            else
++                plan.sell.insert(guid);
++        }
++        return plan;
++    }
++
++    uint32 WeaponSkillFor(ItemTemplate const* proto)
++    {
++        if (!proto || proto->Class != ITEM_CLASS_WEAPON)
++            return 0;
++        switch (proto->SubClass)
++        {
++            case ITEM_SUBCLASS_WEAPON_AXE:          return SKILL_AXES;
++            case ITEM_SUBCLASS_WEAPON_AXE2:         return SKILL_2H_AXES;
++            case ITEM_SUBCLASS_WEAPON_BOW:          return SKILL_BOWS;
++            case ITEM_SUBCLASS_WEAPON_GUN:          return SKILL_GUNS;
++            case ITEM_SUBCLASS_WEAPON_MACE:         return SKILL_MACES;
++            case ITEM_SUBCLASS_WEAPON_MACE2:        return SKILL_2H_MACES;
++            case ITEM_SUBCLASS_WEAPON_POLEARM:      return SKILL_POLEARMS;
++            case ITEM_SUBCLASS_WEAPON_SWORD:        return SKILL_SWORDS;
++            case ITEM_SUBCLASS_WEAPON_SWORD2:       return SKILL_2H_SWORDS;
++            case ITEM_SUBCLASS_WEAPON_STAFF:        return SKILL_STAVES;
++            case ITEM_SUBCLASS_WEAPON_FIST:         return SKILL_FIST_WEAPONS;
++            case ITEM_SUBCLASS_WEAPON_DAGGER:       return SKILL_DAGGERS;
++            case ITEM_SUBCLASS_WEAPON_THROWN:       return SKILL_THROWN;
++            case ITEM_SUBCLASS_WEAPON_SPEAR:        return SKILL_POLEARMS;
++            case ITEM_SUBCLASS_WEAPON_CROSSBOW:     return SKILL_CROSSBOWS;
++            case ITEM_SUBCLASS_WEAPON_WAND:         return SKILL_WANDS;
++            default:                                return 0;
++        }
++    }
++
++    bool ClassCanWear(Player const* bot, ItemTemplate const* proto)
++    {
++        if (!bot || !proto)
++            return false;
++        if (proto->AllowableClass && proto->AllowableClass != uint32(-1)
++            && !(proto->AllowableClass & bot->getClassMask()))
++            return false;
++        if (proto->AllowableRace && proto->AllowableRace != uint32(-1)
++            && !(proto->AllowableRace & bot->getRaceMask()))
++            return false;
++
++        if (proto->Class == ITEM_CLASS_WEAPON)
++        {
++            if (proto->SubClass == ITEM_SUBCLASS_WEAPON_FISHING_POLE
++                || proto->SubClass == ITEM_SUBCLASS_WEAPON_MISC)
++                return true;
++            uint32 skill = WeaponSkillFor(proto);
++            if (skill && !bot->HasSkill(skill))
++                return false;
++            return true;
++        }
++
++        if (proto->Class != ITEM_CLASS_ARMOR)
++            return true;
++
++        switch (proto->InventoryType)
++        {
++            case INVTYPE_CLOAK:
++            case INVTYPE_NECK:
++            case INVTYPE_FINGER:
++            case INVTYPE_TRINKET:
++            case INVTYPE_BODY:
++            case INVTYPE_TABARD:
++            case INVTYPE_HOLDABLE:
++                return true;
++            default:
++                break;
++        }
++
++        switch (proto->SubClass)
++        {
++            case ITEM_SUBCLASS_ARMOR_SHIELD:
++            case ITEM_SUBCLASS_ARMOR_BUCKLER:
++                return bot->HasSkill(SKILL_SHIELD);
++            case ITEM_SUBCLASS_ARMOR_LIBRAM:
++                return bot->getClass() == CLASS_PALADIN;
++            case ITEM_SUBCLASS_ARMOR_IDOL:
++                return bot->getClass() == CLASS_DRUID;
++            case ITEM_SUBCLASS_ARMOR_TOTEM:
++                return bot->getClass() == CLASS_SHAMAN;
++            case ITEM_SUBCLASS_ARMOR_SIGIL:
++                return bot->getClass() == CLASS_DEATH_KNIGHT;
++            case ITEM_SUBCLASS_ARMOR_MISC:
++            case ITEM_SUBCLASS_ARMOR_CLOTH:
++                return true;
++            case ITEM_SUBCLASS_ARMOR_LEATHER:
++                return bot->HasSkill(SKILL_LEATHER);
++            case ITEM_SUBCLASS_ARMOR_MAIL:
++                return bot->HasSkill(SKILL_MAIL);
++            case ITEM_SUBCLASS_ARMOR_PLATE:
++                return bot->HasSkill(SKILL_PLATE_MAIL);
++            default:
++                return true;
++        }
++    }
++
++    bool IsGearProto(ItemTemplate const* proto)
++    {
++        return proto && (proto->Class == ITEM_CLASS_ARMOR || proto->Class == ITEM_CLASS_WEAPON)
++            && !ToolFamiliesOf(proto);
++    }
++
++    void EquipBetterGear(Player* bot)
++    {
++        if (!bot)
++            return;
++        BotRole role = BotAI::GetRole(bot->GetGUID());
++        auto consider = [&](Item* item) -> bool
++        {
++            if (!item || !item->GetTemplate())
++                return false;
++            ItemTemplate const* proto = item->GetTemplate();
++            if (!IsGearProto(proto))
++                return false;
++            if (BotAI::IsProfessionTool(proto))
++                return false;
++            if (!ClassCanWear(bot, proto))
++                return false;
++            if (proto->RequiredLevel && bot->GetLevel() < proto->RequiredLevel)
++                return false;
++            uint8 eslot = bot->FindEquipSlot(proto, NULL_SLOT, true);
++            if (eslot == NULL_SLOT)
++                return false;
++            Item* current = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, eslot);
++            float newScore = BotAI::ScoreItemForBot(bot, proto, role);
++            if (current)
++            {
++                float currentScore = BotAI::ScoreItemForBot(bot, current->GetTemplate(), role);
++                if (newScore <= currentScore * 1.05f)
++                    return false;
++            }
++            uint16 dest = uint16(eslot) | (uint16(INVENTORY_SLOT_BAG_0) << 8);
++            if (bot->CanEquipItem(NULL_SLOT, dest, item, true) != EQUIP_ERR_OK)
++                return false;
++            bot->SwapItem(item->GetPos(), dest);
++            return true;
++        };
++
++        for (uint32 n = 0; n < 8; ++n)
++        {
++            bool swapped = false;
++            ForEachInventoryItem(bot, [&](Item* item)
++            {
++                if (!swapped && consider(item))
++                    swapped = true;
++            });
++            if (!swapped)
++                break;
++        }
++    }
++
++    struct GearPlan
++    {
++        std::unordered_set<ObjectGuid> sell;
++    };
++
++    GearPlan ClassifyGear(Player* bot)
++    {
++        GearPlan plan;
++        if (!bot)
++            return plan;
++        BotRole role = BotAI::GetRole(bot->GetGUID());
++        uint8 const level = bot->GetLevel();
++        struct Candidate
++        {
++            Item* item;
++            uint8 eslot;
++            float score;
++            uint32 requiredLevel;
++            bool canWear;
++            bool tooHigh;
++            bool upcoming;
++        };
++        std::vector<Candidate> items;
++        ForEachInventoryItem(bot, [&](Item* item)
++        {
++            if (!item || !item->GetTemplate())
++                return;
++            ItemTemplate const* proto = item->GetTemplate();
++            if (!IsGearProto(proto))
++                return;
++            if (proto->Quality >= ITEM_QUALITY_EPIC)
++                return;
++            bool canWear = ClassCanWear(bot, proto);
++            uint32 req = proto->RequiredLevel;
++            bool tooHigh = req && req > uint32(level) + 5;
++            bool upcoming = canWear && req > level && req <= uint32(level) + 5;
++            uint8 eslot = bot->FindEquipSlot(proto, NULL_SLOT, true);
++            float score = BotAI::ScoreItemForBot(bot, proto, role);
++            items.push_back({ item, eslot, score, req, canWear, tooHigh, upcoming });
++        });
++
++        // Keep at most one upcoming spare per slot, the highest-scoring one.
++        std::unordered_map<uint8, ObjectGuid> bestSpare;
++        std::unordered_map<uint8, float> bestSpareScore;
++        for (Candidate const& c : items)
++        {
++            if (!c.upcoming || c.eslot == NULL_SLOT)
++                continue;
++            Item* current = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, c.eslot);
++            float currentScore = current ? BotAI::ScoreItemForBot(bot, current->GetTemplate(), role) : 0.0f;
++            if (current && c.score <= currentScore * 1.05f)
++                continue;
++            auto it = bestSpareScore.find(c.eslot);
++            if (it == bestSpareScore.end() || c.score > it->second)
++            {
++                bestSpare[c.eslot] = c.item->GetGUID();
++                bestSpareScore[c.eslot] = c.score;
++            }
++        }
++
++        for (Candidate const& c : items)
++        {
++            ItemTemplate const* proto = c.item->GetTemplate();
++            if (!c.canWear || c.tooHigh)
++            {
++                plan.sell.insert(c.item->GetGUID());
++                continue;
++            }
++            if (c.upcoming)
++            {
++                auto it = bestSpare.find(c.eslot);
++                if (it == bestSpare.end() || it->second != c.item->GetGUID())
++                    plan.sell.insert(c.item->GetGUID());
++                continue;
++            }
++
++            Item* current = (c.eslot != NULL_SLOT) ? bot->GetItemByPos(INVENTORY_SLOT_BAG_0, c.eslot) : nullptr;
++            float currentScore = current ? BotAI::ScoreItemForBot(bot, current->GetTemplate(), role) : 0.0f;
++            bool upgrade = current ? (c.score > currentScore * 1.05f) : (c.eslot != NULL_SLOT);
++            bool uselessBlue = proto->Quality >= ITEM_QUALITY_RARE
++                && current && c.score < currentScore * 0.5f;
++            bool whiteOrGreen = proto->Quality <= ITEM_QUALITY_UNCOMMON;
++
++            if (whiteOrGreen && !upgrade)
++                plan.sell.insert(c.item->GetGUID());
++            else if (uselessBlue)
++                plan.sell.insert(c.item->GetGUID());
++        }
++        return plan;
++    }
++
+     bool IsOutgrownGearItem(Player* bot, Item const* item)
+     {
+         ItemTemplate const* proto = item->GetTemplate();
+@@ -567,8 +1071,9 @@ namespace
+             return true;
+         if (proto->ItemId == OrderItemOf(bot))
+             return true;
+-        if (BotAI::IsProfessionTool(proto))
+-            return true;
++        // Profession tools are classified separately so a bot keeps one best
++        // tool per profession and can sell duplicates, worse ones, and tools
++        // for professions it does not have.
+         if (proto->Class == ITEM_CLASS_KEY || proto->Class == ITEM_CLASS_PROJECTILE)
+             return true;
+         if (proto->Class == ITEM_CLASS_REAGENT)
+@@ -687,6 +1192,72 @@ namespace
+         return BagItemFate::Keep;
+     }
+ 
++    // When the economy is live, bag cleanup may only vendor items that PlanSale
++    // marks Vendor. Auction and implicit Keep (including protected entries and
++    // profession tools the economy never plans) stay in the bags for the economy trip.
++    bool TryLiveVerdicts(Player* bot, std::unordered_map<uint32, BotEconomy::Verdict>& out)
++    {
++        out.clear();
++        if (!bot || !BotEconomy::IsLive())
++            return false;
++        for (BotEconomy::Line const& line : BotEconomy::PlanSale(bot))
++            out[line.entry] = line.verdict;
++        return true;
++    }
++
++    bool EconomyHoldsItem(uint32 entry, std::unordered_map<uint32, BotEconomy::Verdict> const* live)
++    {
++        if (!live)
++            return false;
++        if (BotEconomy::IsProtectedItem(entry))
++            return true;
++        auto it = live->find(entry);
++        if (it == live->end())
++            return true;
++        return it->second != BotEconomy::Verdict::Vendor;
++    }
++
++    uint32 CountSellableBagItems(Player* bot, ToolPlan const& tools, GearPlan const& gear)
++    {
++        if (!bot)
++            return 0;
++        std::unordered_map<uint32, BotEconomy::Verdict> liveVerdicts;
++        bool const live = TryLiveVerdicts(bot, liveVerdicts);
++        std::unordered_map<uint32, uint32> tradeCount;
++        std::unordered_map<uint32, uint32> consCount;
++        ForEachInventoryItem(bot, [&](Item* item)
++        {
++            if (!item || !item->GetTemplate())
++                return;
++            if (item->GetTemplate()->Class == ITEM_CLASS_TRADE_GOODS)
++                tradeCount[item->GetEntry()] += item->GetCount();
++            if (item->GetTemplate()->Class == ITEM_CLASS_CONSUMABLE)
++                consCount[item->GetEntry()] += item->GetCount();
++        });
++        uint32 count = 0;
++        ForEachInventoryItem(bot, [&](Item* item)
++        {
++            if (!item)
++                return;
++            ObjectGuid const guid = item->GetGUID();
++            if (tools.keep.count(guid))
++                return;
++            ItemTemplate const* proto = item->GetTemplate();
++            if (EconomyHoldsItem(proto ? proto->ItemId : 0, live ? &liveVerdicts : nullptr))
++                return;
++            if (tools.sell.count(guid) || gear.sell.count(guid))
++            {
++                ++count;
++                return;
++            }
++            uint32 traded = proto && proto->Class == ITEM_CLASS_TRADE_GOODS ? tradeCount[item->GetEntry()] : 0;
++            uint32 consumed = proto && proto->Class == ITEM_CLASS_CONSUMABLE ? consCount[item->GetEntry()] : 0;
++            if (FateOfItem(bot, item, traded, consumed, true) == BagItemFate::Sell)
++                ++count;
++        });
++        return count;
++    }
++
+     void CollectInventoryItems(Player* bot, std::vector<Item*>& out)
+     {
+         out.clear();
+@@ -901,7 +1472,10 @@ namespace
+         if (!price)
+             price = 1;
+         uint32 money = bot->GetMoney();
+-        if (money < price + _settings.bagBuyReserveCopper)
++        uint32 reserve = _settings.bagBuyReserveCopper;
++        if (BotEconomy::IsLive())
++            reserve = std::max(reserve, BotEconomy::MoneyReserveCopper());
++        if (money < price + reserve)
+             return 0;
+         if (CountFreeGeneralSlotsLocal(bot) == 0 && empty == NULL_SLOT)
+             return 0;
+@@ -942,29 +1516,9 @@ namespace
+ 
+     bool HasVendorSellable(Player* bot)
+     {
+-        std::unordered_map<uint32, uint32> tradeCount;
+-        std::unordered_map<uint32, uint32> consCount;
+-        ForEachInventoryItem(bot, [&](Item* item)
+-        {
+-            if (!item || !item->GetTemplate())
+-                return;
+-            if (item->GetTemplate()->Class == ITEM_CLASS_TRADE_GOODS)
+-                tradeCount[item->GetEntry()] += item->GetCount();
+-            if (item->GetTemplate()->Class == ITEM_CLASS_CONSUMABLE)
+-                consCount[item->GetEntry()] += item->GetCount();
+-        });
+-        bool sellable = false;
+-        ForEachInventoryItem(bot, [&](Item* item)
+-        {
+-            if (sellable || !item)
+-                return;
+-            ItemTemplate const* proto = item->GetTemplate();
+-            uint32 traded = proto && proto->Class == ITEM_CLASS_TRADE_GOODS ? tradeCount[item->GetEntry()] : 0;
+-            uint32 consumed = proto && proto->Class == ITEM_CLASS_CONSUMABLE ? consCount[item->GetEntry()] : 0;
+-            if (FateOfItem(bot, item, traded, consumed, true) == BagItemFate::Sell)
+-                sellable = true;
+-        });
+-        return sellable;
++        ToolPlan tools = ClassifyTools(bot);
++        GearPlan gear = ClassifyGear(bot);
++        return CountSellableBagItems(bot, tools, gear) > 0;
+     }
+ }
+ 
+@@ -1354,7 +1908,11 @@ namespace BotMaintenance
+                 bags += "/";
+             bags += std::to_string(bag->GetBagSize());
+         }
+-        return Acore::StringFormat("bags: {}/{} free (backpack 16, equipped {})", freeSlots, total, bags);
++        ToolPlan tools = ClassifyTools(const_cast<Player*>(bot));
++        GearPlan gear = ClassifyGear(const_cast<Player*>(bot));
++        uint32 sellable = CountSellableBagItems(const_cast<Player*>(bot), tools, gear);
++        return Acore::StringFormat("bags: {}/{} free (backpack 16, equipped {}), {} sellable",
++            freeSlots, total, bags, sellable);
+     }
+ 
+     bool NeedsSellTrip(Player* bot)
+@@ -1363,7 +1921,14 @@ namespace BotMaintenance
+             return false;
+         if (bot->GetGroup())
+             return false;
+-        if (CountFreeGeneralSlotsLocal(bot) >= _settings.freeSlotTarget)
++        // An economy sale trip already going (or queued) handles vendoring and AH
++        // listings; do not start a second walk to a vendor.
++        if (BotEconomy::HasSaleTrip(bot))
++            return false;
++        // Full or nearly full: trip when free general slots are at or below the
++        // configured target (default 4) and something a vendor would buy is in the bags,
++        // including unusable white/green gear and extra profession tools.
++        if (CountFreeGeneralSlotsLocal(bot) > _settings.freeSlotTarget)
+             return false;
+         return HasVendorSellable(bot);
+     }
+@@ -1376,12 +1941,21 @@ namespace BotMaintenance
+ 
+         result.stacksMerged = MergeStacks(bot);
+         result.bagsEquipped = EquipUpgradeBags(bot, result.upgradeSlots);
++        EquipBetterGear(bot);
+ 
+         uint32 freeSlots = CountFreeGeneralSlotsLocal(bot);
+         bool bagsTight = force || freeSlots < _settings.freeSlotTarget;
++        // Unusable gear and extra tools are sold whenever a vendor is present,
++        // not only once bags are already tight. Trade goods stay tight-only.
++        bool sellNow = bagsTight || vendor != nullptr;
+ 
+-        if (bagsTight)
++        if (sellNow)
+         {
++            ToolPlan tools = ClassifyTools(bot);
++            GearPlan gear = ClassifyGear(bot);
++            std::unordered_map<uint32, BotEconomy::Verdict> liveVerdicts;
++            bool const live = TryLiveVerdicts(bot, liveVerdicts);
++
+             std::unordered_map<uint32, uint32> tradeCount;
+             std::unordered_map<uint32, uint32> consCount;
+             std::vector<Item*> items;
+@@ -1414,9 +1988,19 @@ namespace BotMaintenance
+                 ItemTemplate const* proto = item->GetTemplate();
+                 if (!proto)
+                     continue;
++                ObjectGuid const guid = item->GetGUID();
++                if (tools.keep.count(guid))
++                    continue;
++                if (EconomyHoldsItem(proto->ItemId, live ? &liveVerdicts : nullptr))
++                    continue;
++
+                 uint32 traded = proto->Class == ITEM_CLASS_TRADE_GOODS ? tradeCount[item->GetEntry()] : 0;
+                 uint32 consumed = proto->Class == ITEM_CLASS_CONSUMABLE ? consCount[item->GetEntry()] : 0;
+-                BagItemFate fate = FateOfItem(bot, item, traded, consumed, true);
++                BagItemFate fate = BagItemFate::Keep;
++                if (tools.sell.count(guid) || gear.sell.count(guid))
++                    fate = proto->SellPrice > 0 ? BagItemFate::Sell : BagItemFate::Destroy;
++                else if (bagsTight)
++                    fate = FateOfItem(bot, item, traded, consumed, true);
+                 if (fate == BagItemFate::Keep)
+                     continue;
+ 
+@@ -1433,6 +2017,8 @@ namespace BotMaintenance
+                     result.copperEarned += money;
+                     bot->DestroyItem(bagSlot, slot, true);
+                     ++result.stacksSold;
++                    if (live)
++                        BotEconomy::RecordCleanupVendorSale(bot, entry, count, proto->SellPrice, "bag-cleanup");
+                     if (proto->Class == ITEM_CLASS_TRADE_GOODS)
+                     {
+                         if (tradeCount[entry] > count)
+@@ -1457,11 +2043,16 @@ namespace BotMaintenance
+                     continue;
+                 }
+ 
+-                // Sellable but no vendor: destroy greys and leftover quest items only when
+-                // there is no general slot left, so a later sell trip still has something to sell.
++                // Sellable but no vendor: destroy greys, leftover quest items, and
++                // unusable white/green (or extra tools) only when there is no general
++                // slot left, so a later sell trip still has something to sell.
++                bool const disposable = proto->Quality == ITEM_QUALITY_POOR
++                    || StaleQuestItem(bot, proto)
++                    || tools.sell.count(guid)
++                    || gear.sell.count(guid);
+                 if (fate == BagItemFate::Sell && !vendor && allowDestroy
+                     && CountFreeGeneralSlotsLocal(bot) == 0
+-                    && (proto->Quality == ITEM_QUALITY_POOR || StaleQuestItem(bot, proto)))
++                    && disposable)
+                 {
+                     bot->DestroyItem(bagSlot, slot, true);
+                     ++result.stacksDestroyed;
+diff --git a/module/src/world/BotWorldBehavior.cpp b/module/src/world/BotWorldBehavior.cpp
+index bc54a6f..51e2681 100644
+--- a/module/src/world/BotWorldBehavior.cpp
++++ b/module/src/world/BotWorldBehavior.cpp
+@@ -2,6 +2,7 @@
+ #include "BotWorldBehavior.h"
+ #include "BotAI.h"
+ #include "BotMaintenance.h"
++#include "BotMgr.h"
+ #include "BotMovement.h"
+ #include "BotTaxi.h"
+ #include "BotZoneProgression.h"
+@@ -479,6 +480,22 @@ namespace
+         float dist = Dist2d(poi.x, poi.y, bot->GetPositionX(), bot->GetPositionY());
+         uint32 lifetime = NeedLifetimeMs(dist);
+         constexpr float FLIGHT_MIN_YARDS = 900.0f;
++        constexpr float NEED_TELEPORT_YARDS = 400.0f;
++
++        auto teleportToPoi = [&]()
++        {
++            if (bot->IsBeingTeleported())
++                return;
++            if (bot->IsInCombat())
++                bot->CombatStop(true);
++            float dx = bot->GetPositionX() - poi.x;
++            float dy = bot->GetPositionY() - poi.y;
++            float len = std::max(0.001f, std::hypot(dx, dy));
++            float standOff = std::min(2.5f, len);
++            bot->TeleportTo(bot->GetMapId(), poi.x + dx / len * standOff, poi.y + dy / len * standOff,
++                poi.z + 1.0f, 0.0f);
++            sBotMgr->QueueTeleportAck(bot->GetSession());
++        };
+ 
+         if (dist > FLIGHT_MIN_YARDS && KnowsNodeNear(bot, poi.x, poi.y, poi.z))
+         {
+@@ -498,6 +515,20 @@ namespace
+                 return true;
+             }
+             state.pendingAfterTravel = WorldIntent::None;
++            teleportToPoi();
++            BeginAtPoi(bot, state, intent, poi, 3000, lifetime, now);
++            Trace(bot, "chose WorldIntent::{} (need), teleporting to {} {} ({:.0f} yd, no flight).", IntentName(intent),
++                BotWorldPoi::KindName(poi.kind), poi.entry, dist);
++            return true;
++        }
++
++        if (dist > NEED_TELEPORT_YARDS)
++        {
++            teleportToPoi();
++            BeginAtPoi(bot, state, intent, poi, 3000, lifetime, now);
++            Trace(bot, "chose WorldIntent::{} (need), teleporting to {} {} ({:.0f} yd).", IntentName(intent),
++                BotWorldPoi::KindName(poi.kind), poi.entry, dist);
++            return true;
+         }
+ 
+         BeginAtPoi(bot, state, intent, poi, 3000, lifetime, now);
+@@ -1127,6 +1158,16 @@ namespace BotWorldBehavior
+             }
+             if (status == NavStatus::Stuck)
+             {
++                if ((state.intent == WorldIntent::Repair || state.intent == WorldIntent::Vendor
++                    || state.intent == WorldIntent::Ammo) && !bot->IsBeingTeleported())
++                {
++                    if (bot->IsInCombat())
++                        bot->CombatStop(true);
++                    bot->TeleportTo(bot->GetMapId(), state.x, state.y, state.z + 1.0f, 0.0f);
++                    sBotMgr->QueueTeleportAck(bot->GetSession());
++                    Trace(bot, "stuck on WorldIntent::{}, teleporting the rest of the way.", IntentName(state.intent));
++                    return AmbientTick::Busy;
++                }
+                 Finish(bot, state, "abandoned (stuck)", FAIL_COOLDOWN_MS, now);
+                 return AmbientTick::Relocated;
+             }
