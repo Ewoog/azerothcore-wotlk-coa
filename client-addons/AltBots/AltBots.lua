@@ -1,5 +1,7 @@
--- AltBots: remembers each of your characters' GUIDs when you log into them,
--- then lets your main spawn them as CoA Companions bots and invite them.
+-- AltBots: remembers each of your characters' GUIDs when you log into them, and
+-- syncs that list with the server's list for your account (GETALTS), so characters
+-- removed by a wipe disappear and new ones show up without a login on each. Then
+-- your main can spawn them as CoA Companions bots and invite them.
 -- Alts tab: spawn, quest solo, invite or despawn. Commands tab: follow, stay,
 -- attack, stop attack, pull, farm and inventory (clean bags) orders for one
 -- alt or every alt in your group.
@@ -61,41 +63,200 @@ local function LowGuid(guid)
     return tonumber(string.sub(guid, -8), 16)
 end
 
+-- Saved data, version 2:
+--   AltBotsDB.realms[realm].chars[name] = { guid, classId, classFile, level, seen, source, stale }
+--   source is "login" (you logged into it), "server" (the account list from GETALTS) or "manual" (/alt add).
+--   stale marks a character that could not be checked since the server looked reset.
+-- Version 1 kept AltBotsDB[realm][name] = guid next to the settings; MigrateDB moves that over.
+local DB_VERSION = 2
+local SETTING_KEYS = {
+    version = true, realms = true, farmRadius = true, minimapAngle = true, minimapHidden = true, tab = true,
+}
+local SYNC_DELAY, SYNC_TIMEOUT, SYNC_REFRESH = 3, 8, 60
+
+-- 3.3.5's UnitClass has no class id, and GETALTS sends ids, so map the stock ones for class colors.
+local CLASS_FILE_BY_ID = {
+    [1] = "WARRIOR", [2] = "PALADIN", [3] = "HUNTER", [4] = "ROGUE", [5] = "PRIEST", [6] = "DEATHKNIGHT",
+    [7] = "SHAMAN", [8] = "MAGE", [9] = "WARLOCK", [11] = "DRUID",
+}
+
+local spawned = {}
+local altSync = { state = "idle" }
+local syncAt, syncScheduled
+local OnAltsChanged
+
 local function Realm() return GetRealmName() or "?" end
-local function Alts()
-    AltBotsDB[Realm()] = AltBotsDB[Realm()] or {}
-    return AltBotsDB[Realm()]
+
+local function MigrateDB()
+    if type(AltBotsDB) ~= "table" then AltBotsDB = {} end
+    AltBotsDB.realms = AltBotsDB.realms or {}
+    for key, value in pairs(AltBotsDB) do
+        if not SETTING_KEYS[key] and type(value) == "table" then
+            local realm = AltBotsDB.realms[key] or { chars = {} }
+            realm.chars = realm.chars or {}
+            for name, guid in pairs(value) do
+                if type(name) == "string" and tonumber(guid) and not realm.chars[name] then
+                    realm.chars[name] = { guid = tonumber(guid), source = "login" }
+                end
+            end
+            AltBotsDB.realms[key] = realm
+            AltBotsDB[key] = nil
+        end
+    end
+    AltBotsDB.version = DB_VERSION
+end
+
+local function RealmData()
+    if type(AltBotsDB.realms) ~= "table" then MigrateDB() end
+    local key = Realm()
+    local data = AltBotsDB.realms[key]
+    if not data then
+        data = { chars = {} }
+        AltBotsDB.realms[key] = data
+    end
+    data.chars = data.chars or {}
+    return data
+end
+
+local function Alts() return RealmData().chars end
+
+local function AltGuid(name)
+    local info = name and Alts()[name]
+    return info and info.guid
+end
+
+local function StaleCount()
+    local n = 0
+    for name, info in pairs(Alts()) do
+        if info.stale and name ~= UnitName("player") then n = n + 1 end
+    end
+    return n
+end
+
+local function RemoveAlt(name)
+    if not name or not Alts()[name] then return false end
+    Alts()[name] = nil
+    spawned[name] = nil
+    return true
 end
 
 local function RegisterSelf()
     local name = UnitName("player")
     local low = LowGuid(UnitGUID("player"))
-    if name and low then
-        Alts()[name] = low
+    if not name or not low then return end
+    local alts = Alts()
+    local old = alts[name]
+    for other, info in pairs(alts) do
+        if other ~= name and info.guid == low then
+            alts[other] = nil
+            Print("Removed " .. other .. ": its character id now belongs to " .. name .. ".")
+        end
     end
+    if old and old.guid ~= low then
+        local marked = 0
+        for other, info in pairs(alts) do
+            if other ~= name and not info.stale then
+                info.stale = true
+                marked = marked + 1
+            end
+        end
+        if marked > 0 then
+            Print(name .. " has a new character id, so the server looks reset. Checking your other " ..
+                marked .. " saved character" .. (marked == 1 and "" or "s") .. " against the server...")
+        end
+    end
+    local _, classFile = UnitClass("player")
+    alts[name] = {
+        guid = low, classFile = classFile, classId = old and old.guid == low and old.classId or nil,
+        level = UnitLevel("player"), seen = time(), source = "login",
+    }
 end
 
 local function GM(cmd) SendChatMessage(cmd, "SAY") end
 
-local function SpawnAndInvite(name)
-    local low = Alts()[name]
-    if not low then Print("I don't know '" .. name .. "' yet. Log into it once with AltBots enabled.") return end
-    if name == UnitName("player") then Print("That's you.") return end
-    Print("Spawning " .. name .. " (guid " .. low .. ")...")
-    GM(".botcmd spawnbot " .. low)
-    pending[name] = { at = GetTime() + SPAWN_DELAY }
-end
-
 local function Queue(item) table.insert(queue, item) end
 
+local function SpawnAndInvite(name)
+    local low = AltGuid(name)
+    if not low then Print("I don't know '" .. tostring(name) .. "' yet. Press Sync on the Alts tab, or log into it once.") return end
+    if name == UnitName("player") then Print("That's you.") return end
+    Print("Spawning " .. name .. " (guid " .. low .. ")...")
+    spawned[name] = true
+    Queue({ gm = ".botcmd spawnbot " .. low, after = function()
+        pending[name] = { at = GetTime() + SPAWN_DELAY }
+    end })
+end
+
 local function InviteKnownAlt(name)
-    local low = Alts()[name]
+    local low = AltGuid(name)
     if low then
         Queue({ addon = "INVITEBOT:" .. tostring(low) })
         Print("Inviting " .. name .. ".")
     else
         InviteUnit(name)
         Print("Invited " .. name .. ".")
+    end
+end
+
+local function RequestAltSync(quiet)
+    altSync = { state = "waiting", sentAt = GetTime(), quiet = quiet, list = {} }
+    Queue({ addon = "GETALTS:0" })
+end
+
+local function ApplyAltSync(list)
+    local data = RealmData()
+    local old = data.chars
+    local fresh, added, removed = {}, {}, {}
+    local me = UnitName("player")
+    for _, c in ipairs(list) do
+        local prev = old[c.name]
+        local same = prev and prev.guid == c.guid
+        fresh[c.name] = {
+            guid = c.guid, classId = c.classId, level = c.level,
+            classFile = CLASS_FILE_BY_ID[c.classId] or (same and prev.classFile) or nil,
+            seen = same and prev.seen or nil, source = (same and prev.source == "login") and "login" or "server",
+        }
+        if not same and c.name ~= me then table.insert(added, c.name) end
+        if c.online then spawned[c.name] = true else spawned[c.name] = nil end
+    end
+    for name, info in pairs(old) do
+        if not fresh[name] then
+            if info.source == "manual" then
+                fresh[name] = info
+            else
+                table.insert(removed, name)
+                spawned[name] = nil
+            end
+        end
+    end
+    data.chars = fresh
+    data.syncedAt = time()
+    data.serverList = true
+    table.sort(added)
+    table.sort(removed)
+    if #removed > 0 then
+        Print("Removed " .. #removed .. " character" .. (#removed == 1 and "" or "s") ..
+            " that no longer exist on your account: " .. table.concat(removed, ", ") .. ".")
+    end
+    if #added > 0 then
+        Print("Found " .. #added .. " character" .. (#added == 1 and "" or "s") .. " on your account: " ..
+            table.concat(added, ", ") .. ".")
+    end
+    if not altSync.quiet and #removed == 0 and #added == 0 then
+        Print("Your saved characters match the server.")
+    end
+end
+
+local function OnAltSyncTimeout()
+    altSync.state = "unsupported"
+    RealmData().serverList = false
+    local stale = StaleCount()
+    if not altSync.quiet then
+        Print("The server did not send a character list. It needs the updated bot module for that.")
+    end
+    if stale > 0 then
+        Print(stale .. " saved character" .. (stale == 1 and "" or "s") .. " could not be checked. " ..
+            "Remove them on the Alts tab, or type /alt prune to remove them all.")
     end
 end
 
@@ -230,7 +391,25 @@ local function HandleIncoming(body)
     local guid = tonumber(parts[2])
     if not verb then return end
 
-    if verb == "ROLES" and guid then
+    if verb == "ALTCHAR" then
+        local g, classId, level, _, online, name = body:match("^ALTCHAR:(%d+):(%d+):(%d+):(%d+):([01]):(.+)$")
+        if g and altSync.state == "waiting" then
+            table.insert(altSync.list, {
+                guid = tonumber(g), classId = tonumber(classId), level = tonumber(level),
+                online = online == "1", name = name,
+            })
+        end
+        return
+
+    elseif verb == "ALTCHAREND" then
+        if altSync.state ~= "waiting" then return end
+        altSync.state = "done"
+        ApplyAltSync(altSync.list)
+        altSync.list = nil
+        if OnAltsChanged then OnAltsChanged() end
+        return
+
+    elseif verb == "ROLES" and guid then
         local set = {}
         for roleId in string.gmatch(parts[3] or "", "[^,]+") do
             set[roleId] = true
@@ -513,7 +692,7 @@ local function OrderTargets(choice)
     else
         local n = ResolveAlt(choice)
         if n then table.insert(out, n)
-        else Print("I don't know '" .. tostring(choice) .. "' yet. Log into it once with AltBots enabled.") end
+        else Print("I don't know '" .. tostring(choice) .. "' yet. Press Sync on the Alts tab, or log into it once.") end
     end
     return out
 end
@@ -536,7 +715,7 @@ end
 local function ScheduleBagRefresh(names)
     local guids = {}
     for _, n in ipairs(names or {}) do
-        local g = Alts()[n]
+        local g = AltGuid(n)
         if g then table.insert(guids, g) end
     end
     if #guids == 0 then return end
@@ -558,7 +737,7 @@ local function Order(verb, choice, radius)
     local grouped = GroupedNames()
     local sent = {}
     for _, n in ipairs(targets) do
-        local low = Alts()[n]
+        local low = AltGuid(n)
         if verb == "pull" then
             if grouped[n] then
                 Queue({ addon = "PULL:" .. low }); table.insert(sent, n)
@@ -584,14 +763,13 @@ local function Order(verb, choice, radius)
     end
 end
 
-local spawned = {}
 local function Spawn(name)
-    local low = Alts()[name]; if not low then return end
-    GM(".botcmd spawnbot " .. low); spawned[name] = true
+    local low = AltGuid(name); if not low then return end
+    Queue({ gm = ".botcmd spawnbot " .. low }); spawned[name] = true
 end
 local function Despawn(name)
-    local low = Alts()[name]; if not low then return end
-    GM(".botcmd despawn " .. low); spawned[name] = nil
+    local low = AltGuid(name); if not low then return end
+    Queue({ gm = ".botcmd despawn " .. low }); spawned[name] = nil
 end
 
 local win, popup, minimapBtn
@@ -954,12 +1132,14 @@ local function MakeAltRow(parent)
     row.status:SetPoint("LEFT", 192, 0)
     row.status:SetWidth(120)
     row.status:SetJustifyH("LEFT")
+    row.remove = MakeTextBtn(row, 22, 20, "x")
+    row.remove:SetPoint("RIGHT", -6, 0)
     row.invite = MakeTextBtn(row, 64, 20, "Invite")
-    row.invite:SetPoint("RIGHT", -8, 0)
+    row.invite:SetPoint("RIGHT", -32, 0)
     row.quest = MakeTextBtn(row, 64, 20, "Quest")
-    row.quest:SetPoint("RIGHT", -76, 0)
+    row.quest:SetPoint("RIGHT", -100, 0)
     row.spawn = MakeTextBtn(row, 64, 20, "Spawn")
-    row.spawn:SetPoint("RIGHT", -144, 0)
+    row.spawn:SetPoint("RIGHT", -168, 0)
     return row
 end
 
@@ -1082,18 +1262,26 @@ EnsureWindow = function()
     hint:SetPoint("TOPLEFT", 6, -20)
     hint:SetPoint("TOPRIGHT", -6, -20)
     hint:SetJustifyH("LEFT")
-    hint:SetText("Log into a character once with AltBots enabled to save it here. Then spawn and invite it from this list.")
+    hint:SetText("")
     ui.altsHint = hint
     ui.altsEmpty = alts:CreateFontString(nil, "OVERLAY", "GameFontDisable")
     ui.altsEmpty:SetPoint("CENTER", 0, 10)
-    ui.altsEmpty:SetText("No other characters saved yet.\nLog into an alt with this addon enabled, then come back.")
+    ui.altsEmpty:SetText("No other characters saved yet.\nPress Sync, or log into an alt with this addon enabled.")
     ui.spawnAllBtn = MakeTextBtn(alts, 150, 20, "Spawn + invite all")
     ui.spawnAllBtn:SetPoint("TOPLEFT", 6, -40)
     HookTip(ui.spawnAllBtn, "Spawn + invite all", "Spawn every saved alt and invite them to your group.")
     ui.spawnAllBtn:SetScript("OnClick", function()
-        local names = SortedAltNames()
-        for _, n in ipairs(names) do SpawnAndInvite(n); spawned[n] = true end
-        SetStatus("Spawning and inviting all saved alts...")
+        local skipped = 0
+        for _, n in ipairs(SortedAltNames()) do
+            local info = Alts()[n]
+            if info and info.stale then
+                skipped = skipped + 1
+            else
+                SpawnAndInvite(n)
+            end
+        end
+        SetStatus("Spawning and inviting all saved alts..." ..
+            (skipped > 0 and (" Skipped " .. skipped .. " unverified.") or ""))
         RefreshAlts()
     end)
     ui.despawnAllBtn = MakeTextBtn(alts, 110, 20, "Despawn all")
@@ -1101,8 +1289,37 @@ EnsureWindow = function()
     HookTip(ui.despawnAllBtn, "Despawn all", "Send every saved alt away.")
     ui.despawnAllBtn:SetScript("OnClick", function()
         local names = SortedAltNames()
-        for _, n in ipairs(names) do Despawn(n) end
-        SetStatus("Despawned all saved alts.")
+        local grouped = GroupedNames()
+        local out = {}
+        for _, n in ipairs(names) do
+            if spawned[n] or grouped[n] then table.insert(out, n) end
+        end
+        if #out == 0 then out = names end
+        for _, n in ipairs(out) do Despawn(n) end
+        SetStatus("Despawning " .. #out .. " alt" .. (#out == 1 and "" or "s") .. ".")
+        RefreshAlts()
+    end)
+    ui.syncBtn = MakeTextBtn(alts, 70, 20, "Sync")
+    ui.syncBtn:SetPoint("TOPRIGHT", -6, -40)
+    HookTip(ui.syncBtn, "Sync with the server",
+        "Ask the server which characters your account has. Characters that no longer exist are removed "
+        .. "and new ones are added, so a character wipe cleans itself up.")
+    ui.syncBtn:SetScript("OnClick", function()
+        RequestAltSync(false)
+        SetStatus("Asking the server for your character list...")
+        RefreshAlts()
+    end)
+    ui.pruneBtn = MakeTextBtn(alts, 130, 20, "Remove unverified")
+    ui.pruneBtn:SetPoint("RIGHT", ui.syncBtn, "LEFT", -6, 0)
+    HookTip(ui.pruneBtn, "Remove unverified",
+        "Remove every saved character that could not be checked since the server looked reset.")
+    ui.pruneBtn:SetScript("OnClick", function()
+        local n = 0
+        for _, name in ipairs(SortedAltNames()) do
+            local info = Alts()[name]
+            if info and info.stale and RemoveAlt(name) then n = n + 1 end
+        end
+        SetStatus("Removed " .. n .. " unverified character" .. (n == 1 and "" or "s") .. ".")
         RefreshAlts()
     end)
     local asf = CreateFrame("ScrollFrame", "AltBotsAltsScroll", alts, "UIPanelScrollFrameTemplate")
@@ -1467,6 +1684,43 @@ EnsureWindow = function()
 end
 
 
+local function AgoText(stamp)
+    local secs = time() - (stamp or 0)
+    if secs < 60 then return "just now" end
+    if secs < 3600 then return math.floor(secs / 60) .. " min ago" end
+    if secs < 86400 then return math.floor(secs / 3600) .. " h ago" end
+    return math.floor(secs / 86400) .. " days ago"
+end
+
+local function AltsHintText()
+    local data = RealmData()
+    if altSync.state == "waiting" then
+        return "Checking your characters with the server..."
+    end
+    local stale = StaleCount()
+    if stale > 0 then
+        return "|cffff9933The server looks reset. " .. stale .. " saved character" .. (stale == 1 and "" or "s") ..
+            " could not be checked yet: press Sync, or remove them.|r"
+    end
+    if data.serverList and data.syncedAt then
+        return "Synced with your account's character list " .. AgoText(data.syncedAt) .. "."
+    end
+    return "Characters are saved when you log into them. Press Sync to load your account's list from the server."
+end
+
+local function AltName(name, info)
+    local c = info and info.classFile and CLASS_COLORS[info.classFile]
+    local text = name
+    if c then
+        text = string.format("|cff%02x%02x%02x%s|r",
+            math.floor(c.r * 255 + 0.5), math.floor(c.g * 255 + 0.5), math.floor(c.b * 255 + 0.5), name)
+    end
+    if info and info.level and info.level > 0 then
+        text = text .. "  |cff999999" .. info.level .. "|r"
+    end
+    return text
+end
+
 RefreshAlts = function()
     if not win or not ui.altsChild then return end
     HidePool(ui.pools.altRows)
@@ -1475,6 +1729,13 @@ RefreshAlts = function()
     if ui.spawnAllBtn then
         if #names == 0 then ui.spawnAllBtn:Disable(); ui.despawnAllBtn:Disable()
         else ui.spawnAllBtn:Enable(); ui.despawnAllBtn:Enable() end
+    end
+    if ui.altsHint then ui.altsHint:SetText(AltsHintText()) end
+    if ui.syncBtn then
+        if altSync.state == "waiting" then ui.syncBtn:Disable() else ui.syncBtn:Enable() end
+    end
+    if ui.pruneBtn then
+        if StaleCount() > 0 then ui.pruneBtn:Show() else ui.pruneBtn:Hide() end
     end
     if #names == 0 then
         ui.altsEmpty:Show()
@@ -1488,12 +1749,18 @@ RefreshAlts = function()
         row:ClearAllPoints()
         row:SetPoint("TOPLEFT", 2, y)
         row:SetWidth(620)
-        row.name:SetText(name)
+        local info = Alts()[name]
+        row.name:SetText(AltName(name, info))
         local inGroup = grouped[name]
         local isOut = spawned[name] or inGroup
+        row.status:SetTextColor(0.5, 0.5, 0.5)
         if inGroup then
             row.status:SetText("In your group")
             row.dot:SetTexture("Interface\\COMMON\\Indicator-Green")
+        elseif info and info.stale then
+            row.status:SetText("Not verified")
+            row.status:SetTextColor(1, 0.6, 0.2)
+            row.dot:SetTexture("Interface\\COMMON\\Indicator-Red")
         elseif spawned[name] then
             row.status:SetText("Questing solo")
             row.dot:SetTexture("Interface\\COMMON\\Indicator-Yellow")
@@ -1533,6 +1800,16 @@ RefreshAlts = function()
             end)
             HookTip(row.quest, "Quest solo", "Spawn " .. name .. " without inviting, so it quests on its own.")
         end
+
+        row.remove:SetScript("OnClick", function()
+            RemoveAlt(name)
+            Print("Removed " .. name .. " from your saved characters.")
+            SetStatus("Removed " .. name .. ".")
+            RefreshAlts()
+        end)
+        HookTip(row.remove, "Remove " .. name, (info and info.stale)
+            and "This character could not be checked since the server looked reset. Remove it if it no longer exists."
+            or "Forget this character. Sync or a login on it adds it back.")
 
         if inGroup then
             row.invite:Disable()
@@ -2440,6 +2717,10 @@ ShowTab = function(id)
     SetTabState(ui.tabs.party, id == "party")
     SetTabState(ui.tabs.quests, id == "quests")
     if id == "alts" then
+        local data = RealmData()
+        if data.serverList and altSync.state ~= "waiting" and time() - (data.syncedAt or 0) > SYNC_REFRESH then
+            RequestAltSync(true)
+        end
         ui.altsPane:Show(); RefreshAlts()
     elseif id == "commands" then
         ui.cmdPane:Show(); RefreshCommands()
@@ -2465,7 +2746,16 @@ frame:SetScript("OnUpdate", function()
         elseif item.addon then
             SendAddonMessage(PREFIX, item.addon, "WHISPER", UnitName("player"))
         end
+        if item.after then item.after() end
         nextSendAt = now + SEND_GAP
+    end
+    if syncAt and now >= syncAt then
+        syncAt = nil
+        RequestAltSync(true)
+    end
+    if altSync.state == "waiting" and now - (altSync.sentAt or now) > SYNC_TIMEOUT then
+        OnAltSyncTimeout()
+        if OnAltsChanged then OnAltsChanged() end
     end
     if itemInfoTries and itemInfoTries > 0 and now >= (itemInfoRetryAt or 0) then
         itemInfoTries = itemInfoTries - 1
@@ -2498,15 +2788,51 @@ frame:SetScript("OnUpdate", function()
     end
 end)
 
+OnAltsChanged = function()
+    if win and win:IsShown() then
+        if ui.activeTab == "alts" then RefreshAlts()
+        elseif ui.activeTab == "commands" then RefreshCommands()
+        end
+    end
+end
+
+local MISSING_GUID_PATTERN = "^BotMgr: no character with guid (%d+) found"
+
+local function OnSystemMessage(text)
+    local g = tonumber(text and text:match(MISSING_GUID_PATTERN))
+    if not g then return end
+    for name, info in pairs(Alts()) do
+        if info.guid == g and name ~= UnitName("player") then
+            RemoveAlt(name)
+            Print("Removed " .. name .. ": the server has no character with guid " .. g .. " any more.")
+            OnAltsChanged()
+        end
+    end
+end
+
+frame:RegisterEvent("ADDON_LOADED")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+frame:RegisterEvent("PLAYER_LEVEL_UP")
+frame:RegisterEvent("CHAT_MSG_SYSTEM")
 frame:RegisterEvent("CHAT_MSG_ADDON")
 frame:RegisterEvent("CHAT_MSG_WHISPER")
 frame:RegisterEvent("PARTY_MEMBERS_CHANGED")
 frame:RegisterEvent("RAID_ROSTER_UPDATE")
 frame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3, arg4)
-    if event == "PLAYER_ENTERING_WORLD" then
+    if event == "ADDON_LOADED" and arg1 == "AltBots" then
+        MigrateDB()
+    elseif event == "PLAYER_ENTERING_WORLD" then
         RegisterSelf()
         CreateMinimapButton()
+        if not syncScheduled then
+            syncScheduled = true
+            syncAt = GetTime() + SYNC_DELAY
+        end
+    elseif event == "PLAYER_LEVEL_UP" then
+        local me = Alts()[UnitName("player") or ""]
+        if me and tonumber(arg1) then me.level = tonumber(arg1) end
+    elseif event == "CHAT_MSG_SYSTEM" then
+        OnSystemMessage(arg1)
     elseif event == "CHAT_MSG_ADDON" and arg1 == PREFIX then
         HandleIncoming(arg2)
     elseif event == "CHAT_MSG_WHISPER" and arg1 and string.sub(arg1, 1, 7) == "COABOT\t" then
@@ -2541,7 +2867,8 @@ local function ToggleWindow()
     end
 end
 
-local USAGE = "/alt  open window | /alt invite|solo|despawn <name> | /alt list | /alt add <name> <guid> | /alt remove <name>"
+local USAGE = "/alt  open window | /alt invite|solo|despawn <name> | /alt list | /alt sync | /alt prune"
+    .. " | /alt add <name> <guid> | /alt remove <name> | /alt clear"
     .. " | /alt follow|stay|attack|stopattack|pull <name|all> | /alt farm <name|all> [radius] | /alt farmstop <name|all>"
     .. " | /alt inventory <name|all> | /alt minimap"
 
@@ -2559,14 +2886,53 @@ SlashCmdList["ALTBOTS"] = function(msg)
     if cmd == "" then
         ToggleWindow()
     elseif cmd == "list" then
-        for n, g in pairs(Alts()) do Print(n .. " = " .. g) end
+        local names = {}
+        for n in pairs(Alts()) do table.insert(names, n) end
+        table.sort(names)
+        if #names == 0 then Print("No saved characters on " .. Realm() .. ".") end
+        for _, n in ipairs(names) do
+            local info = Alts()[n]
+            Print(AltName(n, info) .. " = " .. tostring(info.guid) .. " (" .. (info.source or "login") .. ")"
+                .. (info.stale and " |cffff9933not verified|r" or ""))
+        end
+    elseif cmd == "sync" then
+        RequestAltSync(false)
+        Print("Asking the server for your character list...")
+    elseif cmd == "prune" then
+        local n = 0
+        for name, info in pairs(Alts()) do
+            if info.stale and name ~= UnitName("player") and RemoveAlt(name) then n = n + 1 end
+        end
+        Print("Removed " .. n .. " unverified character" .. (n == 1 and "" or "s") .. ".")
+        OnAltsChanged()
+    elseif cmd == "clear" then
+        RealmData().chars = {}
+        RealmData().syncedAt = nil
+        for k in pairs(spawned) do spawned[k] = nil end
+        RegisterSelf()
+        RequestAltSync(false)
+        Print("Cleared the saved characters for " .. Realm() .. " and asked the server for a fresh list.")
+        OnAltsChanged()
     elseif cmd == "add" then
         local n, g = arg:match("^(%S+)%s+(%d+)$")
-        if n then Alts()[n] = tonumber(g); Print("Saved " .. n .. " = " .. g) else Print("Usage: /alt add <name> <guid>") end
+        if n then
+            Alts()[n] = { guid = tonumber(g), source = "manual" }
+            Print("Saved " .. n .. " = " .. g)
+            OnAltsChanged()
+        else
+            Print("Usage: /alt add <name> <guid>")
+        end
     elseif cmd == "remove" then
-        if arg and arg ~= "" then Alts()[arg] = nil; Print("Removed " .. arg) else Print("Usage: /alt remove <name>") end
+        local n = ResolveAlt(arg)
+        if n then
+            RemoveAlt(n); Print("Removed " .. n); OnAltsChanged()
+        elseif arg and arg ~= "" then
+            Print("I don't know '" .. arg .. "'.")
+        else
+            Print("Usage: /alt remove <name>")
+        end
     elseif cmd == "invite" then
-        SpawnAndInvite(arg)
+        SpawnAndInvite(ResolveAlt(arg) or arg)
     elseif cmd == "spawn" or cmd == "solo" then
         local n = ResolveAlt(arg)
         if n then Spawn(n) else Print("I don't know '" .. tostring(arg) .. "' yet.") end
