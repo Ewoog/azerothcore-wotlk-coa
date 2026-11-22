@@ -6,8 +6,14 @@
 
 # Allow bots to open corpses and take items and money while in a party or raid.
 # Disabled by default so grouped players can loot themselves. Solo bots still loot.
-# Does not change Need/Greed rolls or gathering and fishing loot.
+# Does not change Need/Greed rolls (see CoaBots.Loot.NeedOnUpgrades) or gathering and fishing loot.
 CoaBots.Loot.AutoLootInGroup = 0
+
+# Bots roll Need on group-loot armor and weapons that are an upgrade for them: gear they can equip now,
+# that matches their gear preference, and that scores at least 5% better than what they wear in that
+# slot (an empty slot always counts). Everything else is Greed, or Pass for armor/weapon types they
+# cannot wear or do not prefer. 0 = never Need (Greed/Pass only, the old behavior).
+CoaBots.Loot.NeedOnUpgrades = 1
 
 #
 #    CoaBots.Enable

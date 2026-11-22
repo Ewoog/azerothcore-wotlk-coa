@@ -3,6 +3,7 @@
 #include "BotWorkBudget.h"
 #include "training/TrainingArenaManager.h"
 #include "BotGear.h"
+#include "BotGearPolicy.h"
 /*
  * mod-coa-playerbots
  *
@@ -1067,6 +1068,57 @@ float ScoreItemForBot(Player* bot, ItemTemplate const* proto, BotRole role)
         score += float(value) * weight;
     }
     return score + WeaponKitFit(bot, proto);
+}
+
+static uint8 PairedEquipSlot(uint8 slot)
+{
+    switch (slot)
+    {
+        case EQUIPMENT_SLOT_FINGER1: return EQUIPMENT_SLOT_FINGER2;
+        case EQUIPMENT_SLOT_FINGER2: return EQUIPMENT_SLOT_FINGER1;
+        case EQUIPMENT_SLOT_TRINKET1: return EQUIPMENT_SLOT_TRINKET2;
+        case EQUIPMENT_SLOT_TRINKET2: return EQUIPMENT_SLOT_TRINKET1;
+        default: return NULL_SLOT;
+    }
+}
+
+bool IsLootUpgrade(Player* bot, ItemTemplate const* proto)
+{
+    if (!bot || !proto || (proto->Class != ITEM_CLASS_ARMOR && proto->Class != ITEM_CLASS_WEAPON))
+        return false;
+    if (!BotGear::Allowed(bot, proto) || BotAI::IsProfessionTool(proto))
+        return false;
+    if (!sBotMgr->MatchesGearPreference(bot, proto->ItemId))
+        return false;
+
+    uint16 dest = 0;
+    if (bot->CanEquipNewItem(NULL_SLOT, dest, proto->ItemId, true) != EQUIP_ERR_OK)
+        return false;
+
+    uint8 const eslot = bot->FindEquipSlot(proto, NULL_SLOT, true);
+    if (eslot == NULL_SLOT)
+        return false;
+
+    BotRole const role = BotAI::GetRole(bot->GetGUID());
+    auto const state = states.find(bot->GetGUID());
+    uint32 const lockMask = state != states.end() ? state->second.manualEquipLockMask : 0;
+    float const newScore = ScoreItemForBot(bot, proto, role) + BotGear::PowerScore(bot, proto);
+    if (!BotGearPolicy::BeatsWorn(newScore, 0.0f))
+        return false;
+
+    for (uint8 slot : { eslot, PairedEquipSlot(eslot) })
+    {
+        if (slot == NULL_SLOT || (slot < 32 && (lockMask & (1u << slot))))
+            continue;
+        Item* current = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        if (!current || !BotGear::Allowed(bot, current->GetTemplate()))
+            return true;
+        ItemTemplate const* worn = current->GetTemplate();
+        float const currentScore = ScoreItemForBot(bot, worn, role) + BotGear::PowerScore(bot, worn);
+        if (BotGearPolicy::BeatsWorn(newScore, currentScore))
+            return true;
+    }
+    return false;
 }
 } // namespace BotAI
 

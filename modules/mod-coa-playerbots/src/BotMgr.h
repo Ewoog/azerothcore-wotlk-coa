@@ -590,7 +590,7 @@ public:
     bool IsProtectedBot(Player const* bot) const;
 
     // Called every world tick via a WorldScript hook. Auto-accepts any
-    // pending group invite and auto-rolls Greed on any pending loot roll for
+    // pending group invite and auto-rolls (Need on upgrades, else Greed or Pass) on any pending loot roll for
     // every active bot (both checked every tick, not throttled — a human
     // player expects a near-instant response to either), and logs a
     // periodic (throttled) heartbeat so a human watching the log can confirm
@@ -679,16 +679,11 @@ private:
     // FinishPendingTeleport's comment).
     void TryReturnGhostToCorpseMap(WorldSession* session);
 
-    // Calls the real WorldSession::HandleLootRoll handler directly with a
-    // Greed vote for the given roll (itemGUID/itemSlot read straight off the
-    // Roll object — no packet-guessing needed). Caller must have already
-    // confirmed this bot has a pending, not-yet-answered vote on this roll.
-    void DoRollGreed(WorldSession* session, Roll* roll);
-
-    // Same shape as DoRollGreed but casts ROLL_PASS -- used when MatchesGearPreference says this
-    // roll's item is an armor/weapon type this bot's class can't wear or doesn't prefer. See
-    // Update()'s roll loop and docs/addon-protocol.md's SETGEARPREF verb.
-    void DoRollPass(WorldSession* session, Roll* roll);
+    // Calls the real WorldSession::HandleLootRoll handler directly with `rollType` (RollType: ROLL_NEED, ROLL_GREED or
+    // ROLL_PASS) for the given roll (itemGUID/itemSlot read straight off the Roll object -- no
+    // packet-guessing needed). Caller must have already confirmed this bot has a pending,
+    // not-yet-answered vote on this roll. See Update()'s roll loop.
+    void DoRollVote(WorldSession* session, Roll* roll, uint8 rollType);
 
     // Checked alongside the heartbeat (every 10s): if every currently active bot session is
     // already at the level cap, logs a one-time (edge-triggered) notice that there's no lower-
@@ -760,6 +755,7 @@ private:
     std::unordered_map<ObjectGuid, uint32> _tradeAgeMs;
     bool _tradeEnabled = true;
     bool _autoLootInGroup = false;
+    bool _lootNeedOnUpgrades = true;
     bool _inventorySellWhenNearVendor = true;
     bool _inventorySellOnLeaderVendor = true;
     uint32 _inventoryKeepQuality = 3;

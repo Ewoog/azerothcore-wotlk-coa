@@ -153,6 +153,11 @@ namespace BotAI
     // Evaluates and scores an item for a bot based on role and class stat affinity.
     float ScoreItemForBot(Player* bot, ItemTemplate const* proto, BotRole role);
 
+    // Whether a loot-roll item would replace what the bot wears: it can equip it now, it suits its gear preference,
+    // and it beats the weaker of its candidate slots by the same 5% margin the bag upgrade pass uses (an empty slot
+    // always counts). Profession tools and slots the commander locked never count.
+    bool IsLootUpgrade(Player* bot, ItemTemplate const* proto);
+
     // The weapon part of ScoreItemForBot on its own: points for weapons (and an off-hand weapon where a
     // learned spell needs one) that the bot's learned Ascension kit can use, minus points for weapons that
     // would make learned spells uncastable (wrong subclass, two-hander with an off-hand-only spell).
