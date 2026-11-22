@@ -63,6 +63,38 @@ namespace BotEconomyPolicy
         return (std::uint64_t(buyPrice) * items + batch - 1) / batch;
     }
 
+    // With no listing to compare against, an item is priced at `multiplier` times what a vendor pays for it, and never
+    // below the price vendors would sell it for.
+    constexpr std::uint64_t EstimateUnitPrice(std::uint32_t vendorSellPrice, std::uint32_t vendorBuyPrice, std::uint32_t multiplier)
+    {
+        std::uint64_t const fromSell = std::uint64_t(vendorSellPrice) * (multiplier ? multiplier : 1);
+        std::uint64_t const estimate = fromSell > vendorBuyPrice ? fromSell : vendorBuyPrice;
+        return estimate ? estimate : 1;
+    }
+
+    // Trade goods a bot puts up for sale: what it carries above its own keep count, after the guild bank's shortfall
+    // (an officer's stock limit not yet met) has been paid in.
+    constexpr std::uint32_t TradeGoodsForSale(std::uint32_t carried, std::uint32_t keep, std::uint32_t guildShortfall)
+    {
+        std::uint32_t const held = keep + guildShortfall;
+        return carried > held ? carried - held : 0;
+    }
+
+    enum class ListingStop : std::uint8_t
+    {
+        Done,           // every item of the line is listed
+        VendorBetter,   // the listing would not beat the vendor price or the deposit
+        NoListingsLeft, // the bot has as many auctions running as it may
+        Failed,         // the deposit or the auction house refused
+    };
+
+    // What is left of an auction line after listing goes to a vendor only when a vendor is the better buyer or the bags
+    // are full; otherwise it waits in the bags for the next listing.
+    constexpr bool VendorTheRest(ListingStop stop, bool bagsFull)
+    {
+        return stop == ListingStop::VendorBetter || stop == ListingStop::Done || bagsFull;
+    }
+
     // A recipe is worth crafting for the market when the product fetches marginPercent more than its reagents are worth.
     constexpr bool CraftPays(std::uint64_t productValue, std::uint64_t reagentValue, std::uint32_t marginPercent)
     {
