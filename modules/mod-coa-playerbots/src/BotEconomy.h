@@ -155,6 +155,8 @@ namespace BotEconomy
     uint32 CraftOrderTimeoutMs();
     // Failed casts in a row before a crafting order is given up; 0: never.
     uint32 CraftMaxCastFailures();
+    // Clears per-bot economy state (trips, cooldowns, gold orders) on logout/despawn (PB-014).
+    void Forget(ObjectGuid botGuid);
 }
 
 #endif // COA_PLAYERBOTS_BOT_ECONOMY_H

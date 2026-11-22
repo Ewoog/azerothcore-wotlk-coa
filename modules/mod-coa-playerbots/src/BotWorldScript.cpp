@@ -12,6 +12,7 @@
 #include "BotMaintenance.h"
 #include "WorldBrain.h"
 #include "DangerMap.h"
+#include "dialogue/BotDialogueManager.h"
 #include "world/encounters/WorldEncounterDirector.h"
 #include "Config.h"
 #include "AllCreatureScript.h"
@@ -90,6 +91,7 @@ public:
         // Quest knowledge base, objective handlers' config: built once, after the world loaded.
         WorldBrain::Initialize();
         DangerMap::Initialize();
+        sBotDialogueMgr.Initialize(sConfigMgr->GetOption<std::string>("CoaBots.Dialogue.DataDir", ""));
         WorldEncounterDirector::LoadConfig();
 
         if (sConfigMgr->GetOption<bool>("CoaBots.AutoLoginOnStartup", false))
