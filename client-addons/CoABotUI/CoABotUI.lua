@@ -74,6 +74,10 @@ local ShowMainPage
 local taskBoardFrame
 local orderPickerFrame
 local gearPanelFrame
+local economyFrame
+local RefreshEconomy
+-- "Economy" tab: what the server says about the economy and the guild/group bots' money (GETECONOMY).
+local econ = { state = nil, bots = {}, log = {}, pendingBots = {}, pendingLog = {} }
 local gearPanelBotGuid
 local autoDungeonSynced = false
 local currentFormationId = "rolebased"
@@ -608,6 +612,25 @@ local function HandleIncomingMessage(body)
     elseif verb == "BOTS" then
         ParseBotsChunk(parts[2])
         if RefreshBotBrowser then RefreshBotBrowser() end
+
+    elseif verb == "ECONSTATE" then
+        local enabled, live, buyGear, craft, capLeft = (parts[2] or ""):match("(%d),(%d),(%d),(%d),(%-?%d+)")
+        econ.state = { enabled = enabled == "1", live = live == "1", buyGear = buyGear == "1", craft = craft == "1", capLeft = tonumber(capLeft) }
+        econ.pendingBots, econ.pendingLog = {}, {}
+
+    elseif verb == "ECONBOT" then
+        for guid, name, money, sold, bought in (parts[2] or ""):gmatch("(%d+),([^,|]*),(%d+),(%d+),(%d+)") do
+            table.insert(econ.pendingBots, { guid = tonumber(guid), name = name, money = tonumber(money), sold = tonumber(sold), bought = tonumber(bought) })
+        end
+
+    elseif verb == "ECONLOG" then
+        for bot, item, count, verdict, unit, ago in (parts[2] or ""):gmatch("([^,|]*),([^,|]*),(%d+),([^,|]*),(%d+),(%-?%d+)") do
+            table.insert(econ.pendingLog, { bot = bot, item = item, count = tonumber(count), verdict = verdict, unit = tonumber(unit), ago = tonumber(ago) })
+        end
+
+    elseif verb == "ECONEND" then
+        econ.bots, econ.log = econ.pendingBots, econ.pendingLog
+        if RefreshEconomy then RefreshEconomy() end
 
     elseif verb == "STOCK" then
         ParseStockChunk(parts[2])
@@ -1282,12 +1305,13 @@ local function CreateMainFrame()
         { id = "orders", label = "Orders" },
         { id = "browse", label = "Browse" },
         { id = "gear", label = "Gear" },
+        { id = "economy", label = "Economy" },
     }
     for i, tabDef in ipairs(tabDefs) do
         local pageId, label = tabDef.id, tabDef.label
         local tab = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-        tab:SetSize(96, 22)
-        tab:SetPoint("TOPLEFT", frame, "TOPLEFT", 14 + (i - 1) * 100, -36)
+        tab:SetSize(78, 22)
+        tab:SetPoint("TOPLEFT", frame, "TOPLEFT", 14 + (i - 1) * 82, -36)
         tab:SetText(label)
         tab.pageId = pageId
         tab.label = label
@@ -1450,6 +1474,7 @@ local function CreateMainFrame()
             if orderPickerFrame then orderPickerFrame:Hide() end
             if botBrowserFrame then botBrowserFrame:Hide() end
             if gearPanelFrame then gearPanelFrame:Hide() end
+            if economyFrame then economyFrame:Hide() end
             for _, btn in ipairs(frame.compactButtons) do btn:Show() end
         else
             btnCollapse:SetText("-")
@@ -1807,7 +1832,8 @@ function RefreshTaskBoard()
             row.taskItemName = nil
 
             ApplyProfessionIcons(row, info.professions)
-            ApplyOrderControls(row, "bot", item.guid, info.orderGathered, info.orderTarget, info.canManage, true)
+            local isCraft = (info.task or ""):find("^crafting") ~= nil
+            ApplyOrderControls(row, "bot", item.guid, info.orderGathered, info.orderTarget, info.canManage, not isCraft)
         else
             local entry = item.entry
             row.nameText:SetText("|cFFFFD100Queued #" .. (tonumber(entry.position) or item.q) .. "|r |cFF888888by " .. SafeText(entry.requester, 24) .. "|r")
@@ -2168,6 +2194,149 @@ end
 
 function ShowGuildTaskBoard()
     ShowMainPage("tasks")
+end
+
+-------------------------------------------------------------------------------
+-- Economy page: bot gold, the last day's trade, and the latest sales and purchases
+-------------------------------------------------------------------------------
+
+local ECON_ROW_H = 18
+local econBotRows = {}
+local econLogLines = {}
+
+local function FormatMoney(copper)
+    copper = copper or 0
+    local g, s, c = math.floor(copper / 10000), math.floor(copper / 100) % 100, copper % 100
+    if g > 0 then return ("%d|cFFFFD100g|r %d|cFFC7C7CFs|r"):format(g, s) end
+    if s > 0 then return ("%d|cFFC7C7CFs|r %d|cFFEDA55Fc|r"):format(s, c) end
+    return ("%d|cFFEDA55Fc|r"):format(c)
+end
+
+local function OnOff(flag)
+    return flag and "|cFF55FF55on|r" or "|cFF888888off|r"
+end
+
+local function CreateEconomyFrame()
+    local frame = CreateFrame("Frame", "CoABotUIEconomy", mainFrame)
+    frame:SetPoint("TOPLEFT", mainFrame, "TOPLEFT", 12, -66)
+    frame:SetPoint("BOTTOMRIGHT", mainFrame, "BOTTOMRIGHT", -12, 10)
+    frame:Hide()
+
+    local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOPLEFT", frame, "TOPLEFT", 4, -7)
+    title:SetText("|cFFFFD100Economy|r |cFF8B93A3your guild and group bots|r")
+
+    local btnRefresh = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    btnRefresh:SetSize(70, 22)
+    btnRefresh:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -4, -4)
+    btnRefresh:SetText("Refresh")
+    btnRefresh:SetScript("OnClick", function() SendGroupCommand("GETECONOMY") end)
+
+    frame.stateText = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    frame.stateText:SetPoint("TOPLEFT", frame, "TOPLEFT", 4, -30)
+    frame.stateText:SetWidth(480)
+    frame.stateText:SetJustifyH("LEFT")
+
+    for _, col in ipairs({ { "Bot", 6, 150, "LEFT" }, { "Gold", 154, 100, "RIGHT" }, { "Sold (24h)", 259, 100, "RIGHT" },
+        { "Bought (24h)", 364, 100, "RIGHT" } }) do
+        local fs = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+        fs:SetPoint("TOPLEFT", frame, "TOPLEFT", col[2], -50)
+        fs:SetWidth(col[3])
+        fs:SetJustifyH(col[4])
+        fs:SetText(col[1])
+    end
+
+    local scrollFrame = CreateFrame("ScrollFrame", "CoABotUIEconomyScroll", frame, "UIPanelScrollFrameTemplate")
+    scrollFrame:SetPoint("TOPLEFT", frame, "TOPLEFT", 4, -64)
+    scrollFrame:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -28, 150)
+    local listArea = CreateFrame("Frame", nil, scrollFrame)
+    listArea:SetSize(470, 1)
+    scrollFrame:SetScrollChild(listArea)
+    frame.listArea = listArea
+
+    frame.emptyText = listArea:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    frame.emptyText:SetPoint("TOP", listArea, "TOP", 0, -30)
+    frame.emptyText:SetText("|cFF888888No guild or group bots online.|r")
+
+    local logTitle = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    logTitle:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 4, 134)
+    logTitle:SetText("|cFFFFD100Latest trades|r")
+    for i = 1, 8 do
+        local line = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        line:SetPoint("TOPLEFT", logTitle, "BOTTOMLEFT", 0, -2 - (i - 1) * 15)
+        line:SetWidth(480)
+        line:SetJustifyH("LEFT")
+        if line.SetWordWrap then line:SetWordWrap(false) end
+        econLogLines[i] = line
+    end
+
+    frame:SetScript("OnShow", function() SendGroupCommand("GETECONOMY") end)
+    return frame
+end
+
+local function GetEconBotRow(i)
+    if econBotRows[i] then return econBotRows[i] end
+    local row = CreateFrame("Frame", nil, economyFrame.listArea)
+    row:SetSize(470, ECON_ROW_H)
+    row:SetPoint("TOPLEFT", economyFrame.listArea, "TOPLEFT", 0, -(i - 1) * ECON_ROW_H)
+    local bg = row:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    bg:SetTexture("Interface\\FriendsFrame\\UI-FriendsFrame-HighlightBar")
+    bg:SetAlpha((i % 2 == 0) and 0.06 or 0.0)
+    local function Cell(x, width, justify)
+        local fs = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        fs:SetPoint("LEFT", row, "LEFT", x, 0)
+        fs:SetWidth(width)
+        fs:SetJustifyH(justify)
+        return fs
+    end
+    row.name = Cell(2, 150, "LEFT")
+    row.money = Cell(150, 100, "RIGHT")
+    row.sold = Cell(255, 100, "RIGHT")
+    row.bought = Cell(360, 100, "RIGHT")
+    econBotRows[i] = row
+    return row
+end
+
+RefreshEconomy = function()
+    if not economyFrame or not economyFrame:IsShown() then return end
+    local st = econ.state
+    if st then
+        local cap = (st.capLeft or -1) < 0 and "no cap" or (FormatMoney(st.capLeft) .. " left this hour")
+        economyFrame.stateText:SetText(("Economy %s, %s | Auction gear buying %s | Craft reagents %s | Bot spending: %s"):format(
+            OnOff(st.enabled), st.live and "|cFF55FF55trading|r" or "|cFFFFD100plan only|r", OnOff(st.buyGear), OnOff(st.craft), cap))
+    else
+        economyFrame.stateText:SetText("|cFF888888Waiting for the server...|r")
+    end
+
+    table.sort(econ.bots, function(a, b) return (a.money or 0) > (b.money or 0) end)
+    for i = 1, math.max(#econ.bots, #econBotRows) do
+        local info = econ.bots[i]
+        if info then
+            local row = GetEconBotRow(i)
+            row.name:SetText(info.name)
+            row.money:SetText(FormatMoney(info.money))
+            row.sold:SetText(FormatMoney(info.sold))
+            row.bought:SetText(FormatMoney(info.bought))
+            row:Show()
+        elseif econBotRows[i] then
+            econBotRows[i]:Hide()
+        end
+    end
+    economyFrame.listArea:SetHeight(math.max(#econ.bots * ECON_ROW_H + 4, 1))
+    if #econ.bots == 0 then economyFrame.emptyText:Show() else economyFrame.emptyText:Hide() end
+
+    local verbLabel = { vendor = "sold to a vendor", auction = "listed", buy = "bought" }
+    for i, line in ipairs(econLogLines) do
+        local e = econ.log[i]
+        if e then
+            local ago = (e.ago or 0) < 60 and ((e.ago or 0) .. " min") or (math.floor(e.ago / 60) .. " h")
+            line:SetText(("|cFF8B93A3%s ago|r  %s %s %dx %s at %s"):format(ago, e.bot, verbLabel[e.verdict] or e.verdict, e.count or 0,
+                e.item, FormatMoney(e.unit)))
+        else
+            line:SetText(i == 1 and "|cFF888888Nothing traded yet.|r" or "")
+        end
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -2766,7 +2935,7 @@ end
 
 ShowMainPage = function(pageId)
     if not mainFrame then return end
-    if pageId ~= "squad" and pageId ~= "tasks" and pageId ~= "orders" and pageId ~= "browse" and pageId ~= "gear" then
+    if pageId ~= "squad" and pageId ~= "tasks" and pageId ~= "orders" and pageId ~= "browse" and pageId ~= "gear" and pageId ~= "economy" then
         pageId = "squad"
     end
 
@@ -2777,6 +2946,7 @@ ShowMainPage = function(pageId)
     if orderPickerFrame then orderPickerFrame:Hide() end
     if botBrowserFrame then botBrowserFrame:Hide() end
     if gearPanelFrame then gearPanelFrame:Hide() end
+    if economyFrame then economyFrame:Hide() end
 
     for _, tab in ipairs(mainFrame.tabs) do
         if tab.pageId == pageId then
@@ -2804,6 +2974,10 @@ ShowMainPage = function(pageId)
     elseif pageId == "browse" then
         if not botBrowserFrame then botBrowserFrame = CreateBotBrowserFrame() end
         botBrowserFrame:Show()
+    elseif pageId == "economy" then
+        if not economyFrame then economyFrame = CreateEconomyFrame() end
+        economyFrame:Show()
+        RefreshEconomy()
     else
         if not gearPanelFrame then gearPanelFrame = CreateGearPanelFrame() end
         gearPanelFrame:Show()
