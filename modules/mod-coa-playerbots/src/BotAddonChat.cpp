@@ -21,18 +21,23 @@
 #include "Chat.h"
 #include "ClassSpecRoles.h"
 #include "Creature.h"
+#include "DatabaseEnv.h"
 #include "Group.h"
 #include "ItemTemplate.h"
 #include "map/BotMapService.h"
 #include "Log.h"
 #include "MotionMaster.h"
+#include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
+#include "QueryResult.h"
 #include "QuestDef.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
+#include "StringFormat.h"
 #include "Unit.h"
 #include "WorldPacket.h"
+#include "WorldSession.h"
 #include <cstdlib>
 #include <sstream>
 #include <string>
@@ -418,6 +423,42 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
             sBotMgr->InviteBotToGroup(commander, target, &handler);
         else
             sBotMgr->InviteBotToGuild(commander, target, &handler);
+        return;
+    }
+
+    // GETALTS:0 lists the characters on the commander's own account, so AltBots can drop saved
+    // alts that no longer exist (after a character or database wipe) and learn new ones without
+    // a login on each. Replies: ALTCHAR:<guid>:<class>:<level>:<race>:<companion online 0/1>:<name>
+    // per character, then ALTCHAREND:<count>.
+    if (verb == "GETALTS")
+    {
+        WorldSession* session = commander->GetSession();
+        ObjectGuid const commanderGuid = commander->GetGUID();
+        session->QueueQueryCallback(CharacterDatabase.AsyncQuery(Acore::StringFormat(
+            "SELECT guid, class, level, race, name FROM characters WHERE account = {} ORDER BY name",
+            session->GetAccountId())).WithCallback([commanderGuid](QueryResult result)
+            {
+                Player* requester = ObjectAccessor::FindConnectedPlayer(commanderGuid);
+                if (!requester)
+                    return;
+                uint32 count = 0;
+                if (result)
+                {
+                    do
+                    {
+                        Field* fields = result->Fetch();
+                        ObjectGuid::LowType const guidLow = fields[0].Get<uint32>();
+                        bool const online = sBotMgr->FindBotPlayer(guidLow) != nullptr;
+                        std::string const head = "ALTCHAR:" + std::to_string(guidLow) + ":" +
+                            std::to_string(uint32(fields[1].Get<uint8>())) + ":" +
+                            std::to_string(uint32(fields[2].Get<uint8>())) + ":" +
+                            std::to_string(uint32(fields[3].Get<uint8>())) + ":" + (online ? "1" : "0") + ":";
+                        SendCoaBotReply(requester, head + WireText(fields[4].Get<std::string>(), WireRoom(head)));
+                        ++count;
+                    } while (result->NextRow());
+                }
+                SendCoaBotReply(requester, "ALTCHAREND:" + std::to_string(count));
+            }));
         return;
     }
 
