@@ -30,6 +30,20 @@ constexpr unsigned PvpPower(unsigned spell)
     return spell == 9930954 ? 5 : spell == 9930955 ? 6 : spell == 9930956 ? 7 : spell == 9930957 ? 10 : 0;
 }
 
+enum class LootRoll : std::uint8_t { Pass, Need, Greed };
+
+constexpr bool BeatsWorn(float candidateScore, float wornScore)
+{
+    return candidateScore > 0.0f && candidateScore > wornScore * 1.05f;
+}
+
+constexpr LootRoll ChooseLootRoll(bool needEnabled, bool needOffered, bool upgrade, bool wearable)
+{
+    if (needEnabled && needOffered && upgrade)
+        return LootRoll::Need;
+    return wearable ? LootRoll::Greed : LootRoll::Pass;
+}
+
 constexpr unsigned PvePower(unsigned spell)
 {
     return spell >= 101600 && spell <= 101699 ? spell - 101600 : 0;

@@ -37,6 +37,7 @@
 #include "DBCStores.h"
 #include "DatabaseEnv.h"
 #include "GameTime.h"
+#include "BotGearPolicy.h"
 #include "Group.h"
 #include "GroupScript.h"
 #include "engine/GroupDirector.h"
@@ -4765,7 +4766,7 @@ void BotMgr::GearUpBot(Player* bot, ChatHandler* handler)
         handler->PSendSysMessage("Bot gear: repaired '{}' using level-appropriate equipment.", bot->GetName());
 }
 
-void BotMgr::DoRollGreed(WorldSession* session, Roll* roll)
+void BotMgr::DoRollVote(WorldSession* session, Roll* roll, uint8 rollType)
 {
     // HandleLootRoll reads itemGUID/itemSlot/rollType then calls Group::CountRollVote,
     // which does the real vote bookkeeping and broadcasts the update via SendLootRoll
@@ -4774,16 +4775,7 @@ void BotMgr::DoRollGreed(WorldSession* session, Roll* roll)
     WorldPacket packet;
     packet << roll->itemGUID;
     packet << uint32(roll->itemSlot);
-    packet << uint8(ROLL_GREED);
-    session->HandleLootRoll(packet);
-}
-
-void BotMgr::DoRollPass(WorldSession* session, Roll* roll)
-{
-    WorldPacket packet;
-    packet << roll->itemGUID;
-    packet << uint32(roll->itemSlot);
-    packet << uint8(ROLL_PASS);
+    packet << rollType;
     session->HandleLootRoll(packet);
 }
 
@@ -5054,7 +5046,9 @@ void BotMgr::Update(uint32 diff)
     for (WorldSession* session : _botSessions)
         TryReturnGhostToCorpseMap(session);
 
-    // Loot rolls: also checked every tick. Greeds on anything except the 4 basic armor types /
+    // Loot rolls: also checked every tick. Needs on armor and weapons that would replace what the
+    // bot wears (BotAI::IsLootUpgrade, CoaBots.Loot.NeedOnUpgrades) when the roll offers Need.
+    // Otherwise greeds on anything except the 4 basic armor types /
     // 6 basic melee weapon types this bot's class can't wear or doesn't prefer
     // (MatchesGearPreference, see docs/addon-protocol.md's GETGEAR/SETGEARPREF verbs) --
     // everything else (shields/jewelry/ranged weapons/relics/consumables/etc.) still always
@@ -5074,18 +5068,18 @@ void BotMgr::Update(uint32 diff)
             auto voteItr = roll->playerVote.find(bot->GetGUID());
             if (voteItr != roll->playerVote.end() && voteItr->second == NOT_EMITED_YET)
             {
-                if (MatchesGearPreference(bot, roll->itemid))
-                {
-                    LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotMgr: bot '{}' rolling Greed on item {} (slot {}).",
-                        bot->GetName(), roll->itemid, roll->itemSlot);
-                    DoRollGreed(session, roll);
-                }
-                else
-                {
-                    LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotMgr: bot '{}' rolling Pass on item {} (slot {}) -- wrong armor/weapon type for its class/preference.",
-                        bot->GetName(), roll->itemid, roll->itemSlot);
-                    DoRollPass(session, roll);
-                }
+                ItemTemplate const* proto = sObjectMgr->GetItemTemplate(roll->itemid);
+                bool const needOffered = roll->rollVoteMask & ROLL_FLAG_TYPE_NEED;
+                bool const upgrade = _lootNeedOnUpgrades && needOffered && BotAI::IsLootUpgrade(bot, proto);
+                BotGearPolicy::LootRoll const choice = BotGearPolicy::ChooseLootRoll(
+                    _lootNeedOnUpgrades, needOffered, upgrade, MatchesGearPreference(bot, roll->itemid));
+                char const* const label = choice == BotGearPolicy::LootRoll::Need ? "Need (upgrade)" :
+                    choice == BotGearPolicy::LootRoll::Greed ? "Greed" : "Pass (wrong armor/weapon type)";
+                LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()),
+                    "BotMgr: bot '{}' rolling {} on item {} (slot {}).",
+                    bot->GetName(), label, roll->itemid, roll->itemSlot);
+                DoRollVote(session, roll, choice == BotGearPolicy::LootRoll::Need ? ROLL_NEED :
+                    choice == BotGearPolicy::LootRoll::Greed ? ROLL_GREED : ROLL_PASS);
             }
         }
     }
@@ -5109,6 +5103,7 @@ void BotMgr::Update(uint32 diff)
         _aiIdleIntervalMs = sConfigMgr->GetOption<uint32>("CoaBots.AI.IdleIntervalMs", 250);
         _tradeEnabled = sConfigMgr->GetOption<bool>("CoaBots.Trade.Enable", true);
         _autoLootInGroup = sConfigMgr->GetOption<bool>("CoaBots.Loot.AutoLootInGroup", false);
+        _lootNeedOnUpgrades = sConfigMgr->GetOption<bool>("CoaBots.Loot.NeedOnUpgrades", true);
         _inventorySellWhenNearVendor = sConfigMgr->GetOption<bool>("CoaBots.Inventory.SellWhenNearVendor", true);
         _inventorySellOnLeaderVendor = sConfigMgr->GetOption<bool>("CoaBots.Inventory.SellOnLeaderVendor", true);
         _inventoryKeepQuality = sConfigMgr->GetOption<uint32>("CoaBots.Inventory.KeepQuality", 3);

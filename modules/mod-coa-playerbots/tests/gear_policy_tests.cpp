@@ -27,5 +27,14 @@ int main()
     assert(PvpPower(101615) == 0);
     assert(PvePower(101715) == 0);
     assert(PvpPower(9930957) == 10);
+    assert(BeatsWorn(10.0f, 0.0f));
+    assert(!BeatsWorn(0.0f, 0.0f));
+    assert(!BeatsWorn(104.0f, 100.0f));
+    assert(BeatsWorn(106.0f, 100.0f));
+    assert(ChooseLootRoll(true, true, true, true) == LootRoll::Need);
+    assert(ChooseLootRoll(true, false, true, true) == LootRoll::Greed);
+    assert(ChooseLootRoll(false, true, true, true) == LootRoll::Greed);
+    assert(ChooseLootRoll(true, true, false, true) == LootRoll::Greed);
+    assert(ChooseLootRoll(true, true, false, false) == LootRoll::Pass);
     std::cout << "Gear policy: reported low-level gear regression and all 80 level boundaries passed.\n";
 }
