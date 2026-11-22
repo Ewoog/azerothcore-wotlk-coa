@@ -13,6 +13,24 @@ If you use an old version of this module please update the table structure using
 ALTER TABLE `auctionhousebot` RENAME TO `mod_auctionhousebot`;
 ```
 
+## Conquest of Azeroth
+
+This copy is vendored from azerothcore/mod-ah-bot (commit c11d831) with these changes:
+
+- `AuctionHouseBot.CoA.ItemFilter` (on by default) limits the seller to stock 3.3.5a items (entry 56806 and
+  below) and items a profession recipe creates. Level-scaled copies (4400001-4912583), Worldforged items,
+  soulbound and quest items, and items without an Item.dbc row are never listed. The rules live in
+  `src/CoaAuctionItems.h`; `apps/coa-tests/test_auction_seller_items.py` covers them.
+- `AuctionHouseBot.CoA.CraftedItems` adds every item made by a primary or secondary profession recipe, Conquest of
+  Azeroth recipes included, read from SkillLineAbility and the spell store at startup. It replaces the static
+  `auctionhousebot_professionItems` table, which this copy does not ship.
+- `AuctionHouseBot.CoA.TradeGoodsUseBuyPrice` prices trade goods from the vendor buy price.
+- The module's tables come from `data/sql/updates/pending_db_world/rev_20261122_02_auction_house_seller.sql`
+  instead of the module folder. Blue and epic prices are tuned so greens and blues stay under the bots' 20x
+  vendor-price buy ceiling (`CoaBots.Economy.AuctionBuyMaxVendorMultiple`) and epics stay above it.
+- The seller runs seller-only: keep `AuctionHouseBot.EnableBuyer = 0`, because the buyer creates gold and buys
+  the playerbots' listings.
+
 ## Description
 
 An auction house bot for the best core: AzerothCore.
@@ -22,7 +40,7 @@ This mod works by selling and bidding auctions in the factions auction house. It
 
 ```
 1. Simply place the module under the `modules` directory of your AzerothCore source.
-1. Import the SQL manually to the right Database (auth, world or characters).
+1. The world tables are created by the server updater from the pending SQL (see above).
 1. Re-run cmake and launch a clean build of AzerothCore.
 ```
 

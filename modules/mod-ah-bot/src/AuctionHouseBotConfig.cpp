@@ -18,6 +18,7 @@
  */
 
 #include "AuctionHouseMgr.h"
+#include "CoaAuctionItems.h"
 #include "Common.h"
 #include "Config.h"
 #include "DatabaseEnv.h"
@@ -2093,6 +2094,14 @@ void AHBConfig::InitializeFromFile()
     Profession_Items               = sConfigMgr->GetOption<bool>  ("AuctionHouseBot.ProfessionItems"  , false);
 
     //
+    // Conquest of Azeroth item rules
+    //
+
+    CoaItemFilter                  = sConfigMgr->GetOption<bool>  ("AuctionHouseBot.CoA.ItemFilter"              , true);
+    CoaCraftedItems                = sConfigMgr->GetOption<bool>  ("AuctionHouseBot.CoA.CraftedItems"            , true);
+    CoaTradeGoodsUseBuyPrice       = sConfigMgr->GetOption<bool>  ("AuctionHouseBot.CoA.TradeGoodsUseBuyPrice"   , true);
+
+    //
     // Flags: items binding
     //
 
@@ -2602,6 +2611,18 @@ void AHBConfig::InitializeFromSql(std::set<uint32> botsIds)
         }
     }
 
+    //
+    // Include the items made by profession recipes, Conquest of Azeroth ones among them
+    //
+
+    if (CoaCraftedItems)
+    {
+        for (uint32 item : CoaAuctionItems::ProfessionCraftedItems())
+        {
+            LootItems.insert(item);
+        }
+    }
+
     if (DebugOutConfig)
     {
         LOG_INFO("module", "Loaded {} items from lootable items", uint32(LootItems.size()));
@@ -2618,6 +2639,20 @@ void AHBConfig::InitializeBins()
 
     for (ItemTemplateContainer::const_iterator itr = its->begin(); itr != its->end(); ++itr)
     {
+
+        //
+        // Conquest of Azeroth: only stock and profession-crafted items the client knows
+        //
+
+        if (CoaItemFilter && !CoaAuctionItems::Sellable(CoaAuctionItems::Describe(itr->second)))
+        {
+            if (DebugOutFilters)
+            {
+                LOG_ERROR("module", "AuctionHouseBot: Item {} disabled (Conquest of Azeroth item rules)", itr->second.ItemId);
+            }
+
+            continue;
+        }
 
         //
         // Exclude items with the blocked binding type

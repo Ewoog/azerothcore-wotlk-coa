@@ -1,9 +1,6 @@
---
--- Main configuration for the auction houses
---
-
-DROP TABLE IF EXISTS `mod_auctionhousebot`;
-CREATE TABLE `mod_auctionhousebot` (
+-- Auction house seller (mod-ah-bot): per-house quotas and prices, and the items it never sells.
+-- Prices are percentages of the vendor price; greens and blues stay under the bots' 20x buy ceiling.
+CREATE TABLE IF NOT EXISTS `mod_auctionhousebot` (
   `auctionhouse` int(11) NOT NULL DEFAULT '0' COMMENT 'mapID of the auctionhouse.',
   `name` char(25) DEFAULT NULL COMMENT 'Text name of the auctionhouse.',
   `minitems` int(11) DEFAULT '0' COMMENT 'This is the minimum number of items you want to keep in the auction house. a 0 here will make it the same as the maximum.',
@@ -67,34 +64,21 @@ CREATE TABLE `mod_auctionhousebot` (
   `buyerbiddinginterval` int(11) DEFAULT '1' COMMENT 'Interval how frequently AHB bids on each AH. Time in minutes',
   `buyerbidsperinterval` int(11) DEFAULT '1' COMMENT 'number of bids to put in per bidding interval',
   PRIMARY KEY (`auctionhouse`)
-) ENGINE=MyISAM DEFAULT CHARSET=utf8;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
---
--- AHBot auction houses default configuration values
---
+DELETE FROM `mod_auctionhousebot` WHERE `auctionhouse` IN (2, 6, 7);
+INSERT INTO `mod_auctionhousebot` (`auctionhouse`, `name`, `minitems`, `maxitems`, `percentgreytradegoods`, `percentwhitetradegoods`, `percentgreentradegoods`, `percentbluetradegoods`, `percentpurpletradegoods`, `percentorangetradegoods`, `percentyellowtradegoods`, `percentgreyitems`, `percentwhiteitems`, `percentgreenitems`, `percentblueitems`, `percentpurpleitems`, `percentorangeitems`, `percentyellowitems`, `minpricegrey`, `maxpricegrey`, `minpricewhite`, `maxpricewhite`, `minpricegreen`, `maxpricegreen`, `minpriceblue`, `maxpriceblue`, `minpricepurple`, `maxpricepurple`, `minpriceorange`, `maxpriceorange`, `minpriceyellow`, `maxpriceyellow`, `minbidpricegrey`, `maxbidpricegrey`, `minbidpricewhite`, `maxbidpricewhite`, `minbidpricegreen`, `maxbidpricegreen`, `minbidpriceblue`, `maxbidpriceblue`, `minbidpricepurple`, `maxbidpricepurple`, `minbidpriceorange`, `maxbidpriceorange`, `minbidpriceyellow`, `maxbidpriceyellow`, `maxstackgrey`, `maxstackwhite`, `maxstackgreen`, `maxstackblue`, `maxstackpurple`, `maxstackorange`, `maxstackyellow`, `buyerpricegrey`, `buyerpricewhite`, `buyerpricegreen`, `buyerpriceblue`, `buyerpricepurple`, `buyerpriceorange`, `buyerpriceyellow`, `buyerbiddinginterval`, `buyerbidsperinterval`) VALUES
+(2,'Alliance',250,250,0,27,12,10,1,0,0,0,10,30,8,2,0,0,100,150,150,250,800,1400,1200,1800,2500,4500,3250,5550,5250,6550,70,100,70,100,80,100,75,100,80,100,80,100,80,100,0,0,3,2,1,1,1,1,3,5,12,15,20,22,1,1),
+(6,'Horde',250,250,0,27,12,10,1,0,0,0,10,30,8,2,0,0,100,150,150,250,800,1400,1200,1800,2500,4500,3250,5550,5250,6550,70,100,70,100,80,100,75,100,80,100,80,100,80,100,0,0,3,2,1,1,1,1,3,5,12,15,20,22,1,1),
+(7,'Neutral',250,250,0,27,12,10,1,0,0,0,10,30,8,2,0,0,100,150,150,250,800,1400,1200,1800,2500,4500,3250,5550,5250,6550,70,100,70,100,80,100,75,100,80,100,80,100,80,100,0,0,3,2,1,1,1,1,3,5,12,15,20,22,1,1);
 
-INSERT INTO `mod_auctionhousebot` (`auctionhouse`, `name`, `minitems`, `maxitems`, `percentgreytradegoods`, `percentwhitetradegoods`, `percentgreentradegoods`, `percentbluetradegoods`, `percentpurpletradegoods`, `percentorangetradegoods`, `percentyellowtradegoods`, `percentgreyitems`, `percentwhiteitems`, `percentgreenitems`, `percentblueitems`, `percentpurpleitems`, `percentorangeitems`, `percentyellowitems`, `minpricegrey`, `maxpricegrey`, `minpricewhite`, `maxpricewhite`, `minpricegreen`, `maxpricegreen`, `minpriceblue`, `maxpriceblue`, `minpricepurple`, `maxpricepurple`, `minpriceorange`, `maxpriceorange`, `minpriceyellow`, `maxpriceyellow`, `minbidpricegrey`, `maxbidpricegrey`, `minbidpricewhite`, `maxbidpricewhite`, `minbidpricegreen`, `maxbidpricegreen`, `minbidpriceblue`, `maxbidpriceblue`, `minbidpricepurple`, `maxbidpricepurple`, `minbidpriceorange`, `maxbidpriceorange`, `minbidpriceyellow`, `maxbidpriceyellow`, `maxstackgrey`, `maxstackwhite`, `maxstackgreen`, `maxstackblue`, `maxstackpurple`, `maxstackorange`, `maxstackyellow`, `buyerpricegrey`, `buyerpricewhite`, `buyerpricegreen`, `buyerpriceblue`, `buyerpricepurple`, `buyerpriceorange`, `buyerpriceyellow`, `buyerbiddinginterval`, `buyerbidsperinterval`)
-VALUES
-(2,'Alliance',250,250,0,27,12,10,1,0,0,0,10,30,8,2,0,0,100,150,150,250,800,1400,1250,1750,2250,4550,3250,5550,5250,6550,70,100,70,100,80,100,75,100,80,100,80,100,80,100,0,0,3,2,1,1,1,1,3,5,12,15,20,22,1,1),
-(6,'Horde',250,250,0,27,12,10,1,0,0,0,10,30,8,2,0,0,100,150,150,250,800,1400,1250,1750,2250,4550,3250,5550,5250,6550,70,100,70,100,80,100,75,100,80,100,80,100,80,100,0,0,3,2,1,1,1,1,3,5,12,15,20,22,1,1),
-(7,'Neutral',250,250,0,27,12,10,1,0,0,0,10,30,8,2,0,0,100,150,150,250,800,1400,1250,1750,2250,4550,3250,5550,5250,6550,70,100,70,100,80,100,75,100,80,100,80,100,80,100,0,0,3,2,1,1,1,1,3,5,12,15,20,22,1,1);
-
---
--- Items blacklist
---
-
-DROP TABLE IF EXISTS `mod_auctionhousebot_disabled_items`;
-CREATE TABLE `mod_auctionhousebot_disabled_items` (
+CREATE TABLE IF NOT EXISTS `mod_auctionhousebot_disabled_items` (
   `item` mediumint(8) unsigned NOT NULL,
   PRIMARY KEY (`item`)
-) ENGINE=MyISAM DEFAULT CHARSET=utf8;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
---
--- Blacklist default values
---
-
-INSERT INTO `mod_auctionhousebot_disabled_items`
-VALUES
+DELETE FROM `mod_auctionhousebot_disabled_items`;
+INSERT INTO `mod_auctionhousebot_disabled_items` (`item`) VALUES
 (17), (3895), (1700), (862), (4196), (3934), (2275), (4213), (4988), (4989), (4990), (4110), (4111), (4116), (3463), (3068),
 (913), (2016), (3738), (1189), (3222), (2664), (2273), (4763), (2444), (1041), (1133), (1134), (2413), (2415), (2927), (2932),
 (2443), (1487), (1623), (3031), (3034), (3762), (3772), (4981), (2693), (2808), (1254), (2442), (3137), (4191), (4193), (931),
@@ -380,3 +364,71 @@ VALUES
 (53890), (54069), (54860), (50840), (53891), (53924), (51997), (51998), (54847), (54857), (56806), (54212), (54452), (54810), (50093), (54822),
 (50289), (50301), (50307), (52189), (52202), (52272), (52275), (52276), (52345), (52562), (52563), (52565), (52729), (53510), (54218), (54455),
 (54467), (50248), (50431), (52011), (52062), (54291), (54470);
+
+INSERT IGNORE INTO `mod_auctionhousebot_disabled_items` (`item`)
+SELECT entry
+FROM item_template
+WHERE (
+    NAME LIKE '%tablet%' OR
+    NAME LIKE '%sulfuron%' OR
+    NAME LIKE '%nightcrawlers%' OR
+    NAME LIKE '%throwing dagger%' OR
+    NAME LIKE '%shot pouch%' OR
+    NAME LIKE '%brimstone%' OR
+    NAME LIKE '%small pouch%' OR
+    NAME LIKE '%dye%' OR
+    NAME LIKE '%ironwood seed%' OR
+    NAME LIKE '%stranglethorn seed%' OR
+    NAME LIKE '%simple wood%' OR
+    NAME LIKE '%bleach%' OR
+    NAME LIKE '%flour%' OR
+    NAME LIKE '%brew%' OR
+    NAME LIKE '%parchment%' OR
+    NAME LIKE '%light quiver%' OR
+    NAME LIKE '%honey%' OR
+    NAME LIKE '%/%' OR
+    NAME LIKE '%creeping anguish%' OR
+    NAME LIKE '%felcloth bag%' OR
+    NAME LIKE '%elementium ore%' OR
+    NAME LIKE '%unused%' OR
+    NAME LIKE '%lava core%' OR
+    NAME LIKE '%fiery core%' OR
+    NAME LIKE '%sulfuron ingot%' OR
+    NAME LIKE '%sak%' OR
+    NAME LIKE '%gigantique%' OR
+    NAME LIKE '%portable hole%' OR
+    NAME LIKE '%deptecated%' OR
+    NAME LIKE '%durability%' OR
+    NAME LIKE '%big sack%' OR
+    NAME LIKE '%decoded%' OR
+    NAME LIKE '%knowledge:%' OR
+    NAME LIKE '%manual%' OR
+    NAME LIKE '%gnome head%' OR
+    NAME LIKE '%critter enlarger%' OR
+    NAME LIKE '%box of%' OR
+    NAME LIKE '%summoning%' OR
+    NAME LIKE '%turtle egg%' OR
+    NAME LIKE '%heavy crate%' OR
+    NAME LIKE '%assasin throwing axe%' OR
+    NAME LIKE '%sack of gems%' OR
+    NAME LIKE '%plans: darkspear%' OR
+    NAME LIKE '%of swords%' OR
+    NAME LIKE '%gnomish alarm%' OR
+    NAME LIKE '%world enlarger%' OR
+    NAME LIKE '%tome%' OR
+    NAME LIKE '%ornate spyglass%' OR
+    NAME LIKE '%test%' OR
+    NAME LIKE '%darkmoon prize%' OR
+    NAME LIKE '%codex%' OR
+    NAME LIKE '%grimoire%' OR
+    NAME LIKE '%deprecated%' OR
+    NAME LIKE '%[PH]%' OR
+    NAME LIKE 'Monster -%' OR
+    NAME LIKE '%book%' OR
+    NAME LIKE '%libram%' OR
+    NAME LIKE '%guide%'
+)
+OR NAME COLLATE utf8mb4_bin LIKE '%OLD%'
+OR UPPER(NAME) LIKE '%NPC%'
+OR UPPER(NAME) LIKE '%QA%'
+OR (CLASS = 0 AND SUBCLASS = 5 AND REQUIREDLEVEL < 40);

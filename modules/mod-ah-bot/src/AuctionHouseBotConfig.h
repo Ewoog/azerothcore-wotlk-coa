@@ -202,6 +202,10 @@ public:
     bool   Other_TGs;
     bool   Profession_Items;
 
+    bool   CoaItemFilter;
+    bool   CoaCraftedItems;
+    bool   CoaTradeGoodsUseBuyPrice;
+
     bool   No_Bind;
     bool   Bind_When_Picked_Up;
     bool   Bind_When_Equipped;

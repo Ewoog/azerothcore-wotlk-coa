@@ -119,6 +119,34 @@ AuctionHouseBot.DivisibleStacks = 0
 AuctionHouseBot.ElapsingTimeClass = 1
 
 ###############################################################################
+# CONQUEST OF AZEROTH ITEM RULES
+#
+#    AuctionHouseBot.CoA.ItemFilter
+#        Sell only stock 3.3.5a items (entry 56806 and below) plus items made
+#        by a profession recipe. Never sell level-scaled copies, Worldforged
+#        items, soulbound or quest items, or items without an Item.dbc row
+#        (the client would show them broken).
+#    Default 1 (True)
+#
+#    AuctionHouseBot.CoA.CraftedItems
+#        Add every item a primary or secondary profession recipe creates,
+#        Conquest of Azeroth recipes included, to the seller's item pool.
+#        Replaces the static ProfessionItems table.
+#    Default 1 (True)
+#
+#    AuctionHouseBot.CoA.TradeGoodsUseBuyPrice
+#        Price trade goods from what a vendor charges for them instead of
+#        what a vendor pays, so the quality multipliers keep materials near
+#        their vendor cost.
+#    Default 1 (True)
+#
+###############################################################################
+
+AuctionHouseBot.CoA.ItemFilter = 1
+AuctionHouseBot.CoA.CraftedItems = 1
+AuctionHouseBot.CoA.TradeGoodsUseBuyPrice = 1
+
+###############################################################################
 # AUCTION HOUSE BOT FILTERS PART 1
 #
 #    AuctionHouseBot.VendorItems
@@ -213,10 +241,10 @@ AuctionHouseBot.ProfessionItems = 0
 AuctionHouseBot.No_Bind = 1
 AuctionHouseBot.Bind_When_Picked_Up = 0
 AuctionHouseBot.Bind_When_Equipped = 1
-AuctionHouseBot.Bind_When_Use = 1
+AuctionHouseBot.Bind_When_Use = 0
 AuctionHouseBot.Bind_Quest_Item = 0
 AuctionHouseBot.DisablePermEnchant = 0
-AuctionHouseBot.DisableConjured = 0
+AuctionHouseBot.DisableConjured = 1
 AuctionHouseBot.DisableGems = 0
 AuctionHouseBot.DisableMoney = 0
 AuctionHouseBot.DisableMoneyLoot = 0

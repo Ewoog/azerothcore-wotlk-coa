@@ -847,7 +847,8 @@ void AuctionHouseBot::Sell(Player* AHBplayer, AHBConfig* config)
 
         if (buyoutPrice == 0)
         {
-            if (config->UseBuyPriceForSeller)
+            if (config->UseBuyPriceForSeller ||
+                (config->CoaTradeGoodsUseBuyPrice && prototype->Class == ITEM_CLASS_TRADE_GOODS && prototype->BuyPrice))
             {
                 buyoutPrice = prototype->BuyPrice;
             }
