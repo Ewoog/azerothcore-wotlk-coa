@@ -36,11 +36,11 @@ using namespace Acore::ChatCommands;
 class ah_bot_commandscript : public CommandScript
 {
 private:
-    static ItemQualities stringToItemQualities(const char* name, int length)
+    static ItemQualities stringToItemQualities(char const* name, int length)
     {
-        // 
+        //
         // Translates a string into ItemQualities enum
-        // 
+        //
 
         if (strncmp(name, "grey", length) == 0)
         {
@@ -96,7 +96,7 @@ public:
         return commandTable;
     }
 
-    static bool HandleAHBotOptionsCommand(ChatHandler* handler, const char*args)
+    static bool HandleAHBotOptionsCommand(ChatHandler* handler, char const* args)
     {
         uint32 ahMapID = 0;
         char*  opt     = strtok((char*)args, " ");

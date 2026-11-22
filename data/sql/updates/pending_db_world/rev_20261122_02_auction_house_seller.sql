@@ -366,69 +366,69 @@ INSERT INTO `mod_auctionhousebot_disabled_items` (`item`) VALUES
 (54467), (50248), (50431), (52011), (52062), (54291), (54470);
 
 INSERT IGNORE INTO `mod_auctionhousebot_disabled_items` (`item`)
-SELECT entry
-FROM item_template
+SELECT `entry`
+FROM `item_template`
 WHERE (
-    NAME LIKE '%tablet%' OR
-    NAME LIKE '%sulfuron%' OR
-    NAME LIKE '%nightcrawlers%' OR
-    NAME LIKE '%throwing dagger%' OR
-    NAME LIKE '%shot pouch%' OR
-    NAME LIKE '%brimstone%' OR
-    NAME LIKE '%small pouch%' OR
-    NAME LIKE '%dye%' OR
-    NAME LIKE '%ironwood seed%' OR
-    NAME LIKE '%stranglethorn seed%' OR
-    NAME LIKE '%simple wood%' OR
-    NAME LIKE '%bleach%' OR
-    NAME LIKE '%flour%' OR
-    NAME LIKE '%brew%' OR
-    NAME LIKE '%parchment%' OR
-    NAME LIKE '%light quiver%' OR
-    NAME LIKE '%honey%' OR
-    NAME LIKE '%/%' OR
-    NAME LIKE '%creeping anguish%' OR
-    NAME LIKE '%felcloth bag%' OR
-    NAME LIKE '%elementium ore%' OR
-    NAME LIKE '%unused%' OR
-    NAME LIKE '%lava core%' OR
-    NAME LIKE '%fiery core%' OR
-    NAME LIKE '%sulfuron ingot%' OR
-    NAME LIKE '%sak%' OR
-    NAME LIKE '%gigantique%' OR
-    NAME LIKE '%portable hole%' OR
-    NAME LIKE '%deptecated%' OR
-    NAME LIKE '%durability%' OR
-    NAME LIKE '%big sack%' OR
-    NAME LIKE '%decoded%' OR
-    NAME LIKE '%knowledge:%' OR
-    NAME LIKE '%manual%' OR
-    NAME LIKE '%gnome head%' OR
-    NAME LIKE '%critter enlarger%' OR
-    NAME LIKE '%box of%' OR
-    NAME LIKE '%summoning%' OR
-    NAME LIKE '%turtle egg%' OR
-    NAME LIKE '%heavy crate%' OR
-    NAME LIKE '%assasin throwing axe%' OR
-    NAME LIKE '%sack of gems%' OR
-    NAME LIKE '%plans: darkspear%' OR
-    NAME LIKE '%of swords%' OR
-    NAME LIKE '%gnomish alarm%' OR
-    NAME LIKE '%world enlarger%' OR
-    NAME LIKE '%tome%' OR
-    NAME LIKE '%ornate spyglass%' OR
-    NAME LIKE '%test%' OR
-    NAME LIKE '%darkmoon prize%' OR
-    NAME LIKE '%codex%' OR
-    NAME LIKE '%grimoire%' OR
-    NAME LIKE '%deprecated%' OR
-    NAME LIKE '%[PH]%' OR
-    NAME LIKE 'Monster -%' OR
-    NAME LIKE '%book%' OR
-    NAME LIKE '%libram%' OR
-    NAME LIKE '%guide%'
+    `name` LIKE '%tablet%' OR
+    `name` LIKE '%sulfuron%' OR
+    `name` LIKE '%nightcrawlers%' OR
+    `name` LIKE '%throwing dagger%' OR
+    `name` LIKE '%shot pouch%' OR
+    `name` LIKE '%brimstone%' OR
+    `name` LIKE '%small pouch%' OR
+    `name` LIKE '%dye%' OR
+    `name` LIKE '%ironwood seed%' OR
+    `name` LIKE '%stranglethorn seed%' OR
+    `name` LIKE '%simple wood%' OR
+    `name` LIKE '%bleach%' OR
+    `name` LIKE '%flour%' OR
+    `name` LIKE '%brew%' OR
+    `name` LIKE '%parchment%' OR
+    `name` LIKE '%light quiver%' OR
+    `name` LIKE '%honey%' OR
+    `name` LIKE '%/%' OR
+    `name` LIKE '%creeping anguish%' OR
+    `name` LIKE '%felcloth bag%' OR
+    `name` LIKE '%elementium ore%' OR
+    `name` LIKE '%unused%' OR
+    `name` LIKE '%lava core%' OR
+    `name` LIKE '%fiery core%' OR
+    `name` LIKE '%sulfuron ingot%' OR
+    `name` LIKE '%sak%' OR
+    `name` LIKE '%gigantique%' OR
+    `name` LIKE '%portable hole%' OR
+    `name` LIKE '%deptecated%' OR
+    `name` LIKE '%durability%' OR
+    `name` LIKE '%big sack%' OR
+    `name` LIKE '%decoded%' OR
+    `name` LIKE '%knowledge:%' OR
+    `name` LIKE '%manual%' OR
+    `name` LIKE '%gnome head%' OR
+    `name` LIKE '%critter enlarger%' OR
+    `name` LIKE '%box of%' OR
+    `name` LIKE '%summoning%' OR
+    `name` LIKE '%turtle egg%' OR
+    `name` LIKE '%heavy crate%' OR
+    `name` LIKE '%assasin throwing axe%' OR
+    `name` LIKE '%sack of gems%' OR
+    `name` LIKE '%plans: darkspear%' OR
+    `name` LIKE '%of swords%' OR
+    `name` LIKE '%gnomish alarm%' OR
+    `name` LIKE '%world enlarger%' OR
+    `name` LIKE '%tome%' OR
+    `name` LIKE '%ornate spyglass%' OR
+    `name` LIKE '%test%' OR
+    `name` LIKE '%darkmoon prize%' OR
+    `name` LIKE '%codex%' OR
+    `name` LIKE '%grimoire%' OR
+    `name` LIKE '%deprecated%' OR
+    `name` LIKE '%[PH]%' OR
+    `name` LIKE 'Monster -%' OR
+    `name` LIKE '%book%' OR
+    `name` LIKE '%libram%' OR
+    `name` LIKE '%guide%'
 )
-OR NAME COLLATE utf8mb4_bin LIKE '%OLD%'
-OR UPPER(NAME) LIKE '%NPC%'
-OR UPPER(NAME) LIKE '%QA%'
-OR (CLASS = 0 AND SUBCLASS = 5 AND REQUIREDLEVEL < 40);
+OR `name` COLLATE utf8mb4_bin LIKE '%OLD%'
+OR UPPER(`name`) LIKE '%NPC%'
+OR UPPER(`name`) LIKE '%QA%'
+OR (`class` = 0 AND `subclass` = 5 AND `RequiredLevel` < 40);

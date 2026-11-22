@@ -147,13 +147,13 @@ void AHBot_AuctionHouseScript::OnAuctionAdd(AuctionHouseObject* /*ah*/, AuctionE
     if (config->DebugOut)
     {
         LOG_INFO("module", "AHBot: Auction Added ah={}, auctionId={}, totalAHItems = {}", AuctionHouseId(ahEntry->houseId), auction->Id, config->TotalItemCounts());
-    }    
+    }
 }
 
 // this is called after the auction has been removed from the DB
 void AHBot_AuctionHouseScript::OnAuctionRemove(AuctionHouseObject* /*ah*/, AuctionEntry* auction)
 {
-    // 
+    //
     // Get the configuration for the auction house
     //
     AuctionHouseEntry const* ahEntry = sAuctionMgr->GetAuctionHouseEntryFromHouse(auction->GetHouseId());

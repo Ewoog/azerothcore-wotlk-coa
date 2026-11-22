@@ -92,9 +92,9 @@ void AHBot_WorldScript::OnBeforeConfigLoad(bool reload)
         return;
     }
 
-    // 
+    //
     // Start the bots only if the operation is a reload, otherwise let the OnStartup do the job
-    // 
+    //
 
     if (reload)
     {
@@ -146,9 +146,9 @@ void AHBot_WorldScript::OnStartup()
 
 void AHBot_WorldScript::DeleteBots()
 {
-    // 
+    //
     // Save the old bots references.
-    // 
+    //
 
     std::set<AuctionHouseBot*> oldBots;
 
@@ -163,9 +163,9 @@ void AHBot_WorldScript::DeleteBots()
 
     gBots.clear();
 
-    // 
+    //
     // Free the resources used up by the old bots
-    // 
+    //
 
     for (AuctionHouseBot* bot: oldBots)
     {
@@ -173,14 +173,13 @@ void AHBot_WorldScript::DeleteBots()
     }
 }
 
-
 void AHBot_WorldScript::PopulateBots()
 {
     uint32 account = sConfigMgr->GetOption<uint32>("AuctionHouseBot.Account", 0);
 
-    // 
+    //
     // Insert the bot in the list used for auction house iterations
-    // 
+    //
 
     gBots.clear();
 

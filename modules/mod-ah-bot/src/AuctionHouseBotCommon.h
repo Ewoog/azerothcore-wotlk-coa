@@ -51,9 +51,9 @@ class AuctionHouseBot;
 #define AHB_CLASS_UNUSED    512
 #define AHB_CLASS_DRUID    1024
 
-// 
+//
 // Items classification
-// 
+//
 
 #define AHB_GREY_TG           0
 #define AHB_WHITE_TG          1

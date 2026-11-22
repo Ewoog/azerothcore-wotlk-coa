@@ -143,7 +143,7 @@ private:
     uint32 orangeItems;
     uint32 yellowItems;
 
-    // 
+    //
     // Per-item statistics
     //
 
@@ -352,11 +352,10 @@ public:
     void   CalculatePercents ();
     // max number of items of type in AH based on maxItems
     uint32 GetMaximum        (uint32 ahbotItemType);
-    
+
     void   DecItemCounts     (uint32 Class, uint32 Quality);
 
     void   IncItemCounts     (uint32 Class, uint32 Quality);
-
 
     void   ResetItemCounts   ();
     uint32 TotalItemCounts   ();
