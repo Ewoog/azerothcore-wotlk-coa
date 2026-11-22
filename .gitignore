@@ -10,6 +10,7 @@
 !/modules/mod-coa-mythic-plus/
 !/modules/mod-cfbg/
 !/modules/mod-coa-playerbots/
+!/modules/mod-ah-bot/
 !/modules/*.md
 !/modules/*.sh
 !/modules/CMakeLists.txt
