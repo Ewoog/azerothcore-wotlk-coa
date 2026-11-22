@@ -2570,4 +2570,15 @@ namespace BotEconomy
     {
         return g_settings.craftMaxCastFailures;
     }
+
+    void Forget(ObjectGuid botGuid)
+    {
+        g_trips.erase(botGuid);
+        g_wantsTrip.erase(botGuid);
+        g_nextTripAt.erase(botGuid);
+        g_goldOrders.erase(botGuid);
+        g_wantsShopping.erase(botGuid);
+        g_nextShopAt.erase(botGuid);
+        EndStockRun(botGuid);
+    }
 }

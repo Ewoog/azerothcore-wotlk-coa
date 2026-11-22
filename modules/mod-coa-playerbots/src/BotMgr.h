@@ -583,6 +583,12 @@ public:
     ObjectGuid::LowType FindEligibleOfflineBot(TeamId team, uint8 minLevel = 0, uint8 maxLevel = 80,
         std::unordered_set<ObjectGuid::LowType> const& excludedGuids = {}) const;
 
+    // Unified protection predicate (PB-002): true if the bot is in a guild, has a guild invite,
+    // is in an online or persisted group/raid, is on a real player's friends list, or is executing
+    // an active player/guild order.
+    bool IsProtectedBot(ObjectGuid::LowType charLowGuid) const;
+    bool IsProtectedBot(Player const* bot) const;
+
     // Called every world tick via a WorldScript hook. Auto-accepts any
     // pending group invite and auto-rolls Greed on any pending loot roll for
     // every active bot (both checked every tick, not throttled — a human
@@ -733,6 +739,7 @@ private:
     bool NoteCraftFailure(Player* crafter, CraftOrderState& order, std::string const& why);
 
     std::vector<WorldSession*> _botSessions;
+    std::unordered_map<ObjectGuid::LowType, WorldSession*> _botSessionByLowGuid;
     // One detached login per GUID; concurrent callers share its completion.
     std::unordered_map<ObjectGuid::LowType, std::vector<std::function<void(Player*)>>> _pendingBotLogins;
     std::vector<WorldSession*> _pendingTeleportAck;
@@ -773,7 +780,7 @@ public:
     // throttled login BotMgr::Update already drains SpawnRandomBots/SpawnLeveledBots's queues
     // with. Also callable directly (e.g. from a GM command) to (re)populate the queue against an
     // already-running server without needing a restart.
-    void QueueAllBotsForAutoLogin();
+    uint32 QueueAllBotsForAutoLogin(uint32 maxCountOverride = 0);
     bool AutoLootInGroup() const { return _autoLootInGroup; }
     bool InventorySellWhenNearVendor() const { return _inventorySellWhenNearVendor; }
     bool InventorySellOnLeaderVendor() const { return _inventorySellOnLeaderVendor; }
