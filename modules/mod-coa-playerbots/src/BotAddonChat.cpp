@@ -26,6 +26,7 @@
 #include "Group.h"
 #include "ItemTemplate.h"
 #include "map/BotMapService.h"
+#include "QuestInteraction.h"
 #include "Log.h"
 #include "MotionMaster.h"
 #include "ObjectAccessor.h"
@@ -718,6 +719,15 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
             sBotMgr->InviteBotToGroup(commander, target, &handler);
         else
             sBotMgr->InviteBotToGuild(commander, target, &handler);
+        return;
+    }
+
+    // SHAREQUESTS:0 gives every quest in the commander's log to the grouped own alts,
+    // regardless of their eligibility (QuestInteraction::ShareQuestLogWithAlts).
+    if (verb == "SHAREQUESTS")
+    {
+        LOG_INFO("module.coa-playerbots", "BotAddonChat: '{}' -> SHAREQUESTS.", commander->GetName());
+        QuestInteraction::ShareQuestLogWithAlts(commander);
         return;
     }
 

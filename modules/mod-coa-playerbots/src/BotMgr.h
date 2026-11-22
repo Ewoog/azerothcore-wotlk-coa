@@ -765,6 +765,8 @@ private:
     uint32 _inventoryKeepQuality = 3;
     bool _questShareTurnIn = true;
     bool _questShareAccept = true;
+    bool _questShareIgnoreEligibility = true;
+    bool _questShareObjectLoot = true;
     bool _gatherWhileFollowing = true;
     float _gatherFollowRadius = 20.0f;
     void UpdateTrades(uint32 diff);
@@ -787,6 +789,8 @@ public:
     uint32 InventoryKeepQuality() const { return _inventoryKeepQuality; }
     bool QuestShareTurnIn() const { return _questShareTurnIn; }
     bool QuestShareAccept() const { return _questShareAccept; }
+    bool QuestShareIgnoreEligibility() const { return _questShareIgnoreEligibility; }
+    bool QuestShareObjectLoot() const { return _questShareObjectLoot; }
     bool GatherWhileFollowing() const { return _gatherWhileFollowing; }
     float GatherFollowRadius() const { return _gatherFollowRadius; }
 };

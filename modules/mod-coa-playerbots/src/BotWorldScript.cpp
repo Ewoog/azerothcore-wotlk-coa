@@ -19,6 +19,7 @@
 #include "AllGameObjectScript.h"
 #include "Creature.h"
 #include "GameObject.h"
+#include "Item.h"
 #include "KillRewarder.h"
 #include "Log.h"
 #include "ObjectAccessor.h"
@@ -135,8 +136,10 @@ public:
         return false;
     }
 
-    void OnPlayerLootItem(Player* player, Item*, uint32 count, ObjectGuid lootGuid) override
+    void OnPlayerLootItem(Player* player, Item* item, uint32 count, ObjectGuid lootGuid) override
     {
+        if (item)
+            QuestInteraction::OnCompanionLeaderLootedItem(player, item->GetEntry(), count, lootGuid);
         if (player && player->GetSession() && player->GetSession()->IsBot())
         {
             CoaBotScheduling::Notify(player->GetGUID(), true);
