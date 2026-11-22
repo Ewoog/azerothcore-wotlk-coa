@@ -11,6 +11,7 @@
 
 #include "Define.h"
 #include <string>
+#include <vector>
 
 class Creature;
 class Player;
@@ -19,6 +20,7 @@ namespace BotMaintenance
 {
     void LoadConfig();
 
+    bool CleanupEnabled();
     bool AutoTravelEnabled();
     float TravelSearchYards();
 
@@ -57,8 +59,10 @@ namespace BotMaintenance
     AmmoOutcome BuyAmmoFromVendorEntry(Player* bot, uint32 vendorEntry, Creature* discountNpc);
 
     // A real (non-bot) player opened a repair-capable NPC or a vendor. Grouped bots
-    // on the same map and within the configured share range repair and/or restock,
-    // and the commander is told in chat (prefix "AltBots:").
+    // on the same map and within the configured share range repair and/or restock.
+    // At a vendor (CoaBots.Inventory.SellOnLeaderVendor) they also list their
+    // auction finds when the economy lists from anywhere, then sell junk and safe
+    // vendor trash; the commander is told in chat (prefix "AltBots:") what sold.
     void OnPlayerOpenedNpc(Player* player, Creature* npc);
 
     // Act on whatever service is already at hand: an armorer / ammo vendor standing
@@ -85,6 +89,12 @@ namespace BotMaintenance
     // configured target and a vendor would buy something.
     bool NeedsSellTrip(Player* bot);
 
+    struct SoldStack
+    {
+        uint32 entry = 0;
+        uint32 count = 0;
+    };
+
     struct BagCleanupResult
     {
         uint32 stacksSold = 0;
@@ -95,6 +105,7 @@ namespace BotMaintenance
         uint32 bagsGranted = 0;
         uint32 stacksMerged = 0;
         uint32 upgradeSlots = 0;
+        std::vector<SoldStack> sold;
     };
 
     // Consolidate stacks, equip or swap larger bags, sell or destroy junk, and

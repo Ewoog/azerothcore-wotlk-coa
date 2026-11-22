@@ -1,6 +1,7 @@
 #include "BotMaintenance.h"
 #include "BotAI.h"
 #include "BotEconomy.h"
+#include "BotEconomyPolicy.h"
 #include "BotGear.h"
 #include "BotMgr.h"
 #include "Bag.h"
@@ -1192,29 +1193,41 @@ namespace
         return BagItemFate::Keep;
     }
 
-    // When the economy is live, bag cleanup may only vendor items that PlanSale
-    // marks Vendor. Auction and implicit Keep (including protected entries and
-    // profession tools the economy never plans) stay in the bags for the economy trip.
+    bool EconomyJudgesClass(ItemTemplate const* proto)
+    {
+        return proto && (proto->Class == ITEM_CLASS_TRADE_GOODS || proto->Class == ITEM_CLASS_ARMOR
+            || proto->Class == ITEM_CLASS_WEAPON || proto->Class == ITEM_CLASS_CONSUMABLE);
+    }
+
     bool TryLiveVerdicts(Player* bot, std::unordered_map<uint32, BotEconomy::Verdict>& out)
     {
         out.clear();
         if (!bot || !BotEconomy::IsLive())
             return false;
         for (BotEconomy::Line const& line : BotEconomy::PlanSale(bot))
-            out[line.entry] = line.verdict;
+            if (line.verdict != BotEconomy::Verdict::Keep)
+            {
+                BotEconomy::Verdict& verdict = out[line.entry];
+                if (verdict != BotEconomy::Verdict::Auction)
+                    verdict = line.verdict;
+            }
         return true;
     }
 
-    bool EconomyHoldsItem(uint32 entry, std::unordered_map<uint32, BotEconomy::Verdict> const* live)
+    bool EconomyHoldsItem(ItemTemplate const* proto, std::unordered_map<uint32, BotEconomy::Verdict> const* live)
     {
-        if (!live)
-            return false;
-        if (BotEconomy::IsProtectedItem(entry))
+        if (!proto)
             return true;
-        auto it = live->find(entry);
-        if (it == live->end())
-            return true;
-        return it->second != BotEconomy::Verdict::Vendor;
+        BotEconomyPolicy::PlannedSale planned = BotEconomyPolicy::PlannedSale::NotPlanned;
+        if (live)
+        {
+            auto it = live->find(proto->ItemId);
+            if (it != live->end())
+                planned = it->second == BotEconomy::Verdict::Auction ? BotEconomyPolicy::PlannedSale::Auction
+                                                                     : BotEconomyPolicy::PlannedSale::Vendor;
+        }
+        return !BotEconomyPolicy::CleanupMayVendor(live != nullptr, BotEconomy::IsProtectedItem(proto->ItemId), planned,
+            EconomyJudgesClass(proto));
     }
 
     uint32 CountSellableBagItems(Player* bot, ToolPlan const& tools, GearPlan const& gear)
@@ -1243,7 +1256,7 @@ namespace
             if (tools.keep.count(guid) || BotEconomy::IsReservedItem(bot, item))
                 return;
             ItemTemplate const* proto = item->GetTemplate();
-            if (EconomyHoldsItem(proto ? proto->ItemId : 0, live ? &liveVerdicts : nullptr))
+            if (EconomyHoldsItem(proto, live ? &liveVerdicts : nullptr))
                 return;
             if (tools.sell.count(guid) || gear.sell.count(guid))
             {
@@ -1492,13 +1505,55 @@ namespace
         return 1;
     }
 
+    std::string ItemLink(uint32 entry)
+    {
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(entry);
+        if (!proto)
+            return Acore::StringFormat("item {}", entry);
+        uint32 const color = proto->Quality < MAX_ITEM_QUALITY ? ItemQualityColors[proto->Quality] : ItemQualityColors[0];
+        return Acore::StringFormat("|c{:08x}|Hitem:{}:0:0:0:0:0:0:0:0|h[{}]|h|r", color, entry, proto->Name1);
+    }
+
+    std::vector<std::pair<uint32, uint32>> MergedSales(BotMaintenance::BagCleanupResult const& result)
+    {
+        std::vector<std::pair<uint32, uint32>> merged;
+        for (BotMaintenance::SoldStack const& stack : result.sold)
+        {
+            auto it = std::find_if(merged.begin(), merged.end(),
+                [&](std::pair<uint32, uint32> const& line) { return line.first == stack.entry; });
+            if (it == merged.end())
+                merged.emplace_back(stack.entry, stack.count);
+            else
+                it->second += stack.count;
+        }
+        return merged;
+    }
+
     void ReportBagCleanup(Player* tellPlayer, Player* bot, BotMaintenance::BagCleanupResult const& result)
     {
         if (tellPlayer && (result.stacksSold || result.copperEarned))
         {
-            std::string text = Acore::StringFormat("{} sold {} items ({}).",
-                bot->GetName(), result.stacksSold, FormatCopperLocal(result.copperEarned));
-            SendAltBots(tellPlayer, text);
+            SendAltBots(tellPlayer, Acore::StringFormat("{} sold {} stack(s) for {}, {} free bag slot(s) now:",
+                bot->GetName(), result.stacksSold, FormatCopperLocal(result.copperEarned), CountFreeGeneralSlotsLocal(bot)));
+            constexpr size_t LINKS_PER_LINE = 5;
+            std::string line;
+            size_t onLine = 0;
+            for (auto const& [entry, count] : MergedSales(result))
+            {
+                if (!line.empty())
+                    line += ", ";
+                line += ItemLink(entry);
+                if (count > 1)
+                    line += Acore::StringFormat(" x{}", count);
+                if (++onLine == LINKS_PER_LINE)
+                {
+                    SendAltBots(tellPlayer, "  " + line);
+                    line.clear();
+                    onLine = 0;
+                }
+            }
+            if (!line.empty())
+                SendAltBots(tellPlayer, "  " + line);
         }
         if (tellPlayer && (result.bagsEquipped || result.bagsBought || result.bagsGranted) && result.upgradeSlots)
         {
@@ -1557,6 +1612,11 @@ namespace BotMaintenance
             _settings.repairAveragePct = 100;
         if (_settings.ammoFill < _settings.ammoLow)
             _settings.ammoFill = _settings.ammoLow;
+    }
+
+    bool CleanupEnabled()
+    {
+        return _settings.cleanupEnable;
     }
 
     bool AutoTravelEnabled()
@@ -1847,8 +1907,14 @@ namespace BotMaintenance
                 ReportAmmo(player, member, bought);
             }
 
-            if (canSell)
+            if (canSell && sBotMgr->InventorySellOnLeaderVendor())
+            {
+                uint32 const listed = BotEconomy::ListAuctionFinds(member);
+                if (listed)
+                    SendAltBots(player, Acore::StringFormat("{} put {} auction(s) up for what the auction house pays better.",
+                        member->GetName(), listed));
                 CleanBags(member, true, false, npc, player);
+            }
         }
     }
 }
@@ -1991,7 +2057,7 @@ namespace BotMaintenance
                 ObjectGuid const guid = item->GetGUID();
                 if (tools.keep.count(guid) || BotEconomy::IsReservedItem(bot, item))
                     continue;
-                if (EconomyHoldsItem(proto->ItemId, live ? &liveVerdicts : nullptr))
+                if (EconomyHoldsItem(proto, live ? &liveVerdicts : nullptr))
                     continue;
 
                 uint32 traded = proto->Class == ITEM_CLASS_TRADE_GOODS ? tradeCount[item->GetEntry()] : 0;
@@ -2017,6 +2083,7 @@ namespace BotMaintenance
                     result.copperEarned += money;
                     bot->DestroyItem(bagSlot, slot, true);
                     ++result.stacksSold;
+                    result.sold.push_back({ entry, count });
                     if (live)
                         BotEconomy::RecordCleanupVendorSale(bot, entry, count, proto->SellPrice, "bag-cleanup");
                     if (proto->Class == ITEM_CLASS_TRADE_GOODS)

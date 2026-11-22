@@ -77,6 +77,13 @@ int main()
     assert(!VendorTheRest(ListingStop::Failed, false));
     assert(VendorTheRest(ListingStop::NoListingsLeft, true));
 
+    assert(CleanupMayVendor(false, true, PlannedSale::Auction, true));
+    assert(!CleanupMayVendor(true, true, PlannedSale::Vendor, false));
+    assert(CleanupMayVendor(true, false, PlannedSale::Vendor, true));
+    assert(!CleanupMayVendor(true, false, PlannedSale::Auction, false));
+    assert(!CleanupMayVendor(true, false, PlannedSale::NotPlanned, true));
+    assert(CleanupMayVendor(true, false, PlannedSale::NotPlanned, false));
+
     std::cout << "Economy policy: keep rules, purchase window, price ceiling, hourly cap, upgrade margin, give-up limit, "
-                 "vendor cost, craft margin, price estimate, trade goods for sale and unsold listings passed.\n";
+                 "vendor cost, craft margin, price estimate, trade goods for sale, unsold listings and cleanup vendoring passed.\n";
 }

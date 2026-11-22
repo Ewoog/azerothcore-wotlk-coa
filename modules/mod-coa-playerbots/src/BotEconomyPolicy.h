@@ -95,6 +95,30 @@ namespace BotEconomyPolicy
         return stop == ListingStop::VendorBetter || stop == ListingStop::Done || bagsFull;
     }
 
+    enum class PlannedSale : std::uint8_t
+    {
+        NotPlanned,
+        Vendor,
+        Auction,
+    };
+
+    // Whether bag cleanup may sell a stack to a vendor itself. With the live economy, stacks it plans for the auction
+    // house stay for a listing, and an item class the economy judges (trade goods, gear, consumables) that it left out
+    // of the plan is one it wants kept. Everything else (stale quest items, white vendor trash, known recipes) falls
+    // back to the cleanup rules, which the economy never looks at.
+    constexpr bool CleanupMayVendor(bool economyLive, bool protectedByOwner, PlannedSale planned, bool economyJudgesClass)
+    {
+        if (!economyLive)
+            return true;
+        if (protectedByOwner)
+            return false;
+        if (planned == PlannedSale::Vendor)
+            return true;
+        if (planned == PlannedSale::Auction)
+            return false;
+        return !economyJudgesClass;
+    }
+
     // A recipe is worth crafting for the market when the product fetches marginPercent more than its reagents are worth.
     constexpr bool CraftPays(std::uint64_t productValue, std::uint64_t reagentValue, std::uint32_t marginPercent)
     {
