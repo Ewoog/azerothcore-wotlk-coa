@@ -60,19 +60,19 @@ namespace
         uint32 outdatedBelowLevels = 15;   // a consumable this many levels under the bot is outdated
         uint32 minAuctionQuality = 2;      // uncommon and better go to the auction, the rest to a vendor
         uint32 undercutPercent = 5;        // what the plan assumes below the lowest current buyout
-        uint32 scanIntervalSec = 600;      // how often one bot is looked at
+        uint32 scanIntervalSec = 300;      // how often one bot is looked at
         uint32 botsPerTick = 2;            // bots looked at per world tick
         uint32 journalDays = 14;           // journal rows older than this are removed
         bool dryRun = true;                // plan only: nobody travels or sells
-        uint32 maxTrips = 5;               // bots on their way to town at the same time
+        uint32 maxTrips = 15;              // bots on their way to town at the same time
         uint32 tripCooldownMin = 30;       // minutes before the same bot is sent again
         uint32 guildSharePercent = 10;     // of what a trip earns, paid into the guild bank
         uint32 moneyReserveCopper = 50000; // a bot keeps at least this much for its own needs
-        uint32 maxListings = 20;           // auctions one bot may have running
+        uint32 maxListings = 40;           // auctions one bot may have running
         uint32 spreadMin = 5;              // listing prices vary by this many percent ...
         uint32 spreadMax = 10;             // ... up to this many, up or down
-        uint32 minListingCopper = 5000;    // a listing worth less than this is not worth the deposit: a vendor takes it
-        uint32 listingMinutes = 1440;      // how long a listing runs
+        uint32 minListingCopper = 1000;    // a listing worth less than this is not worth the deposit: a vendor takes it
+        uint32 listingMinutes = 2880;      // how long a listing runs
         bool consumeSupplies = false;      // eating and drinking use up food and drink
         uint32 supplyTarget = 20;          // how many of each a bot likes to carry
         uint32 dailyBudgetCopper = 20000;  // what one bot spends on supplies in a day
@@ -85,6 +85,10 @@ namespace
         uint32 shoppingIntervalMin = 120;      // minutes between shopping trips of one bot
         uint32 auctionHourlyCapCopper = 5000000; // what all bots together may spend at the auction houses in one hour (0 = no cap)
         uint32 auctionMaxVendorMultiple = 20;  // a bot pays at most this many times the vendor price per item (0 = no ceiling)
+        bool listFromAnywhere = false;         // bots list their auction finds wherever they are, without a trip to town
+        bool sellTradeGoods = false;           // gathered and looted materials go to the auction house
+        uint32 tradeGoodsKeep = 0;             // of each material a bot keeps for itself
+        uint32 estimateMultiplier = 3;         // unlisted items are priced at this many times the vendor price
         bool craftForMarket = false;           // crafters turn their own materials into goods and list them
         uint32 craftForMarketMaxCasts = 10;    // crafts per auction house visit
         uint32 craftForMarketMarginPercent = 25; // how much more the product must fetch than its reagents are worth
@@ -169,21 +173,21 @@ namespace
         g_settings.outdatedBelowLevels = sConfigMgr->GetOption<uint32>("CoaBots.Economy.OutdatedBelowLevels", 15);
         g_settings.minAuctionQuality = sConfigMgr->GetOption<uint32>("CoaBots.Economy.MinAuctionQuality", 2);
         g_settings.undercutPercent = std::min<uint32>(50, sConfigMgr->GetOption<uint32>("CoaBots.Economy.UndercutPercent", 5));
-        g_settings.scanIntervalSec = std::max<uint32>(30, sConfigMgr->GetOption<uint32>("CoaBots.Economy.ScanIntervalSec", 600));
+        g_settings.scanIntervalSec = std::max<uint32>(30, sConfigMgr->GetOption<uint32>("CoaBots.Economy.ScanIntervalSec", 300));
         g_settings.botsPerTick = std::max<uint32>(1, sConfigMgr->GetOption<uint32>("CoaBots.Economy.BotsPerTick", 2));
         g_settings.journalDays = std::max<uint32>(1, sConfigMgr->GetOption<uint32>("CoaBots.Economy.JournalDays", 14));
         g_settings.dryRun = sConfigMgr->GetOption<bool>("CoaBots.Economy.DryRun", true);
-        g_settings.maxTrips = std::max<uint32>(1, sConfigMgr->GetOption<uint32>("CoaBots.Economy.MaxTrips", 5));
+        g_settings.maxTrips = std::max<uint32>(1, sConfigMgr->GetOption<uint32>("CoaBots.Economy.MaxTrips", 15));
         g_settings.tripCooldownMin = std::max<uint32>(1, sConfigMgr->GetOption<uint32>("CoaBots.Economy.TripCooldownMin", 30));
         g_settings.guildSharePercent = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("CoaBots.Economy.GuildSharePercent", 10));
         g_settings.moneyReserveCopper = sConfigMgr->GetOption<uint32>("CoaBots.Economy.MoneyReserveCopper", 50000);
-        g_settings.maxListings = sConfigMgr->GetOption<uint32>("CoaBots.Economy.MaxListings", 20);
+        g_settings.maxListings = sConfigMgr->GetOption<uint32>("CoaBots.Economy.MaxListings", 40);
         g_settings.spreadMin = std::min<uint32>(50, sConfigMgr->GetOption<uint32>("CoaBots.Economy.PriceSpreadMinPercent", 5));
         g_settings.consumeSupplies = sConfigMgr->GetOption<bool>("CoaBots.Economy.ConsumeSupplies", false);
         g_settings.supplyTarget = std::max<uint32>(1, std::min<uint32>(200, sConfigMgr->GetOption<uint32>("CoaBots.Economy.SupplyTarget", 20)));
         g_settings.dailyBudgetCopper = sConfigMgr->GetOption<uint32>("CoaBots.Economy.DailyBudgetCopper", 20000);
-        g_settings.minListingCopper = sConfigMgr->GetOption<uint32>("CoaBots.Economy.MinListingCopper", 5000);
-        g_settings.listingMinutes = std::max<uint32>(5, std::min<uint32>(2880, sConfigMgr->GetOption<uint32>("CoaBots.Economy.ListingMinutes", 1440)));
+        g_settings.minListingCopper = sConfigMgr->GetOption<uint32>("CoaBots.Economy.MinListingCopper", 1000);
+        g_settings.listingMinutes = std::max<uint32>(5, std::min<uint32>(2880, sConfigMgr->GetOption<uint32>("CoaBots.Economy.ListingMinutes", 2880)));
         g_settings.spreadMax = std::max<uint32>(g_settings.spreadMin, std::min<uint32>(50, sConfigMgr->GetOption<uint32>("CoaBots.Economy.PriceSpreadMaxPercent", 10)));
         g_settings.auctionBuyGear = sConfigMgr->GetOption<bool>("CoaBots.Economy.AuctionBuyGear", false);
         g_settings.auctionBuyBudgetPercent = std::min<uint32>(100, sConfigMgr->GetOption<uint32>("CoaBots.Economy.AuctionBuyBudgetPercent", 25));
@@ -194,6 +198,10 @@ namespace
         g_settings.shoppingIntervalMin = std::max<uint32>(10, sConfigMgr->GetOption<uint32>("CoaBots.Economy.ShoppingIntervalMin", 120));
         g_settings.auctionHourlyCapCopper = sConfigMgr->GetOption<uint32>("CoaBots.Economy.AuctionBuyHourlyCapCopper", 5000000);
         g_settings.auctionMaxVendorMultiple = sConfigMgr->GetOption<uint32>("CoaBots.Economy.AuctionBuyMaxVendorMultiple", 20);
+        g_settings.listFromAnywhere = sConfigMgr->GetOption<bool>("CoaBots.Economy.ListFromAnywhere", false);
+        g_settings.sellTradeGoods = sConfigMgr->GetOption<bool>("CoaBots.Economy.SellTradeGoods", false);
+        g_settings.tradeGoodsKeep = sConfigMgr->GetOption<uint32>("CoaBots.Economy.TradeGoodsKeep", 0);
+        g_settings.estimateMultiplier = std::max<uint32>(1, std::min<uint32>(20, sConfigMgr->GetOption<uint32>("CoaBots.Economy.EstimateMultiplier", 3)));
         g_settings.craftForMarket = sConfigMgr->GetOption<bool>("CoaBots.Economy.CraftForMarket", false);
         g_settings.craftForMarketMaxCasts = std::min<uint32>(50, sConfigMgr->GetOption<uint32>("CoaBots.Economy.CraftForMarketMaxCasts", 10));
         g_settings.craftForMarketMarginPercent = std::min<uint32>(1000, sConfigMgr->GetOption<uint32>("CoaBots.Economy.CraftForMarketMarginPercent", 25));
@@ -309,7 +317,7 @@ namespace
             return std::max<uint32>(1, uint32(uint64(it->second) * (100 - g_settings.undercutPercent) / 100));
         }
         source = "estimate";
-        return std::max<uint32>(1, proto->SellPrice * 2);
+        return uint32(std::min<uint64>(2000000, BotEconomyPolicy::EstimateUnitPrice(proto->SellPrice, proto->BuyPrice, g_settings.estimateMultiplier)));
     }
 
     template <typename F>
@@ -1223,14 +1231,109 @@ namespace
 
     // What a bot does once it has reached the auctioneers: collect what earlier auctions earned, list and sell, and
     // pay the guild its share.
+    // ---- Listing -------------------------------------------------------------------------------------------------
+
+    // Materials the bot's guild bank is short of (an officer's stock limit above what the bank holds): item -> how many.
+    std::unordered_map<uint32, uint32> GuildStockShortfall(Player* bot)
+    {
+        std::unordered_map<uint32, uint32> shortfall;
+        auto limits = bot && bot->GetGuildId() ? g_stockLimits.find(bot->GetGuildId()) : g_stockLimits.end();
+        if (limits == g_stockLimits.end() || limits->second.empty())
+            return shortfall;
+        auto const banked = sBotMgr->GuildBankTradeGoods(bot->GetGuildId());
+        for (auto const& [entry, keep] : limits->second)
+        {
+            auto const have = banked.find(entry);
+            uint32 const inBank = have == banked.end() ? 0 : have->second;
+            if (inBank < keep)
+                shortfall[entry] = keep - inBank;
+        }
+        return shortfall;
+    }
+
+    // The guild bank comes first: materials it is short of are paid in before anything is put up for sale.
+    void TopUpGuildStock(Player* bot)
+    {
+        for (auto const& [entry, missing] : GuildStockShortfall(bot))
+        {
+            uint32 const carried = std::min(bot->GetItemCount(entry, false), missing);
+            if (carried && !BotEconomy::IsReservedReagent(bot, entry))
+                sBotMgr->GuildDepositItem(bot->GetGUID().GetCounter(), entry, carried, nullptr);
+        }
+    }
+
+    // Lists the stacks of one auction line at the house of `auctioneerFaction`; `remaining` is what is still unlisted.
+    BotEconomyPolicy::ListingStop ListLine(Player* bot, BotEconomy::Line const& line, ItemTemplate const* proto, uint32 auctioneerFaction,
+        uint32& listingsLeft, uint32& remaining)
+    {
+        using BotEconomyPolicy::ListingStop;
+        std::vector<Item*> stacks;
+        ForEachBagItem(bot, [&](Item* it) { if (it->GetEntry() == line.entry) stacks.push_back(it); });
+        for (Item* it : stacks)
+        {
+            if (!remaining)
+                return ListingStop::Done;
+            if (!listingsLeft)
+                return ListingStop::NoListingsLeft;
+            uint32 const n = std::min(remaining, it->GetCount());
+            uint32 const unit = ListingUnitPrice(line, proto);
+            // When a vendor would pay more than the auction nets after its 5% cut, sell to the vendor instead.
+            if (uint64(unit) * n < g_settings.minListingCopper || uint64(unit) * n * 95 / 100 <= uint64(proto->SellPrice) * n)
+                return ListingStop::VendorBetter;
+            if (!ListOnAuction(bot, it, n, unit * n, auctioneerFaction))
+                return ListingStop::Failed;
+            remaining -= n;
+            --listingsLeft;
+            ++g_tripTotals.listed;
+            JournalDone(bot, line, n, unit, "auction", line.priceSource);
+        }
+        return remaining ? ListingStop::Failed : ListingStop::Done;
+    }
+
+    uint32 ListingsLeft(Player* bot)
+    {
+        uint32 const listingsNow = g_listingCount[bot->GetGUID().GetCounter()];
+        return g_settings.maxListings > listingsNow ? g_settings.maxListings - listingsNow : 0;
+    }
+
+    uint32 g_listedFromAnywhere = 0;
+
+    // CoaBots.Economy.ListFromAnywhere: a bot collects its auction mail and lists its auction lines at its own side's
+    // auction house from wherever it is, the way a player's mailbox and a quick trip would. Vendor lines wait for a trip.
+    bool ListFromAnywhere(Player* bot)
+    {
+        if (!g_settings.listFromAnywhere || !BotEconomy::IsLive() || g_trips.count(bot->GetGUID()))
+            return false;
+        uint32 listingsLeft = ListingsLeft(bot);
+        uint64 const collected = CollectAuctionMail(bot);
+        TopUpGuildStock(bot);
+        uint32 listed = 0;
+        for (BotEconomy::Line const& line : BotEconomy::PlanSale(bot))
+        {
+            if (line.verdict != BotEconomy::Verdict::Auction || !listingsLeft)
+                continue;
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(line.entry);
+            if (!proto)
+                continue;
+            uint32 remaining = line.count;
+            uint32 const before = listingsLeft;
+            ListLine(bot, line, proto, bot->GetFaction(), listingsLeft, remaining);
+            listed += before - listingsLeft;
+        }
+        g_listedFromAnywhere += listed;
+        if (listed || collected || bot->m_mailsUpdated)
+            bot->SaveToDB(false, false);
+        return listed > 0;
+    }
+
     void SellInTown(Player* bot, uint32 auctioneerFaction, bool vendorOnly)
     {
         uint64 gained = vendorOnly ? 0 : CollectAuctionMail(bot);
         bool const bagsFull = bot->GetFreeInventorySpace() <= g_settings.bagsFullFreeSlots;
 
-        uint32 const listingsNow = g_listingCount[bot->GetGUID().GetCounter()];
-        uint32 listingsLeft = g_settings.maxListings > listingsNow ? g_settings.maxListings - listingsNow : 0;
+        uint32 listingsLeft = ListingsLeft(bot);
 
+        TopUpGuildStock(bot);
         if (!vendorOnly)
             CraftForMarket(bot, auctioneerFaction, listingsLeft);
 
@@ -1248,24 +1351,10 @@ namespace
 
             if (line.verdict == BotEconomy::Verdict::Auction && !vendorOnly)
             {
-                std::vector<Item*> stacks;
-                ForEachBagItem(bot, [&](Item* it) { if (it->GetEntry() == line.entry) stacks.push_back(it); });
-                for (Item* it : stacks)
-                {
-                    if (!remaining || !listingsLeft)
-                        break;
-                    uint32 const n = std::min(remaining, it->GetCount());
-                    uint32 const unit = ListingUnitPrice(line, proto);
-                    // When a vendor would pay more than the auction nets after its 5% cut, sell to the vendor instead.
-                    if (uint64(unit) * n < g_settings.minListingCopper || uint64(unit) * n * 95 / 100 <= uint64(proto->SellPrice) * n)
-                        break;
-                    if (!ListOnAuction(bot, it, n, unit * n, auctioneerFaction))
-                        break;
-                    remaining -= n;
-                    --listingsLeft;
-                    ++g_tripTotals.listed;
-                    JournalDone(bot, line, n, unit, "auction", line.priceSource);
-                }
+                BotEconomyPolicy::ListingStop const stop = ListLine(bot, line, proto, auctioneerFaction, listingsLeft, remaining);
+                // A full auction list or a refused deposit keeps the rest for the next listing instead of selling it off cheap.
+                if (!BotEconomyPolicy::VendorTheRest(stop, bagsFull))
+                    continue;
             }
 
             // Whatever is left (or was meant for a vendor) is sold at the vendor price.
@@ -1331,6 +1420,20 @@ namespace BotEconomy
         });
 
         std::unordered_set<uint32> consumableDone;
+        std::unordered_map<uint32, uint32> tradeTotal;
+        std::unordered_map<uint32, uint32> guildShortfall;
+        uint32 gatherItem = 0;
+        // A bot on a guild gather order banks its materials for the guild (BotMgr::MakeRoomForGatherOrder): it sells none.
+        bool const sellsTradeGoods = g_settings.sellTradeGoods && !sBotMgr->GetGatherOrderItem(bot->GetGUID(), &gatherItem);
+        if (sellsTradeGoods)
+        {
+            ForEachBagItem(bot, [&](Item* item)
+            {
+                if (item->GetTemplate() && item->GetTemplate()->Class == ITEM_CLASS_TRADE_GOODS)
+                    tradeTotal[item->GetEntry()] += item->GetCount();
+            });
+            guildShortfall = GuildStockShortfall(bot);
+        }
         auto add = [&](Line line)
         {
             if (line.verdict == Verdict::Keep || !line.count)
@@ -1365,6 +1468,26 @@ namespace BotEconomy
                     stock.reason = "stock-surplus";
                     Decide(item, proto, false, stock);
                     add(std::move(stock));
+                    return;
+                }
+                // Gathered and looted materials (herbs, ore, leather, cloth, meat...), above what the bot keeps and what
+                // its guild bank is short of. Crafting-order reagents stay (IsReservedItem above).
+                if (sellsTradeGoods && !BotAI::IsProfessionTool(proto) && !bot->HasQuestForItem(entry))
+                {
+                    if (!consumableDone.insert(entry).second)
+                        return;
+                    auto const shortfall = guildShortfall.find(entry);
+                    uint32 const forSale = BotEconomyPolicy::TradeGoodsForSale(tradeTotal[entry], g_settings.tradeGoodsKeep,
+                        shortfall == guildShortfall.end() ? 0 : shortfall->second);
+                    if (!forSale)
+                        return;
+                    Line goods;
+                    goods.entry = entry;
+                    goods.name = proto->Name1;
+                    goods.count = forSale;
+                    goods.reason = "trade-goods";
+                    Decide(item, proto, false, goods);
+                    add(std::move(goods));
                     return;
                 }
             }
@@ -1510,6 +1633,8 @@ namespace BotEconomy
             ++looked;
             ++g_totals.botsScanned;
 
+            if (ListFromAnywhere(bot))
+                g_lastPlan.erase(bot->GetGUID());
             std::vector<Line> plan = PlanSale(bot);
             uint64 total = 0;
             for (Line const& l : plan)
@@ -2122,6 +2247,8 @@ namespace BotEconomy
                 g_buyTotals.reagentsFromGuildBank, g_buyTotals.reagentStacksBought, Money(g_buyTotals.reagentAuctionCopper), Money(g_buyTotals.reagentVendorCopper));
             handler->PSendSysMessage("Crafting for the market {} (CoaBots.Economy.CraftForMarket): {} item(s) crafted.", g_settings.craftForMarket ? "on" : "off",
                 g_buyTotals.craftedForMarket);
+            handler->PSendSysMessage("Listing from anywhere {} (ListFromAnywhere): {} listing(s); trade goods to the auction {} (SellTradeGoods); auctions run {} min.",
+                g_settings.listFromAnywhere ? "on" : "off", g_listedFromAnywhere, g_settings.sellTradeGoods ? "on" : "off", g_settings.listingMinutes);
             return;
         }
 

@@ -556,7 +556,7 @@ CoaBots.MarkSessionsAsBots = 1
 #    CoaBots.Economy.ScanIntervalSec / BotsPerTick / JournalDays
 #        Description: How often one bot is looked at, how many bots per world tick, and how long
 #                     journal rows are kept.
-#        Default:     600 / 2 / 14
+#        Default:     300 / 2 / 14
 #
 
 #
@@ -568,7 +568,7 @@ CoaBots.MarkSessionsAsBots = 1
 #
 #    CoaBots.Economy.MaxTrips
 #        Description: How many bots may be on their way to town at the same moment.
-#        Default:     5
+#        Default:     15
 #
 #    CoaBots.Economy.TripCooldownMin
 #        Description: Minutes before the same bot is sent to town again.
@@ -583,8 +583,9 @@ CoaBots.MarkSessionsAsBots = 1
 #        Default:     50000 - (5 gold)
 #
 #    CoaBots.Economy.MaxListings
-#        Description: How many auctions one bot may have running.
-#        Default:     20
+#        Description: How many auctions one bot may have running. When a bot has this many running, the rest of its
+#                     auction finds wait in its bags for the next listing instead of going to a vendor.
+#        Default:     40
 #
 #    CoaBots.Economy.ConsumeSupplies
 #        Description: 1 = eating and drinking cost something. A bot that sits down to eat or drink uses up one food or
@@ -608,7 +609,7 @@ CoaBots.MarkSessionsAsBots = 1
 #    CoaBots.Economy.MinListingCopper / ListingMinutes
 #        Description: A listing worth less than this is not worth its deposit and goes to a vendor instead; how
 #                     long a listing runs (12 hours = 720, 24 hours = 1440, 48 hours = 2880).
-#        Default:     5000 (50 silver) / 1440
+#        Default:     1000 (10 silver) / 2880
 #
 #    CoaBots.Economy.PriceSpreadMinPercent / PriceSpreadMaxPercent
 #        Description: Listing prices differ from the plan's price by a random 5 to 10 percent, up or down,
@@ -647,6 +648,28 @@ CoaBots.MarkSessionsAsBots = 1
 #                     vendor buys for nothing have no ceiling). 0 = no ceiling.
 #        Default:     20
 #
+#    CoaBots.Economy.ListFromAnywhere
+#        Description: 1 = every time a bot is looked at (ScanIntervalSec) it collects its auction mail and lists its
+#                     auction finds at its own side's auction house from wherever it is, without a trip to town. Fills
+#                     the auction house far faster than trips alone. Needs Enable = 1 and DryRun = 0.
+#        Default:     0
+#
+#    CoaBots.Economy.SellTradeGoods
+#        Description: 1 = gathered and looted materials (herbs, ore, leather, cloth, meat, elemental...) are listed at
+#                     the auction house instead of sitting in the bags. The guild bank comes first: what an officer's
+#                     stock limit still lacks is paid in before the rest is listed. A bot on a guild gather order sells
+#                     no materials, and crafting-order reagents and protected items are never sold.
+#        Default:     0
+#
+#    CoaBots.Economy.TradeGoodsKeep
+#        Description: How many of each material a bot keeps for itself when SellTradeGoods = 1.
+#        Default:     0
+#
+#    CoaBots.Economy.EstimateMultiplier
+#        Description: An item nobody lists yet is priced at this many times its vendor price (never below the price
+#                     vendors sell it for). Once it is listed, the lowest buyout sets the price.
+#        Default:     3
+#
 #    CoaBots.Economy.CraftForMarket
 #        Description: 1 = on every auction house visit a bot crafts goods from its own materials with the recipes it
 #                     knows, when the product fetches CraftForMarketMarginPercent more than the materials are worth,
@@ -665,20 +688,20 @@ CoaBots.Economy.KeepConsumables = 10
 CoaBots.Economy.OutdatedBelowLevels = 15
 CoaBots.Economy.MinAuctionQuality = 2
 CoaBots.Economy.UndercutPercent = 5
-CoaBots.Economy.ScanIntervalSec = 600
+CoaBots.Economy.ScanIntervalSec = 300
 CoaBots.Economy.BotsPerTick = 2
 CoaBots.Economy.JournalDays = 14
 CoaBots.Economy.DryRun = 1
-CoaBots.Economy.MaxTrips = 5
+CoaBots.Economy.MaxTrips = 15
 CoaBots.Economy.TripCooldownMin = 30
 CoaBots.Economy.GuildSharePercent = 10
 CoaBots.Economy.MoneyReserveCopper = 50000
-CoaBots.Economy.MaxListings = 20
+CoaBots.Economy.MaxListings = 40
 CoaBots.Economy.ConsumeSupplies = 0
 CoaBots.Economy.SupplyTarget = 20
 CoaBots.Economy.DailyBudgetCopper = 20000
-CoaBots.Economy.MinListingCopper = 5000
-CoaBots.Economy.ListingMinutes = 1440
+CoaBots.Economy.MinListingCopper = 1000
+CoaBots.Economy.ListingMinutes = 2880
 CoaBots.Economy.PriceSpreadMinPercent = 5
 CoaBots.Economy.PriceSpreadMaxPercent = 10
 CoaBots.Economy.AuctionBuyGear = 0
@@ -690,6 +713,10 @@ CoaBots.Economy.ShoppingMinSpareCopper = 200000
 CoaBots.Economy.ShoppingIntervalMin = 120
 CoaBots.Economy.AuctionBuyHourlyCapCopper = 5000000
 CoaBots.Economy.AuctionBuyMaxVendorMultiple = 20
+CoaBots.Economy.ListFromAnywhere = 0
+CoaBots.Economy.SellTradeGoods = 0
+CoaBots.Economy.TradeGoodsKeep = 0
+CoaBots.Economy.EstimateMultiplier = 3
 CoaBots.Economy.CraftForMarket = 0
 CoaBots.Economy.CraftForMarketMaxCasts = 10
 CoaBots.Economy.CraftForMarketMarginPercent = 25

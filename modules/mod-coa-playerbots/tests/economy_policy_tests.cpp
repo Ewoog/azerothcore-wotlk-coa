@@ -61,6 +61,22 @@ int main()
     assert(!CraftPays(0, 0, 25));
     assert(!CraftPays(100, 100, 0));
 
+    assert(EstimateUnitPrice(13, 52, 3) == 52);
+    assert(EstimateUnitPrice(100, 0, 3) == 300);
+    assert(EstimateUnitPrice(0, 0, 3) == 1);
+    assert(EstimateUnitPrice(10, 0, 0) == 10);
+
+    assert(TradeGoodsForSale(40, 0, 0) == 40);
+    assert(TradeGoodsForSale(40, 10, 0) == 30);
+    assert(TradeGoodsForSale(40, 10, 25) == 5);
+    assert(TradeGoodsForSale(40, 20, 25) == 0);
+
+    assert(VendorTheRest(ListingStop::VendorBetter, false));
+    assert(VendorTheRest(ListingStop::Done, false));
+    assert(!VendorTheRest(ListingStop::NoListingsLeft, false));
+    assert(!VendorTheRest(ListingStop::Failed, false));
+    assert(VendorTheRest(ListingStop::NoListingsLeft, true));
+
     std::cout << "Economy policy: keep rules, purchase window, price ceiling, hourly cap, upgrade margin, give-up limit, "
-                 "vendor cost and craft margin passed.\n";
+                 "vendor cost, craft margin, price estimate, trade goods for sale and unsold listings passed.\n";
 }
