@@ -26,6 +26,7 @@
  */
 
 #include "BotSpawnRandom.h"
+#include <deque>
 #include "BotGear.h"
 #include "BotPerformance.h"
 #include "AccountMgr.h"
@@ -2044,6 +2045,30 @@ uint32 g_pendingLeveledBotCount = 0;
 uint32 g_pendingLeveledBotRequested = 0;
 uint32 g_pendingLeveledBotCreated = 0;
 uint32 g_pendingLeveledBotThrottleMs = 0;
+
+// One entry per `.botcmd spawnleveled` request, drained front to back: a fixed level (0 = roll each
+// bot's level from CoaBots.LeveledSpawn.Brackets) and a faction filter (-1 = either faction).
+struct LeveledSpawnRequest
+{
+    uint32 remaining;
+    uint8 level;
+    int8 team;
+};
+std::deque<LeveledSpawnRequest> g_leveledQueue;
+
+std::vector<uint8> FilterRacesByTeam(std::vector<uint8> races, int8 team)
+{
+    if (team < 0)
+        return races;
+    races.erase(std::remove_if(races.begin(), races.end(),
+        [team](uint8 race) { return int8(Player::TeamIdForRace(race)) != team; }), races.end());
+    return races;
+}
+
+char const* TeamLabel(int8 team)
+{
+    return team == TEAM_ALLIANCE ? "Alliance" : team == TEAM_HORDE ? "Horde" : "either faction";
+}
 }
 
 // Standalone so it can be applied to a bot that never went through ApplyFreshBotSetup at all --
@@ -2129,7 +2154,7 @@ void RepairGear(Player* bot)
                 BotGear::PreserveSlot(bot, slot);
 }
 
-void SpawnLeveledBots(uint32 requestedCount, ChatHandler* handler)
+void SpawnLeveledBots(uint32 requestedCount, uint8 fixedLevel, int8 team, ChatHandler* handler)
 {
     if (!sBotMgr->BotsEnabled())
     {
@@ -2168,7 +2193,27 @@ void SpawnLeveledBots(uint32 requestedCount, ChatHandler* handler)
         return;
     }
 
-    if (handler)
+    uint8 const serverMaxLevel = uint8(sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL));
+    if (fixedLevel > serverMaxLevel)
+    {
+        if (handler)
+            handler->PSendSysMessage("BotMgr: level {} is above the server max level {}.", uint32(fixedLevel), uint32(serverMaxLevel));
+        return;
+    }
+    if (FilterRacesByTeam(GetValidBotRaces(), team).empty())
+    {
+        if (handler)
+            handler->PSendSysMessage("BotMgr: no bot races are allowed for {} (check CoaBots.ExcludedBotRaces).", TeamLabel(team));
+        return;
+    }
+
+    if (handler && (fixedLevel || team >= 0))
+    {
+        std::string levelText = fixedLevel ? "level " + std::to_string(fixedLevel) : "rolled levels";
+        handler->PSendSysMessage("BotMgr: queued {} leveled bot(s) at {}, {} ({} every {}ms -- watch Server.log for progress).",
+            count, levelText, TeamLabel(team), RandomSpawnBatchSize(), RandomSpawnIntervalMs());
+    }
+    else if (handler)
     {
         if (g_pendingLeveledBotCount)
             handler->PSendSysMessage(
@@ -2181,6 +2226,7 @@ void SpawnLeveledBots(uint32 requestedCount, ChatHandler* handler)
                 count, RandomSpawnBatchSize(), RandomSpawnIntervalMs());
     }
 
+    g_leveledQueue.push_back({ count, fixedLevel, team });
     g_pendingLeveledBotCount += count;
     g_pendingLeveledBotRequested += count;
 }
@@ -2194,6 +2240,7 @@ uint32 CancelPendingSpawns()
     g_pendingLeveledBotCount = 0;
     g_pendingLeveledBotRequested = 0;
     g_pendingLeveledBotCreated = 0;
+    g_leveledQueue.clear();
     return cancelled;
 }
 
@@ -2210,10 +2257,11 @@ void ProcessPendingLeveledBotSpawns(uint32 diff)
     {
         g_pendingLeveledBotCount = 0;
         g_pendingLeveledBotRequested = 0;
+        g_leveledQueue.clear();
         return;
     }
 
-    if (!g_pendingLeveledBotCount)
+    if (!g_pendingLeveledBotCount || g_leveledQueue.empty())
         return;
 
     if (g_pendingLeveledBotThrottleMs > diff)
@@ -2224,17 +2272,19 @@ void ProcessPendingLeveledBotSpawns(uint32 diff)
     g_pendingLeveledBotThrottleMs = RandomSpawnIntervalMs();
 
     uint8 serverMaxLevel = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
-    uint32 thisBatch = std::min(g_pendingLeveledBotCount, RandomSpawnBatchSize());
-    std::vector<uint8> const validRaces = GetValidBotRaces();
+    LeveledSpawnRequest& request = g_leveledQueue.front();
+    uint32 thisBatch = std::min(request.remaining, RandomSpawnBatchSize());
+    std::vector<uint8> const validRaces = FilterRacesByTeam(GetValidBotRaces(), request.team);
     if (validRaces.empty())
     {
         LOG_ERROR("module.coa-playerbots", "BotMgr: no races allowed by bot race configuration; leveled spawn cancelled.");
         g_pendingLeveledBotCount = g_pendingLeveledBotCreated = g_pendingLeveledBotRequested = 0;
+        g_leveledQueue.clear();
         return;
     }
     for (uint32 i = 0; i < thisBatch; ++i)
     {
-        uint8 level = RollWeightedLevel(serverMaxLevel);
+        uint8 level = request.level ? std::min(request.level, serverMaxLevel) : RollWeightedLevel(serverMaxLevel);
         ObjectGuid::LowType newGuid = 0;
         constexpr uint32 MAX_RACE_ATTEMPTS = 10;
         for (uint32 attempt = 0; attempt < MAX_RACE_ATTEMPTS && !newGuid; ++attempt)
@@ -2252,6 +2302,7 @@ void ProcessPendingLeveledBotSpawns(uint32 diff)
             g_pendingLeveledBotCount = 0;
             g_pendingLeveledBotCreated = 0;
             g_pendingLeveledBotRequested = 0;
+            g_leveledQueue.clear();
             return;
         }
 
@@ -2259,6 +2310,9 @@ void ProcessPendingLeveledBotSpawns(uint32 diff)
         sBotMgr->SpawnBot(newGuid, nullptr, [level](Player* bot) { ApplyFreshBotSetup(bot, level); });
     }
     g_pendingLeveledBotCount -= thisBatch;
+    request.remaining -= thisBatch;
+    if (!request.remaining)
+        g_leveledQueue.pop_front();
 
     if (!g_pendingLeveledBotCount)
     {

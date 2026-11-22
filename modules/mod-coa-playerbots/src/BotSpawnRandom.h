@@ -47,7 +47,10 @@ ObjectGuid::LowType CreateOneRandomBot(uint8 race, ChatHandler* handler = nullpt
 // RollWeightedLevel in the .cpp) instead of always 80, plus a level-bracketed gear pass,
 // a two-primary profession set, starting bags, and basic food/water. Clamped to twice
 // CoaBots.RandomSpawn.MaxCount (this path is meant for bigger population batches, 1000-1500).
-void SpawnLeveledBots(uint32 requestedCount, ChatHandler* handler);
+// `.botcmd spawnleveled <count> [level] [alliance|horde|any]`: fixedLevel 0 rolls each bot's level as
+// above, otherwise every bot gets that level. team -1 takes races from both factions; TEAM_ALLIANCE or
+// TEAM_HORDE only from that side. The race is random among the allowed bot races either way.
+void SpawnLeveledBots(uint32 requestedCount, uint8 fixedLevel, int8 team, ChatHandler* handler);
 
 // Drains the queue SpawnLeveledBots fills. Called every tick from BotMgr::Update alongside
 // ProcessPendingRandomBotSpawns; a no-op whenever nothing is queued.

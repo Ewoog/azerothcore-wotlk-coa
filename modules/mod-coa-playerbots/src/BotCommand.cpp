@@ -188,7 +188,8 @@ public:
 
     // Population batch: random levels (mostly 1-10), professions, bags, food/water, and
     // level-bracketed gear -- see BotSpawnRandom.h/.cpp's SpawnLeveledBots.
-    static bool HandleBotSpawnLeveledCommand(ChatHandler* handler, uint32 count)
+    // `.botcmd spawnleveled <count> [level] [alliance|horde|any]`: level 0 or left out keeps the rolled levels.
+    static bool HandleBotSpawnLeveledCommand(ChatHandler* handler, uint32 count, Optional<uint8> level, Optional<std::string> faction)
     {
         if (!sBotMgr->BotsEnabled())
         {
@@ -196,7 +197,23 @@ public:
                 handler->SendSysMessage("BotMgr: companions are switched off (CoaBots.Enable = 0).");
             return true;
         }
-        BotSpawn::SpawnLeveledBots(count, handler);
+        int8 team = -1;
+        if (faction)
+        {
+            std::string f = *faction;
+            std::transform(f.begin(), f.end(), f.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+            if (f == "alliance" || f == "a")
+                team = TEAM_ALLIANCE;
+            else if (f == "horde" || f == "h")
+                team = TEAM_HORDE;
+            else if (f != "any" && f != "both")
+            {
+                if (handler)
+                    handler->SendSysMessage("Usage: .botcmd spawnleveled <count> [level] [alliance|horde|any]");
+                return true;
+            }
+        }
+        BotSpawn::SpawnLeveledBots(count, level.value_or(0), team, handler);
         return true;
     }
 
