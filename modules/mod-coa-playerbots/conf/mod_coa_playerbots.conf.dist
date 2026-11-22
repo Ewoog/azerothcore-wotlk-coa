@@ -444,9 +444,28 @@ CoaBots.Maintenance.AmmoFill = 1000
 #                     so a bot still has to loot those itself. 0 turns this off.
 #        Default:     1
 #
+#    CoaBots.Quest.ShareIgnoreEligibility
+#        Description: Your own alts (characters on your account, logged in as companions) take the
+#                     quests you accept even when they are not eligible (level, race, class,
+#                     prerequisites, reputation, skill). Other bots still need to be eligible. A
+#                     quest the alt already turned in, a full quest log or no bag space for the
+#                     quest's starting item still stops it. The AltBots "Share quests" button uses
+#                     the same rule for the quests already in your log. 0 turns this off.
+#        Default:     1
+#
+#    CoaBots.Quest.ShareObjectLoot
+#        Description: When you loot a quest item from an object in the world (a chest, crate or
+#                     other quest object), each of your own grouped alts within 80 yards that still
+#                     needs that item for a quest gets a copy. Clicking a quest object that gives
+#                     objective credit already counts for every group member in range. 0 turns
+#                     this off.
+#        Default:     1
+#
 
 CoaBots.Quest.ShareTurnIn = 1
 CoaBots.Quest.ShareAccept = 1
+CoaBots.Quest.ShareIgnoreEligibility = 1
+CoaBots.Quest.ShareObjectLoot = 1
 
 #
 # GATHERING WHILE FOLLOWING

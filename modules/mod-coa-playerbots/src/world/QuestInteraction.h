@@ -19,6 +19,7 @@
 #define COA_PLAYERBOTS_QUEST_INTERACTION_H
 
 #include <string>
+#include "ObjectGuid.h"
 #include "WorldBrainState.h"
 #include "WorldExecutor.h"
 
@@ -73,6 +74,8 @@ namespace QuestInteraction
 
     // A real player in a group accepted or turned in a quest. Nearby grouped bots (40 yards)
     // take or hand in the same quest when CoaBots.Quest.ShareAccept / ShareTurnIn is on.
+    // The commander's own alts (same account) skip the eligibility check when
+    // CoaBots.Quest.ShareIgnoreEligibility is on; other bots still need CanTakeQuest.
     // Turn-in uses PickRewardIndex, CanRewardQuest and RewardQuest; accept uses CanTakeQuest,
     // CanAddQuest and AddQuestAndCheckCompletion. Bots as the source are ignored so a bot's
     // own turn-in cannot recurse or reward the player a second time.
@@ -81,6 +84,16 @@ namespace QuestInteraction
     // what, or why not (too far, dead, not finished, bags full).
     void OnCompanionLeaderAccepted(Player* player, Quest const* quest, Object* giver);
     void OnCompanionLeaderTurnedIn(Player* player, Quest const* quest, Object* giver);
+
+    // AltBots "Share quests": every quest in the commander's log goes to each grouped own alt
+    // (same account), skipping eligibility like OnCompanionLeaderAccepted does for them. The
+    // commander gets one chat line per alt with what was taken and what was not.
+    void ShareQuestLogWithAlts(Player* player);
+
+    // The commander looted an item from a gameobject (chest, crate, herb-like quest object).
+    // Each grouped own alt within 80 yards whose quests still need that item gets a copy,
+    // capped at what its quests still need (CoaBots.Quest.ShareObjectLoot).
+    void OnCompanionLeaderLootedItem(Player* player, uint32 itemId, uint32 count, ObjectGuid lootGuid);
 
     // A real player opened a quest giver (creature or gameobject). Grouped bots hand in every
     // finished quest that giver ends, including ones the player already turned in earlier.

@@ -25,6 +25,7 @@
 #include "WorldPacket.h"
 #include "WorldPlanner.h"
 #include "WorldSession.h"
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -592,6 +593,87 @@ namespace QuestInteraction
         }
     }
 
+    bool IsOwnAlt(Player* player, Player* bot)
+    {
+        return player->GetSession() && bot->GetSession()
+            && player->GetSession()->GetAccountId() == bot->GetSession()->GetAccountId();
+    }
+
+    enum class ShareResult
+    {
+        Added,
+        AddedIneligible,
+        AlreadyHas,
+        AlreadyRewarded,
+        LogFull,
+        NoBagSpace,
+        NotEligible,
+    };
+
+    char const* ShareResultText(ShareResult result)
+    {
+        switch (result)
+        {
+            case ShareResult::AlreadyRewarded: return "already finished it";
+            case ShareResult::LogFull: return "quest log is full";
+            case ShareResult::NoBagSpace: return "no bag space for the quest item";
+            case ShareResult::NotEligible: return "not eligible";
+            default: return "";
+        }
+    }
+
+    // Own alts (characters on the commander's account) skip CanTakeQuest -- level, class, race,
+    // prerequisites, reputation, skill -- when CoaBots.Quest.ShareIgnoreEligibility is on. A quest
+    // the alt already handed in is still refused: the core never lets a rewarded non-repeatable
+    // quest complete again, so it would sit in the log forever.
+    ShareResult ShareQuest(Player* player, Player* bot, Quest const* quest, Object* source)
+    {
+        uint32 const questId = quest->GetQuestId();
+        if (bot->GetQuestStatus(questId) != QUEST_STATUS_NONE)
+            return ShareResult::AlreadyHas;
+        if (bot->IsQuestRewarded(questId) && !quest->IsRepeatable() && !quest->IsSeasonal())
+            return ShareResult::AlreadyRewarded;
+
+        bool const eligible = bot->CanTakeQuest(quest, false);
+        if (!eligible && !(sBotMgr->QuestShareIgnoreEligibility() && IsOwnAlt(player, bot)))
+            return ShareResult::NotEligible;
+        if (bot->FindQuestSlot(0) >= MAX_QUEST_LOG_SIZE)
+            return ShareResult::LogFull;
+        if (!bot->CanAddQuest(quest, false))
+            return ShareResult::NoBagSpace;
+
+        bot->AddQuestAndCheckCompletion(quest, source);
+        if (uint32 spell = quest->GetSrcSpell())
+            bot->CastSpell(bot, spell, true);
+        LOG_INFO("module.coa-playerbots.quests", "QuestSharedAccept: '{}' took quest {} '{}' from '{}'{}.",
+            bot->GetName(), questId, quest->GetTitle(), player->GetName(), eligible ? "" : " (eligibility skipped)");
+        return eligible ? ShareResult::Added : ShareResult::AddedIneligible;
+    }
+
+    // How many more of this item the bot's incomplete quests still need.
+    uint32 MissingQuestItemCount(Player* bot, uint32 itemId)
+    {
+        uint32 missing = 0;
+        for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const questId = bot->GetQuestSlotQuestId(slot);
+            if (!questId || bot->GetQuestStatus(questId) != QUEST_STATUS_INCOMPLETE)
+                continue;
+            Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+            if (!quest)
+                continue;
+            for (uint8 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
+            {
+                if (quest->RequiredItemId[i] != itemId)
+                    continue;
+                uint32 const have = bot->GetItemCount(itemId, true);
+                if (have < quest->RequiredItemCount[i])
+                    missing = std::max(missing, quest->RequiredItemCount[i] - have);
+            }
+        }
+        return missing;
+    }
+
     // Grouped bots follow the commander, so their own quest brain is suspended (BotAI.cpp:
     // WorldBrain::Suspend(..., SuspendReason::Grouped)) and they never walk to an ender on
     // their own. Every hand-in a grouped bot ever makes comes from the commander's actions
@@ -772,16 +854,121 @@ namespace QuestInteraction
         Object* source = giver ? giver : FindNearbyQuestObject(player, quest->GetQuestId(), false);
         ForNearbyGroupedBots(player, [&](Player* bot)
         {
-            if (bot->GetQuestStatus(quest->GetQuestId()) != QUEST_STATUS_NONE)
+            ShareResult const result = ShareQuest(player, bot, quest, source);
+            if (!IsOwnAlt(player, bot))
                 return;
-            if (!bot->CanTakeQuest(quest, false) || !bot->CanAddQuest(quest, false))
-                return;
-            bot->AddQuestAndCheckCompletion(quest, source);
-            if (uint32 spell = quest->GetSrcSpell())
-                bot->CastSpell(bot, spell, true);
-            LOG_INFO("module.coa-playerbots.quests", "QuestSharedAccept: '{}' took quest {} '{}' because '{}' accepted it.",
-                bot->GetName(), quest->GetQuestId(), quest->GetTitle(), player->GetName());
+            if (result == ShareResult::AddedIneligible)
+                Tell(player, Acore::StringFormat("{} took \"{}\" with you (not normally eligible).", bot->GetName(), quest->GetTitle()));
+            else if (result == ShareResult::LogFull || result == ShareResult::NoBagSpace || result == ShareResult::AlreadyRewarded)
+                Tell(player, Acore::StringFormat("{} could not take \"{}\": {}.", bot->GetName(), quest->GetTitle(), ShareResultText(result)));
         });
+    }
+
+    void ShareQuestLogWithAlts(Player* player)
+    {
+        if (!IsCompanionShareSource(player))
+        {
+            Tell(player, "you need to be in a group with your alts to share quests.");
+            return;
+        }
+
+        std::vector<Quest const*> quests;
+        for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 const questId = player->GetQuestSlotQuestId(slot);
+            if (!questId)
+                continue;
+            QuestStatus const status = player->GetQuestStatus(questId);
+            if (status != QUEST_STATUS_INCOMPLETE && status != QUEST_STATUS_COMPLETE)
+                continue;
+            if (Quest const* quest = sObjectMgr->GetQuestTemplate(questId))
+                quests.push_back(quest);
+        }
+        if (quests.empty())
+        {
+            Tell(player, "your quest log is empty, nothing to share.");
+            return;
+        }
+
+        uint32 alts = 0;
+        Group* group = player->GetGroup();
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* bot = ref->GetSource();
+            if (!bot || bot == player || !bot->IsInWorld() || bot->IsBeingTeleported() || !IsOwnAlt(player, bot))
+                continue;
+            if (!sBotMgr->FindBotPlayer(bot->GetGUID().GetCounter()))
+                continue;
+            ++alts;
+
+            uint32 added = 0, had = 0, done = 0;
+            std::vector<std::string> missed;
+            for (Quest const* quest : quests)
+            {
+                switch (ShareQuest(player, bot, quest, nullptr))
+                {
+                    case ShareResult::Added:
+                    case ShareResult::AddedIneligible:
+                        ++added;
+                        break;
+                    case ShareResult::AlreadyHas:
+                        ++had;
+                        break;
+                    case ShareResult::AlreadyRewarded:
+                        ++done;
+                        break;
+                    case ShareResult::LogFull:
+                    case ShareResult::NoBagSpace:
+                    case ShareResult::NotEligible:
+                        missed.push_back(quest->GetTitle());
+                        break;
+                }
+            }
+
+            std::string text = Acore::StringFormat("{} took {} quest(s), already had {}", bot->GetName(), added, had);
+            if (done)
+                text += Acore::StringFormat(", already finished {}", done);
+            if (!missed.empty())
+            {
+                text += Acore::StringFormat(", could not take {} (quest log or bags full):", missed.size());
+                for (std::size_t i = 0; i < missed.size(); ++i)
+                    text += (i ? ", \"" : " \"") + missed[i] + "\"";
+            }
+            Tell(player, text + ".");
+        }
+
+        if (!alts)
+            Tell(player, "none of your own alts are in your group.");
+    }
+
+    void OnCompanionLeaderLootedItem(Player* player, uint32 itemId, uint32 count, ObjectGuid lootGuid)
+    {
+        if (!sBotMgr->QuestShareObjectLoot() || !lootGuid.IsGameObject() || !IsCompanionShareSource(player))
+            return;
+
+        Group* group = player->GetGroup();
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* bot = ref->GetSource();
+            if (!bot || bot == player || !bot->IsInWorld() || bot->IsBeingTeleported() || !bot->IsAlive())
+                continue;
+            if (!IsOwnAlt(player, bot) || !sBotMgr->FindBotPlayer(bot->GetGUID().GetCounter()))
+                continue;
+            if (bot->GetMap() != player->GetMap() || !bot->IsWithinDistInMap(player, COMPANION_TURNIN_RANGE))
+                continue;
+
+            uint32 const missing = MissingQuestItemCount(bot, itemId);
+            if (!missing)
+                continue;
+            uint32 const give = std::min(missing, std::max<uint32>(count, 1));
+            if (!bot->AddItem(itemId, give))
+            {
+                Tell(player, Acore::StringFormat("{} has no bag space for a quest item you looted.", bot->GetName()));
+                continue;
+            }
+            LOG_INFO("module.coa-playerbots.quests", "QuestSharedObjectLoot: '{}' got {}x item {} because '{}' looted it from {}.",
+                bot->GetName(), give, itemId, player->GetName(), lootGuid.ToString());
+        }
     }
 
     void OnCompanionLeaderTurnedIn(Player* player, Quest const* quest, Object* giver)

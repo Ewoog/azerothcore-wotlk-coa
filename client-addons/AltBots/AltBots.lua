@@ -5,6 +5,7 @@
 -- Alts tab: spawn, quest solo, invite or despawn. Commands tab: follow, stay,
 -- attack, stop attack, pull, farm and inventory (clean bags) orders for one
 -- alt or every alt in your group.
+-- Quests tab: each bot's quest log, and Share quests (SHAREQUESTS) for your own alts.
 -- Party tab: inspect, role, spec, gear preferences, professions, equipped gear
 -- and bags of grouped bots (COABOT GETGEAR/GETBAGS/EQUIP/UNEQUIP/GETPROFS/SETPROF).
 -- It only sends .botcmd chat commands, COABOT addon messages to yourself
@@ -2347,6 +2348,14 @@ local function RequestAllQuests()
         or "No party members to refresh.")
 end
 
+-- SHAREQUESTS: the server gives every quest in your log to your own grouped alts, even when
+-- they are not eligible, and says in chat what each alt took. The quest logs refresh after it.
+local function ShareQuestsWithAlts()
+    SendBot("SHAREQUESTS", 0)
+    RequestAllQuests()
+    SetStatus("Sharing your quests with your grouped alts...")
+end
+
 local function MakeQuestListRow(parent)
     local row = MakePartyRow(parent)
     row.count = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
@@ -2479,6 +2488,13 @@ BuildQuestPane = function(body)
             SetStatus("Select a party member first.")
         end
     end)
+
+    ui.questShareBtn = MakeTextBtn(detail, 96, 20, "Share quests")
+    ui.questShareBtn:SetPoint("RIGHT", ui.questRefreshBtn, "LEFT", -4, 0)
+    HookTip(ui.questShareBtn, "Share quests", "Give every quest in your log to your own alts in your group, even ones "
+        .. "they are not eligible for (level, class, race or prerequisites). Quests you accept are shared the same way "
+        .. "automatically. Also /alt share.")
+    ui.questShareBtn:SetScript("OnClick", ShareQuestsWithAlts)
 
     local qh, qr = SectionHeader(detail, "Quest log")
     qh:SetPoint("TOPLEFT", 4, -28)
@@ -2867,7 +2883,7 @@ local function ToggleWindow()
     end
 end
 
-local USAGE = "/alt  open window | /alt invite|solo|despawn <name> | /alt list | /alt sync | /alt prune"
+local USAGE = "/alt  open window | /alt invite|solo|despawn <name> | /alt list | /alt sync | /alt prune | /alt share"
     .. " | /alt add <name> <guid> | /alt remove <name> | /alt clear"
     .. " | /alt follow|stay|attack|stopattack|pull <name|all> | /alt farm <name|all> [radius] | /alt farmstop <name|all>"
     .. " | /alt inventory <name|all> | /alt minimap"
@@ -2948,6 +2964,9 @@ SlashCmdList["ALTBOTS"] = function(msg)
         local n = arg:match("^(%S+)$")
         if not n then Print("Usage: /alt " .. cmd .. " <name|all>") return end
         Order(cmd, OrderArg(n))
+    elseif cmd == "share" or cmd == "sharequests" then
+        ShareQuestsWithAlts()
+        Print("Sharing your quests with your grouped alts...")
     elseif cmd == "minimap" then
         SetMinimapShown(not GetMinimapShown())
         Print(GetMinimapShown() and "Minimap button shown." or "Minimap button hidden.")

@@ -5114,6 +5114,8 @@ void BotMgr::Update(uint32 diff)
         _inventoryKeepQuality = sConfigMgr->GetOption<uint32>("CoaBots.Inventory.KeepQuality", 3);
         _questShareTurnIn = sConfigMgr->GetOption<bool>("CoaBots.Quest.ShareTurnIn", true);
         _questShareAccept = sConfigMgr->GetOption<bool>("CoaBots.Quest.ShareAccept", true);
+        _questShareIgnoreEligibility = sConfigMgr->GetOption<bool>("CoaBots.Quest.ShareIgnoreEligibility", true);
+        _questShareObjectLoot = sConfigMgr->GetOption<bool>("CoaBots.Quest.ShareObjectLoot", true);
         _gatherWhileFollowing = sConfigMgr->GetOption<bool>("CoaBots.Gather.WhileFollowing", true);
         float followRadius = sConfigMgr->GetOption<float>("CoaBots.Gather.FollowRadius", 20.0f);
         if (followRadius < 5.0f)
