@@ -6627,6 +6627,10 @@ void OnPlayerOpenedVendor(Player* player, Creature* vendor)
 {
     if (!player || !vendor || !player->GetSession() || !sBotMgr->InventorySellOnLeaderVendor())
         return;
+    // BotMaintenance::OnPlayerOpenedNpc sells for the same visit and reports each item; a sweep here first
+    // would sell greys and old gear unreported and ignore the economy's auction plan.
+    if (BotMaintenance::CleanupEnabled())
+        return;
     if (BotMgr::IsBotAccountId(player->GetSession()->GetAccountId()))
         return;
     if (!vendor->IsAlive() || !vendor->IsVendor())

@@ -1300,10 +1300,10 @@ namespace
 
     // CoaBots.Economy.ListFromAnywhere: a bot collects its auction mail and lists its auction lines at its own side's
     // auction house from wherever it is, the way a player's mailbox and a quick trip would. Vendor lines wait for a trip.
-    bool ListFromAnywhere(Player* bot)
+    uint32 ListFromAnywhere(Player* bot)
     {
         if (!g_settings.listFromAnywhere || !BotEconomy::IsLive() || g_trips.count(bot->GetGUID()))
-            return false;
+            return 0;
         uint32 listingsLeft = ListingsLeft(bot);
         uint64 const collected = CollectAuctionMail(bot);
         TopUpGuildStock(bot);
@@ -1323,7 +1323,7 @@ namespace
         g_listedFromAnywhere += listed;
         if (listed || collected || bot->m_mailsUpdated)
             bot->SaveToDB(false, false);
-        return listed > 0;
+        return listed;
     }
 
     void SellInTown(Player* bot, uint32 auctioneerFaction, bool vendorOnly)
@@ -1401,6 +1401,16 @@ namespace BotEconomy
     void ProcessGoldOrders();
     void BalanceStock();
     void EndStockRun(ObjectGuid bot);
+
+    uint32 ListAuctionFinds(Player* bot)
+    {
+        if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->IsInCombat())
+            return 0;
+        uint32 const listed = ListFromAnywhere(bot);
+        if (listed)
+            g_lastPlan.erase(bot->GetGUID());
+        return listed;
+    }
 
     std::vector<Line> PlanSale(Player* bot)
     {

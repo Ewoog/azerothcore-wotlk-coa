@@ -62,6 +62,11 @@ namespace BotEconomy
     // Everything in the bot's bags that would be sold (Keep lines are left out). Read-only.
     std::vector<Line> PlanSale(Player* bot);
 
+    // Lists the bot's auction lines from wherever it is (CoaBots.Economy.ListFromAnywhere, live economy only) and
+    // collects its auction mail. Grouped bots are skipped by the regular scan, so a vendor visit with the commander
+    // calls this. Returns the auctions created.
+    uint32 ListAuctionFinds(Player* bot);
+
     // Called every world tick with the online bots: plans, a few bots at a time, and journals.
     void Update(uint32 diff, std::vector<WorldSession*> const& sessions);
 

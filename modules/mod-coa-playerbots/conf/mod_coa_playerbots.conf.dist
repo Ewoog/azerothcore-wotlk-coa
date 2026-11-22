@@ -296,8 +296,15 @@ CoaBots.Trade.Enable = 1
 #
 #    CoaBots.Inventory.SellOnLeaderVendor
 #        Description: When a real player in the group opens a vendor (or gossip on a vendor NPC),
-#                     grouped bots within 20 yards of that vendor sell their junk. 0 turns the hook
-#                     off; SellWhenNearVendor still applies on the regular 10-second scan.
+#                     grouped bots within CoaBots.Maintenance.ShareRange of that player clear their
+#                     bags: grey junk, outgrown or unusable gear, leftover quest items, white vendor
+#                     trash, known recipes and surplus trade goods and consumables are sold, and each
+#                     item sold is listed in chat. Quest items still needed, possible upgrades,
+#                     crafting-order and gather-order items and protected items stay. With the live
+#                     economy (CoaBots.Economy.DryRun = 0) what the economy plans for the auction
+#                     house is listed there first (CoaBots.Economy.ListFromAnywhere) instead of
+#                     sold. 0 turns the hook off; SellWhenNearVendor still applies on the regular
+#                     10-second scan.
 #        Default:     1
 #
 #    CoaBots.Inventory.KeepQuality
