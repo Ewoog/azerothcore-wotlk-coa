@@ -870,8 +870,8 @@ namespace QuestInteraction
             if (!sBotMgr->FindBotPlayer(bot->GetGUID().GetCounter()))
                 continue;
 
-            bool const near = bot->GetMap() == player->GetMap() && bot->IsWithinDistInMap(player, COMPANION_SHARE_RANGE);
-            switch (ShareResult const result = ShareQuest(player, bot, quest, near ? source : nullptr))
+            bool const inRange = bot->GetMap() == player->GetMap() && bot->IsWithinDistInMap(player, COMPANION_SHARE_RANGE);
+            switch (ShareResult const result = ShareQuest(player, bot, quest, inRange ? source : nullptr))
             {
                 case ShareResult::Added:
                     took.push_back(bot->GetName());
