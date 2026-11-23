@@ -11,6 +11,7 @@
 !/modules/mod-cfbg/
 !/modules/mod-coa-playerbots/
 !/modules/mod-ah-bot/
+!/modules/mod-ale/
 !/modules/*.md
 !/modules/*.sh
 !/modules/CMakeLists.txt
