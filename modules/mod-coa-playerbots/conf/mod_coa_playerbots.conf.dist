@@ -463,7 +463,10 @@ CoaBots.Maintenance.AmmoFill = 1000
 #                     prerequisites, reputation, skill). Other bots still need to be eligible. A
 #                     quest the alt already turned in, a full quest log or no bag space for the
 #                     quest's starting item still stops it. The AltBots "Share quests" button uses
-#                     the same rule for the quests already in your log. 0 turns this off.
+#                     the same rule for the quests already in your log. Your alts get the quest
+#                     at any distance (other bots need to be within 40 yards), and chat lists
+#                     which alts took it, which already had it and why any could not. 0 turns
+#                     this off.
 #        Default:     1
 #
 #    CoaBots.Quest.ShareObjectLoot
