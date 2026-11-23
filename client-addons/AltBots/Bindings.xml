@@ -20,6 +20,9 @@
   <Binding name="ALTBOTS_PULL">
     AltBots_Order("pull")
   </Binding>
+  <Binding name="ALTBOTS_COLLECT">
+    AltBots_Order("collect")
+  </Binding>
   <Binding name="ALTBOTS_SHARE">
     AltBots_Share()
   </Binding>

@@ -81,6 +81,7 @@
 #include "DatabaseEnv.h"
 #include "DBCStructure.h"
 #include "GameObject.h"
+#include "GameObjectAI.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
 #include "Group.h"

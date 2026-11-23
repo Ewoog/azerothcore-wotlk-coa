@@ -3,8 +3,11 @@
 -- removed by a wipe disappear and new ones show up without a login on each. Then
 -- your main can spawn them as CoA Companions bots and invite them.
 -- Alts tab: spawn, quest solo, invite or despawn, with a name/class filter.
--- Commands tab: follow, stay, attack, stop attack, pull, farm and inventory (clean bags)
--- orders for one alt or every alt in your group, and live health, power and range cards.
+-- Commands tab: follow, stay, attack, stop attack, pull, farm, collect (open the nearest
+-- worldforged pickup or chest) and inventory (clean bags) orders for one alt or every alt in
+-- your group, and live health, power and range cards. Materials: farm a material (a gather
+-- order delivered by mail or to the guild bank), or mail/bank it now.
+-- Party tab bags: left-click an item to trade it to you, mail it, bank it or farm more of it.
 -- Quick bar and key bindings (Bindings.xml): the same orders for every grouped alt.
 -- Quests tab: each bot's quest log, an All bots view that shows who is missing which
 -- quest, a filter, and Share quests (SHAREQUESTS) for your own alts.
@@ -57,6 +60,30 @@ local RESULT_TEXT = {
     level = "too high level",
 }
 
+local ORDER_TEXT = {
+    collect = {
+        started = "is going for %s.", noobject = "found nothing it can open near you.",
+        combat = "is in combat.", dead = "is dead.", toofar = "is not near you.",
+        ok = "collected it.", failed = "could not collect it.",
+    },
+    trade = {
+        coming = "is coming to trade.", none = "does not carry that item.", bound = "cannot trade that item (soulbound).",
+        busy = "is already trading.", combat = "is in combat.", dead = "is dead.", toofar = "is too far away to trade.",
+        open = "opened a trade. Accept it to take the item.", ok = "handed the item over.",
+        cancelled = "the trade was cancelled.", timeout = "closed the trade (no accept).", failed = "could not trade.",
+    },
+    mail = { ok = "mailed %s item(s) to you.", none = "does not carry that item.", bound = "cannot mail that item (soulbound).",
+        tool = "keeps its profession tools." },
+    bank = { ok = "put %s item(s) in the guild bank.", none = "does not carry that item.", bound = "cannot bank that item (soulbound).",
+        tool = "keeps its profession tools.", noguild = "is not in a guild.", bankfull = "found no room in the guild bank." },
+    gather = { placed = "left the group to farm it. Mail or bank delivery as you picked; see chat for progress.",
+        noguild = "is not in a guild, so it cannot bank. Pick Mail instead.", failed = "could not take the order (see chat)." },
+    gatherstop = { ok = "stopped its farm order.", denied = "is not farming for you.", none = "has no farm order." },
+}
+
+local ORDER_ASYNC = { ok = true, failed = true, open = true, cancelled = true, timeout = true }
+local gatherCatalog, gatherCatalogSeen, gatherCatalogOrder = {}, {}, {}
+
 local function Print(msg)
     DEFAULT_CHAT_FRAME:AddMessage("|cFF33CCFFAltBots:|r " .. msg)
 end
@@ -74,7 +101,7 @@ end
 local DB_VERSION = 2
 local SETTING_KEYS = {
     version = true, realms = true, farmRadius = true, minimapAngle = true, minimapHidden = true, tab = true,
-    winPos = true, quickBarPos = true, quickBar = true, scale = true,
+    winPos = true, quickBarPos = true, quickBar = true, scale = true, matDeliver = true, matCount = true,
 }
 local SYNC_DELAY, SYNC_TIMEOUT, SYNC_REFRESH = 3, 8, 60
 
@@ -127,6 +154,13 @@ local function Alts() return RealmData().chars end
 local function AltGuid(name)
     local info = name and Alts()[name]
     return info and info.guid
+end
+
+local function AltNameByGuid(low)
+    for name, info in pairs(Alts()) do
+        if info.guid == low then return name end
+    end
+    return nil
 end
 
 local function StaleCount()
@@ -411,6 +445,36 @@ local function HandleIncoming(body)
         ApplyAltSync(altSync.list)
         altSync.list = nil
         if OnAltsChanged then OnAltsChanged() end
+        return
+
+    elseif verb == "ORDER" and guid then
+        local kind, token, extra = parts[3], parts[4], parts[5]
+        local texts = ORDER_TEXT[kind] or {}
+        local who = AltNameByGuid(guid) or ("guid " .. guid)
+        local text = texts[token] or ((kind or "order") .. ": " .. tostring(token))
+        text = string.format(text, extra or "it")
+        local msg = who .. " " .. text
+        SetStatus(msg)
+        local serverSays = (kind == "collect" or kind == "trade") and ORDER_ASYNC[token]
+        if not serverSays and token ~= "started" and token ~= "coming" and token ~= "ok" and token ~= "placed" then Print(msg) end
+        if (kind == "mail" or kind == "bank" or kind == "trade") and token == "ok" and RequestGearAndBags then
+            RequestGearAndBags(guid, "Refreshing bags...")
+        end
+        return
+
+    elseif verb == "GCAT" then
+        local category, list = body:match("^GCAT:([^:]*):(.*)$")
+        if category then
+            gatherCatalog[category] = gatherCatalog[category] or {}
+            if not gatherCatalogSeen[category] then
+                gatherCatalogSeen[category] = true
+                table.insert(gatherCatalogOrder, category)
+            end
+            for chunk in string.gmatch(list or "", "[^|]+") do
+                local id, name = chunk:match("^(%d+),(.*)$")
+                if id then table.insert(gatherCatalog[category], { id = tonumber(id), name = name }) end
+            end
+        end
         return
 
     elseif verb == "ROLES" and guid then
@@ -701,6 +765,8 @@ local function OrderTargets(choice)
     return out
 end
 
+local COLLECT_RADIUS = 50
+
 local function ClampRadius(r)
     r = tonumber(r) or 40
     if r < 10 then r = 10 elseif r > 100 then r = 100 end
@@ -752,19 +818,75 @@ local function Order(verb, choice, radius)
             local r = ClampRadius(radius)
             AltBotsDB.farmRadius = r
             Queue({ gm = ".botcmd farm " .. low .. " " .. r }); table.insert(sent, n)
+        elseif verb == "collect" then
+            if grouped[n] then
+                Queue({ addon = "COLLECT:" .. low .. ":" .. COLLECT_RADIUS }); table.insert(sent, n)
+            else
+                Print(n .. " is not in your group, so it can't collect for you.")
+            end
         else
             Queue({ gm = ".botcmd " .. verb .. " " .. low }); table.insert(sent, n)
         end
     end
     if #sent > 0 then
         local labels = { follow = "follow", stay = "stay", attack = "attack nearest", stopattack = "stop attacking",
-            pull = "pull your target", farmstop = "stop farming", inventory = "clean bags" }
+            pull = "pull your target", farmstop = "stop farming", inventory = "clean bags",
+            collect = "collect the nearest pickup" }
         local what = labels[verb] or verb
         if verb == "farm" then what = "farm your target (" .. ClampRadius(radius) .. " yd)" end
         Print(table.concat(sent, ", ") .. ": " .. what .. ".")
         SetStatus(table.concat(sent, ", ") .. ": " .. what .. ".")
         if verb == "inventory" then ScheduleBagRefresh(sent) end
     end
+end
+
+local function ItemIdFrom(text)
+    if not text then return nil end
+    return tonumber(text:match("item:(%d+)") or text:match("^%s*(%d+)%s*$"))
+end
+
+local function ItemLabel(id)
+    local name = id and GetItemInfo(id)
+    return name or (id and ("item " .. id)) or "?"
+end
+
+local function MaterialDeliver()
+    return AltBotsDB.matDeliver == "bank" and "bank" or "mail"
+end
+
+-- Farm-material order for one alt: a gather order the bot travels for, delivered by mail or to
+-- its guild bank. The bot leaves your group while it works.
+local function FarmMaterial(choice, itemId, count)
+    if not itemId then Print("Pick a material first (catalog, item ID or shift-click an item link).") return end
+    if choice == ALL_GROUPED then
+        Print("Pick one alt in 'Send to' for a farm order. It leaves your group while it farms.")
+        SetStatus("Pick one alt for a farm order.")
+        return
+    end
+    local n = ResolveAlt(choice)
+    local low = n and AltGuid(n)
+    if not low then return end
+    count = math.max(1, math.min(1000, tonumber(count) or 20))
+    SendBot("GATHER", low, itemId .. ":" .. count .. ":" .. MaterialDeliver())
+    SetStatus(n .. ": farm " .. count .. "x " .. ItemLabel(itemId) .. " (" .. (MaterialDeliver() == "bank" and "guild bank" or "mail") .. ")...")
+end
+
+local function StopFarmMaterial(choice)
+    for _, n in ipairs(OrderTargets(choice)) do
+        SendBot("GATHERSTOP", AltGuid(n))
+    end
+end
+
+local function SendMaterial(choice, itemId, mode, count)
+    if not itemId then Print("Pick a material first (catalog, item ID or shift-click an item link).") return end
+    for _, n in ipairs(OrderTargets(choice)) do
+        SendBot("SENDITEM", AltGuid(n), itemId .. ":" .. mode .. ((count and count > 0) and (":" .. count) or ""))
+    end
+    SetStatus((mode == "bank" and "Banking " or "Mailing ") .. ItemLabel(itemId) .. "...")
+end
+
+local function TradeItemToMe(low, itemId, count)
+    SendBot("GIVEITEM", low, itemId .. ((count and count > 0) and (":" .. count) or ""))
 end
 
 local function Spawn(name)
@@ -1045,7 +1167,7 @@ end
 
 local function MakeActionTile(parent, action, onClick)
     local b = CreateFrame("Button", nil, parent)
-    b:SetWidth(78); b:SetHeight(58)
+    b:SetWidth(70); b:SetHeight(58)
     Skin(b, C.btn, C.border)
     AddHover(b, 0.07)
     b.icon = b:CreateTexture(nil, "ARTWORK")
@@ -1254,6 +1376,9 @@ local ORDER_ACTIONS = {
         tip = "Farm your current target within the farm radius." },
     { verb = "farmstop", icon = "Interface\\Icons\\Spell_Shadow_SacrificialShield", label = "Stop farm",
         tip = "Leave farm mode and return to follow." },
+    { verb = "collect", icon = "Interface\\Icons\\INV_Misc_Bag_CenarionHerbBag", label = "Collect",
+        tip = "Open the nearest worldforged pickup (or other chest) within 50 yards of you, take what is inside "
+            .. "and come back. Each alt picks one it has not looted yet." },
     { verb = "inventory", icon = "Interface\\Icons\\INV_Misc_Bag_10", label = "Clean bags",
         tip = "Sell greys and outgrown whites and greens. Works immediately, or when the bot is near a vendor." },
 }
@@ -1861,12 +1986,137 @@ EnsureWindow = function()
     for i, action in ipairs(ORDER_ACTIONS) do
         local verb = action.verb
         local b = MakeActionTile(cmd, action, function() RunOrder(verb, Choice(), Radius()) end)
-        b:SetPoint("TOPLEFT", (i - 1) * 84, -56)
+        b:SetPoint("TOPLEFT", (i - 1) * 74, -56)
         ui.cmdIcons[i] = b
     end
 
+    local matH, matR = SectionHeader(cmd, "Materials")
+    matH:SetPoint("TOPLEFT", 0, -128)
+    matR:SetPoint("LEFT", matH, "RIGHT", 8, 0)
+    matR:SetPoint("RIGHT", 0, 0)
+
+    ui.matBox = MakeEditBox(cmd, 170, 24)
+    ui.matBox:SetPoint("TOPLEFT", 0, -150)
+    ui.matBox.placeholder = ui.matBox:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
+    ui.matBox.placeholder:SetPoint("LEFT", 8, 0)
+    ui.matBox.placeholder:SetText("Item ID or shift-click a link")
+    TextColor(ui.matBox.placeholder, C.faint)
+    ui.matBox.onCommit = function(self)
+        local id = ItemIdFrom(self:GetText())
+        ui.matId = id
+        if id then self:SetText(ItemLabel(id)) end
+    end
+    ui.matBox:SetScript("OnEnter", function(self)
+        if ui.matId then ShowItemTip(self, ui.matId, "The material for Farm, Mail now and Bank now.")
+        else Tip(self, "Material", "Type an item ID, shift-click an item link while this box has focus, or use Catalog.") end
+    end)
+    ui.matBox:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    if ChatEdit_InsertLink then
+        hooksecurefunc("ChatEdit_InsertLink", function(link)
+            if ui.matBox and ui.matBox:HasFocus() and link then
+                ui.matBox:SetText(link)
+                ui.matBox:ClearFocus()
+            end
+        end)
+    end
+
+    local function SetMaterial(id)
+        ui.matId = id
+        ui.matBox:SetText(ItemLabel(id))
+        if ui.matBox.placeholder then ui.matBox.placeholder:Hide() end
+    end
+    ui.SetMaterial = SetMaterial
+
+    local catBtn = MakeTextBtn(cmd, 64, 24, "Catalog")
+    catBtn:SetPoint("LEFT", ui.matBox, "RIGHT", 6, 0)
+    HookTip(catBtn, "Gather catalog", "Herbs, ore, cloth, leather and other materials bots can gather or hunt for.")
+    local function ShowCategory(anchor, category, page)
+        local list = gatherCatalog[category] or {}
+        local per = 18
+        local first = (page - 1) * per + 1
+        local entries = {}
+        for i = first, math.min(#list, first + per - 1) do
+            local item = list[i]
+            table.insert(entries, { text = item.name, func = function() SetMaterial(item.id) end })
+        end
+        if #list > first + per - 1 then
+            table.insert(entries, { text = "|cff33ccffMore...|r", func = function() ShowCategory(anchor, category, page + 1) end })
+        end
+        if page > 1 then
+            table.insert(entries, { text = "|cff33ccffBack|r", func = function() ShowCategory(anchor, category, page - 1) end })
+        end
+        ShowPopup(anchor, entries)
+    end
+    catBtn:SetScript("OnClick", function(self)
+        if #gatherCatalogOrder == 0 then
+            Queue({ addon = "GETGATHERCATALOG:0" })
+            SetStatus("Loading the gather catalog. Click Catalog again in a moment.")
+            return
+        end
+        local entries = {}
+        for _, category in ipairs(gatherCatalogOrder) do
+            local c = category
+            table.insert(entries, { text = c .. " (" .. #(gatherCatalog[c] or {}) .. ")", func = function() ShowCategory(self, c, 1) end })
+        end
+        ShowPopup(self, entries)
+    end)
+
+    ui.matCount = MakeEditBox(cmd, 44, 24)
+    ui.matCount:SetPoint("LEFT", catBtn, "RIGHT", 6, 0)
+    ui.matCount:SetNumeric(true)
+    ui.matCount:SetMaxLetters(4)
+    ui.matCount:SetText(tostring(AltBotsDB.matCount or 20))
+    ui.matCount.onCommit = function(self)
+        local n = math.max(1, math.min(1000, tonumber(self:GetText()) or 20))
+        AltBotsDB.matCount = n
+        self:SetText(tostring(n))
+    end
+    HookTip(ui.matCount, "Count", "How many to farm (1-1000). Mail now and Bank now send every stack the alt carries.")
+
+    local deliverBtn = MakeTextBtn(cmd, 86, 24, "")
+    deliverBtn:SetPoint("LEFT", ui.matCount, "RIGHT", 6, 0)
+    local function ShowDeliver()
+        deliverBtn:SetText(MaterialDeliver() == "bank" and "Guild bank" or "Mail to me")
+    end
+    ShowDeliver()
+    deliverBtn:SetScript("OnClick", function()
+        AltBotsDB.matDeliver = MaterialDeliver() == "bank" and "mail" or "bank"
+        ShowDeliver()
+    end)
+    HookTip(deliverBtn, "Delivery", "Where a farm order sends what it gathers: your mailbox, or the alt's guild bank. Click to switch.")
+
+    local farmMatBtn = MakeTextBtn(cmd, 70, 24, "Farm it")
+    farmMatBtn:SetPoint("LEFT", deliverBtn, "RIGHT", 6, 0)
+    HookTip(farmMatBtn, "Farm material", "Send the alt picked in 'Send to' to gather or hunt this material anywhere in the world. "
+        .. "It leaves your group, delivers by the chosen way and reports progress in chat.")
+    farmMatBtn:SetScript("OnClick", function()
+        ui.matBox:ClearFocus(); ui.matCount:ClearFocus()
+        FarmMaterial(Choice(), ui.matId, ui.matCount:GetText())
+    end)
+
+    local stopMatBtn = MakeTextBtn(cmd, 46, 24, "Stop")
+    stopMatBtn:SetPoint("LEFT", farmMatBtn, "RIGHT", 6, 0)
+    HookTip(stopMatBtn, "Stop farm order", "Cancel the material farm order. Invite the alt again from the Alts tab afterwards.")
+    stopMatBtn:SetScript("OnClick", function() StopFarmMaterial(Choice()) end)
+
+    local mailNowBtn = MakeTextBtn(cmd, 64, 24, "Mail now")
+    mailNowBtn:SetPoint("LEFT", stopMatBtn, "RIGHT", 6, 0)
+    HookTip(mailNowBtn, "Mail now", "Mail every stack of this material the alt carries to you.")
+    mailNowBtn:SetScript("OnClick", function()
+        ui.matBox:ClearFocus()
+        SendMaterial(Choice(), ui.matId, "mail")
+    end)
+
+    local bankNowBtn = MakeTextBtn(cmd, 64, 24, "Bank now")
+    bankNowBtn:SetPoint("LEFT", mailNowBtn, "RIGHT", 6, 0)
+    HookTip(bankNowBtn, "Bank now", "Put every stack of this material the alt carries in its guild bank.")
+    bankNowBtn:SetScript("OnClick", function()
+        ui.matBox:ClearFocus()
+        SendMaterial(Choice(), ui.matId, "bank")
+    end)
+
     local listH, listR = SectionHeader(cmd, "Grouped alts")
-    listH:SetPoint("TOPLEFT", 0, -128)
+    listH:SetPoint("TOPLEFT", 0, -186)
     listR:SetPoint("LEFT", listH, "RIGHT", 8, 0)
     listR:SetPoint("RIGHT", 0, 0)
     ui.cmdEmpty = EmptyText(cmd, "AltBotsFontBody")
@@ -1874,7 +2124,7 @@ EnsureWindow = function()
     TextColor(ui.cmdEmpty, C.muted)
     ui.cmdEmpty:SetText("None of your saved alts are in the group yet.\nSpawn and invite them from the Alts tab.")
     local csf, cc = MakeScroll("AltBotsCmdScroll", cmd, ROW_W)
-    csf:SetPoint("TOPLEFT", 0, -146)
+    csf:SetPoint("TOPLEFT", 0, -204)
     csf:SetPoint("BOTTOMRIGHT", -18, 0)
     ui.cmdChild = cc
 
@@ -2778,7 +3028,8 @@ RefreshPartyBags = function()
         local bag, slot = pos.bag, pos.slot
         b:SetScript("OnEnter", function(self)
             if entry and entry > 0 then
-                local extra = "Right-click to equip. That slot will stay locked so the bot will not swap it back out."
+                local extra = "Left-click to trade, mail, bank or farm more of it.\n"
+                    .. "Right-click to equip. That slot will stay locked so the bot will not swap it back out."
                 local tooHigh, need = ItemTooHighLevel(entry)
                 if tooHigh then
                     extra = "Requires level " .. need .. ". The bot cannot equip this yet.\n" .. extra
@@ -2789,6 +3040,43 @@ RefreshPartyBags = function()
             end
         end)
         b:SetScript("OnClick", function(self, button)
+            if button == "LeftButton" and entry and entry > 0 then
+                local _, link = GetItemInfo(entry)
+                if IsModifiedClick() and link then
+                    HandleModifiedItemClick(link)
+                    return
+                end
+                local itemId, botGuid, botName = entry, guid, selectedPartyName or "bot"
+                local label = ItemLabel(itemId)
+                ShowPopup(self, {
+                    { text = "Trade to me", func = function()
+                        TradeItemToMe(botGuid, itemId, 0)
+                        SetStatus(botName .. ": trading " .. label .. " to you...")
+                    end },
+                    { text = "Mail to me", func = function()
+                        SendBot("SENDITEM", botGuid, itemId .. ":mail")
+                        SetStatus(botName .. ": mailing " .. label .. "...")
+                    end },
+                    { text = "Put in guild bank", func = function()
+                        SendBot("SENDITEM", botGuid, itemId .. ":bank")
+                        SetStatus(botName .. ": banking " .. label .. "...")
+                    end },
+                    { text = "Farm more of this", func = function()
+                        local alt = AltNameByGuid(botGuid)
+                        if not alt then Print("Farm orders work for your own alts.") return end
+                        ShowTab("commands")
+                        ui.orderChoice = alt
+                        ui.whoBtn:SetText(alt)
+                        if ui.SetMaterial then ui.SetMaterial(itemId) end
+                        RefreshCommands()
+                        SetStatus("Set the count and delivery, then press Farm it.")
+                    end },
+                    { text = "Equip", func = function()
+                        SendBot("EQUIP", botGuid, tostring(bag) .. ":" .. tostring(slot))
+                    end },
+                })
+                return
+            end
             if button == "RightButton" and entry and entry > 0 then
                 local tooHigh = ItemTooHighLevel(entry)
                 if tooHigh then
@@ -3711,7 +3999,7 @@ end
 
 local USAGE = "/alt  open window | /alt invite|solo|despawn <name> | /alt list | /alt sync | /alt prune | /alt share"
     .. " | /alt add <name> <guid> | /alt remove <name> | /alt clear"
-    .. " | /alt follow|stay|attack|stopattack|pull <name|all> | /alt farm <name|all> [radius] | /alt farmstop <name|all>"
+    .. " | /alt follow|stay|attack|stopattack|pull|collect <name|all> | /alt farm <name|all> [radius] | /alt farmstop <name|all>"
     .. " | /alt inventory <name|all> | /alt bar | /alt scale <0.6-1.5> | /alt reset | /alt minimap"
 
 -- Key bindings (Bindings.xml) call these.
@@ -3723,6 +4011,7 @@ BINDING_NAME_ALTBOTS_STAY = "Grouped alts: stay"
 BINDING_NAME_ALTBOTS_ATTACK = "Grouped alts: attack"
 BINDING_NAME_ALTBOTS_STOPATTACK = "Grouped alts: stop attack"
 BINDING_NAME_ALTBOTS_PULL = "Grouped alts: pull your target"
+BINDING_NAME_ALTBOTS_COLLECT = "Grouped alts: collect the nearest pickup"
 BINDING_NAME_ALTBOTS_SHARE = "Share your quests with grouped alts"
 
 function AltBots_Toggle() ToggleWindow() end
@@ -3805,7 +4094,7 @@ SlashCmdList["ALTBOTS"] = function(msg)
         if not n then Print("Usage: /alt farm <name|all> [radius]") return end
         if r == "" then r = AltBotsDB.farmRadius or 40 end
         Order("farm", OrderArg(n), r)
-    elseif cmd == "farmstop" or cmd == "follow" or cmd == "stay" or cmd == "attack" or cmd == "stopattack" or cmd == "pull" or cmd == "inventory" then
+    elseif cmd == "farmstop" or cmd == "follow" or cmd == "stay" or cmd == "attack" or cmd == "stopattack" or cmd == "pull" or cmd == "inventory" or cmd == "collect" then
         local n = arg:match("^(%S+)$")
         if not n then Print("Usage: /alt " .. cmd .. " <name|all>") return end
         Order(cmd, OrderArg(n))
