@@ -115,6 +115,19 @@ char const* GearNameBySubclass(GearTypeEntry const* table, std::size_t count, ui
 // player must actually be grouped with it -- never someone else's bot. Both checks fail
 // closed (return nullptr) rather than reporting why, matching the doc's "silently drop"
 // policy -- an addon bug or a stale/renamed bot shouldn't be able to flood chat with errors.
+// AltBots orders that outlive the group (a gather order takes the bot out of it): the sender's
+// own alt, or any bot grouped with the sender.
+Player* ResolveOwnedOrGroupedBot(Player* commander, ObjectGuid::LowType botGuidLow)
+{
+    Player* bot = sBotMgr->FindBotPlayer(botGuidLow);
+    if (!bot || !bot->GetSession() || !commander->GetSession())
+        return nullptr;
+    if (bot->GetSession()->GetAccountId() == commander->GetSession()->GetAccountId())
+        return bot;
+    Group* botGroup = bot->GetGroup();
+    return botGroup && botGroup == commander->GetGroup() ? bot : nullptr;
+}
+
 Player* ResolveAuthorizedBot(Player* commander, ObjectGuid::LowType botGuidLow)
 {
     Player* bot = sBotMgr->FindBotPlayer(botGuidLow);
@@ -1008,6 +1021,56 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
         return;
     }
 
+    // AltBots orders:
+    //   GATHER:<botGuidLow>:<itemEntry>:<count>:<mail|bank> -> ORDER:<guid>:gather:<placed|noguild|failed>
+    //   GATHERSTOP:<botGuidLow>                          -> ORDER:<guid>:gatherstop:<ok|denied|none>
+    //   SENDITEM:<botGuidLow>:<itemEntry>:<mail|bank>[:<count>] -> ORDER:<guid>:<mail|bank>:<token>:<moved>
+    // A placed gather order takes the bot out of the sender's group so it can travel to the source.
+    if ((verb == "GATHER" && parts.size() >= 5) || verb == "GATHERSTOP" || (verb == "SENDITEM" && parts.size() >= 4))
+    {
+        ObjectGuid::LowType const low = std::strtoul(parts[1].c_str(), nullptr, 10);
+        Player* bot = low ? ResolveOwnedOrGroupedBot(commander, low) : nullptr;
+        if (!bot)
+            return;
+        std::string const prefix = "ORDER:" + std::to_string(low) + ":";
+        if (verb == "GATHERSTOP")
+        {
+            std::string const result = sBotMgr->CancelGatherOrder(commander, low);
+            SendCoaBotReply(commander, prefix + "gatherstop:" + result);
+            return;
+        }
+        uint32 const itemEntry = std::strtoul(parts[2].c_str(), nullptr, 10);
+        if (verb == "SENDITEM")
+        {
+            bool const bank = parts[3] == "bank";
+            uint32 const count = parts.size() >= 5 ? std::strtoul(parts[4].c_str(), nullptr, 10) : 0;
+            uint32 moved = 0;
+            std::string const result = sBotMgr->SendItemToCommander(bot, commander, itemEntry, count, bank, moved);
+            LOG_INFO("module.coa-playerbots", "BotAddonChat: '{}' -> SENDITEM bot '{}' item {} x{} {} = {} ({} moved).",
+                commander->GetName(), bot->GetName(), itemEntry, count, bank ? "bank" : "mail", result, moved);
+            SendCoaBotReply(commander, prefix + (bank ? "bank:" : "mail:") + result + ":" + std::to_string(moved));
+            return;
+        }
+        uint32 const count = std::max<uint32>(1, std::strtoul(parts[3].c_str(), nullptr, 10));
+        bool const mail = parts[4] != "bank";
+        if (!mail && !bot->GetGuild())
+        {
+            SendCoaBotReply(commander, prefix + "gather:noguild");
+            return;
+        }
+        LOG_INFO("module.coa-playerbots", "BotAddonChat: '{}' -> GATHER bot '{}' item {} x{} by {}.", commander->GetName(),
+            bot->GetName(), itemEntry, count, mail ? "mail" : "bank");
+        sBotMgr->GuildGather(low, itemEntry, count, nullptr, commander->GetGUID().GetCounter(), mail);
+        uint32 ordered = 0;
+        bool const placed = sBotMgr->GetGatherOrderItem(bot->GetGUID(), &ordered) && ordered == itemEntry;
+        if (placed)
+            if (Group* group = bot->GetGroup())
+                if (group == commander->GetGroup())
+                    group->RemoveMember(bot->GetGUID());
+        SendCoaBotReply(commander, prefix + "gather:" + (placed ? "placed" : "failed"));
+        return;
+    }
+
     if (verb == "TPTOBOT" && parts.size() >= 2)
     {
         ObjectGuid::LowType targetGuid = std::strtoul(parts[1].c_str(), nullptr, 10);
@@ -1068,6 +1131,28 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
         float radius = 0.0f;
         BotAI::GetFarm(bot->GetGUID(), entry, radius, mapId);
         SendCoaBotReply(commander, "FARM:" + std::to_string(botGuidLow) + ":" + std::to_string(entry) + ":" + std::to_string(uint32(radius)));
+    }
+    else if (verb == "COLLECT")
+    {
+        // COLLECT:<botGuidLow>[:<radius>] -- open the nearest worldforged pickup (else chest) near
+        // the sender. ORDER:<guid>:collect:<started|noobject|combat|dead|toofar>, then ok|failed.
+        float radius = parts.size() >= 3 ? float(std::strtod(parts[2].c_str(), nullptr)) : 40.0f;
+        if (radius <= 0.0f)
+            radius = 40.0f;
+        std::string objectName;
+        BotAI::CollectStart const start = BotAI::StartCollect(bot, commander, radius, &objectName);
+        static char const* const TOKENS[] = { "started", "noobject", "combat", "dead", "toofar" };
+        SendCoaBotReply(commander, "ORDER:" + std::to_string(botGuidLow) + ":collect:" + TOKENS[uint8(start)] +
+            (objectName.empty() ? "" : ":" + SanitizeField(objectName)));
+    }
+    else if (verb == "GIVEITEM" && parts.size() >= 3)
+    {
+        // GIVEITEM:<botGuidLow>:<itemEntry>[:<count>] -- trade it to the sender.
+        // ORDER:<guid>:trade:<ok|none|bound|busy|combat|dead|toofar>, later open, ok, cancelled, timeout or failed.
+        uint32 const itemEntry = std::strtoul(parts[2].c_str(), nullptr, 10);
+        uint32 const count = parts.size() >= 4 ? std::strtoul(parts[3].c_str(), nullptr, 10) : 0;
+        std::string const result = sBotMgr->OfferTrade(bot, commander, itemEntry, count);
+        SendCoaBotReply(commander, "ORDER:" + std::to_string(botGuidLow) + ":trade:" + (result == "ok" ? "coming" : result));
     }
     else if (verb == "FARMSTOP")
     {

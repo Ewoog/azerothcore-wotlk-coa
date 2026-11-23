@@ -99,6 +99,7 @@
 #include "BotZoneProgression.h"
 #include "BotSpawnRandom.h"
 #include "WorldBrain.h"
+#include "QuestKnowledgeBase.h"
 #include "WorldParties.h"
 #include "encounters/WorldEncounterDirector.h"
 #include "GameTime.h"
@@ -238,6 +239,15 @@ struct BotAIState
     time_t farmLoginTime = 0;
     float farmAnchorX = 0.0f, farmAnchorY = 0.0f, farmAnchorZ = 0.0f;
     uint32 farmNextScanAtMs = 0;
+
+    // Collect order (BotAI::StartCollect): one chest-type object near the commander to open and
+    // empty, then the bot goes back to what it was doing. Cleared when done, on timeout, or by
+    // Follow/Stay/StopAttack.
+    ObjectGuid collectTargetGuid;
+    ObjectGuid collectCommanderGuid;
+    uint32 collectDeadlineMs = 0;
+    uint32 collectWaitUntilMs = 0;
+    bool collectOpening = false;
 
     // Bit i set means EQUIPMENT_SLOT i was locked by a commander EQUIP/UNEQUIP and
     // TryUpgradeGearOnce must leave it alone. Cleared by Forget (despawn / bot relog)
@@ -4916,6 +4926,180 @@ void UpdateIdleWatchdog(Player* bot, BotAIState& state)
 // A Stay or Follow is an order for the group the bot was in. Nothing used to clear it when the bot
 // left that group, and an ungrouped bot on Stay never runs its own life again -- it stood where it
 // was told to until the next restart.
+// Collect order (BotAI::StartCollect): walk to one chest-type object, open it the way a client
+// does (the lock's Opening spell, or a plain use when it has none), take everything and close
+// the loot window so the object resets for the next character.
+constexpr uint32 COLLECT_TIMEOUT_MS = 45000;
+constexpr float COLLECT_MIN_RADIUS = 5.0f;
+constexpr float COLLECT_MAX_RADIUS = 80.0f;
+
+bool IsWorldforgedPickup(GameObject const* go)
+{
+    static uint32 const scriptId = sObjectMgr->GetScriptId("worldforged_pickup");
+    return scriptId && go->GetScriptId() == scriptId;
+}
+
+bool HasProfessionOrKeyLock(GameObjectTemplate const* info)
+{
+    LockEntry const* lock = sLockStore.LookupEntry(info->GetLockId());
+    if (!lock)
+        return false;
+    for (uint8 i = 0; i < MAX_LOCK_CASE; ++i)
+    {
+        if (lock->Type[i] == LOCK_KEY_ITEM && lock->Index[i])
+            return true;
+        if (lock->Type[i] == LOCK_KEY_SKILL && (lock->Index[i] == LOCKTYPE_HERBALISM || lock->Index[i] == LOCKTYPE_MINING ||
+                lock->Index[i] == LOCKTYPE_PICKLOCK || lock->Index[i] == LOCKTYPE_FISHING))
+            return true;
+    }
+    return false;
+}
+
+// A pickup or chest this bot may open right now: spawned, closed, not spent for this bot (the
+// object's own AI hides spent worldforged pickups per viewer), not a gathering node and not a
+// quest-only container. Worldforged pickups win over other chests; the nearest wins otherwise.
+bool IsCollectableFor(Player const* bot, GameObject* go)
+{
+    if (!go->isSpawned() || go->GetGoType() != GAMEOBJECT_TYPE_CHEST || go->getLootState() != GO_READY)
+        return false;
+    GameObjectTemplate const* info = go->GetGOInfo();
+    if (!info || go->HasGameObjectFlag(GO_FLAG_NOT_SELECTABLE))
+        return false;
+    if (GameObjectAI* ai = go->AI())
+    {
+        uint16 dynFlags = 0;
+        uint32 goFlags = 0;
+        ai->BuildClientFlags(bot, dynFlags, goFlags);
+        if (goFlags & (GO_FLAG_NOT_SELECTABLE | GO_FLAG_LOCKED))
+            return false;
+    }
+    if (IsWorldforgedPickup(go))
+        return true;
+    if (go->HasGameObjectFlag(GO_FLAG_INTERACT_COND) || HasProfessionOrKeyLock(info) || BotAI::IsQuestOnlyGameObjectLoot(info->GetLootId()))
+        return false;
+    return !info->GetLockId() || QuestKB::OpeningSpellFor(info);
+}
+
+class CollectableObjectCheck
+{
+public:
+    CollectableObjectCheck(Player const* bot, WorldObject const* center, float range)
+        : _bot(bot), _center(center), _range(range) { }
+
+    bool operator()(GameObject* go)
+    {
+        if (!_center->IsWithinDistInMap(go, _range) || !IsCollectableFor(_bot, go))
+            return false;
+        bool const pickup = IsWorldforgedPickup(go);
+        if (_foundPickup && !pickup)
+            return false;
+        if (pickup && !_foundPickup)
+            _range = _center->GetDistance(go) + 0.01f;
+        _foundPickup = _foundPickup || pickup;
+        _range = std::min(_range, _center->GetDistance(go) + 0.01f);
+        return true;
+    }
+
+private:
+    Player const* _bot;
+    WorldObject const* _center;
+    float _range;
+    bool _foundPickup = false;
+};
+
+void ClearCollectState(Player* bot, BotAIState& state)
+{
+    state.collectTargetGuid = ObjectGuid::Empty;
+    state.collectCommanderGuid = ObjectGuid::Empty;
+    state.collectDeadlineMs = 0;
+    state.collectWaitUntilMs = 0;
+    state.collectOpening = false;
+    if (bot)
+        BotMovement::ForceReleaseOwner(bot, MoveOwner::Loot);
+}
+
+void TellCollectResult(Player* bot, BotAIState const& state, std::string const& token, std::string const& text)
+{
+    Player* commander = ObjectAccessor::FindPlayer(state.collectCommanderGuid);
+    if (!commander || !commander->GetSession())
+        return;
+    ChatHandler(commander->GetSession()).PSendSysMessage("|cff33ccffAltBots:|r {} {}", bot->GetName(), text);
+    CoaBotSendAddonReply(commander, "ORDER:" + std::to_string(bot->GetGUID().GetCounter()) + ":collect:" + token);
+}
+
+// Runs before farm mode in the idle branch; true while the collect order owns the bot.
+bool TryCollect(Player* bot, BotAIState& state)
+{
+    if (state.collectTargetGuid.IsEmpty())
+        return false;
+
+    uint32 const now = getMSTime();
+    GameObject* go = ObjectAccessor::GetGameObject(*bot, state.collectTargetGuid);
+    if (!go || go->GetMap() != bot->GetMap() || int32(now - state.collectDeadlineMs) >= 0)
+    {
+        TellCollectResult(bot, state, "failed", go ? "could not reach it in time." : "lost sight of the object.");
+        ClearCollectState(bot, state);
+        return false;
+    }
+
+    WorldBrain::Suspend(bot, SuspendReason::ManualCommand);
+    if (state.collectWaitUntilMs && int32(now - state.collectWaitUntilMs) < 0)
+        return true;
+    if (bot->IsNonMeleeSpellCast(false))
+        return true;
+
+    if (state.collectOpening)
+    {
+        state.collectOpening = false;
+        if (bot->GetLootGUID() != go->GetGUID())
+        {
+            TellCollectResult(bot, state, "failed", Acore::StringFormat("could not open {}.", go->GetName()));
+            ClearCollectState(bot, state);
+            return false;
+        }
+        BotAI::TakeAllLoot(bot, go->loot);
+        WorldPacket releasePacket;
+        releasePacket << go->GetGUID();
+        bot->GetSession()->HandleLootReleaseOpcode(releasePacket);
+        TellCollectResult(bot, state, "ok", Acore::StringFormat("collected {}.", go->GetName()));
+        ClearCollectState(bot, state);
+        return false;
+    }
+
+    if (go->getLootState() != GO_READY)
+        return true;
+
+    uint32 const spellId = QuestKB::OpeningSpellFor(go->GetGOInfo());
+    SpellInfo const* spellInfo = spellId ? sSpellMgr->GetSpellInfo(spellId) : nullptr;
+    if (!go->IsAtInteractDistance(bot, spellInfo))
+    {
+        if (!MoveBotToPoint(bot, MoveOwner::Loot, go->GetPositionX(), go->GetPositionY(), go->GetPositionZ()) &&
+            BotMovement::CurrentOwner(bot) == MoveOwner::Travel)
+            ClearActiveFollow(bot);
+        return true;
+    }
+
+    BotMovement::ForceReleaseOwner(bot, MoveOwner::Loot);
+    if (bot->isMoving())
+    {
+        BotMovement::ForceStopOwner(bot, MoveOwner::Loot);
+        return true;
+    }
+
+    uint32 castMs = 0;
+    if (spellInfo && bot->CastSpell(go, spellId, false) == SPELL_CAST_OK)
+        castMs = spellInfo->CalcCastTime(bot);
+    else
+    {
+        WorldPacket packet(CMSG_GAMEOBJ_USE, 8);
+        packet << go->GetGUID();
+        bot->GetSession()->HandleGameObjectUseOpcode(packet);
+    }
+    state.collectOpening = true;
+    state.collectWaitUntilMs = now + castMs + 500;
+    return true;
+}
+
 void DropGroupOrdersOnLeave(Player* bot, BotAIState& state)
 {
     bool const grouped = bot->GetGroup() != nullptr;
@@ -5111,6 +5295,9 @@ void UpdateOffensive(Player* bot, uint32 diff, BotRole combatRole, BotRole profi
                 return;
 
             DropGroupOrdersOnLeave(bot, state);
+
+            if (TryCollect(bot, state))
+                return;
 
             // Farm mode outranks following the leader and the open-world layer below.
             if (TryFarm(bot, state))
@@ -6903,6 +7090,9 @@ void SetManualCommand(ObjectGuid botGuid, BotManualCommand command, ObjectGuid p
     state.manualCommand = command;
     state.pullTargetGuid = (command == BotManualCommand::Pull) ? pullTarget : ObjectGuid::Empty;
 
+    if (command == BotManualCommand::Follow || command == BotManualCommand::Stay)
+        ClearCollectState(ObjectAccessor::FindPlayer(botGuid), state);
+
     // Follow and Stay are explicit movement orders and end farm mode; a one-shot Pull does not.
     if ((command == BotManualCommand::Follow || command == BotManualCommand::Stay) && state.farmActive)
     {
@@ -6952,6 +7142,8 @@ void StopAttack(ObjectGuid botGuid)
 
     if (Player* bot = ObjectAccessor::FindPlayer(botGuid))
     {
+        if (!state.collectTargetGuid.IsEmpty())
+            ClearCollectState(bot, state);
         bot->AttackStop();
         if (wasFarming)
             BotMovement::ForceStopOwner(bot, MoveOwner::Grind);
@@ -7095,6 +7287,41 @@ bool StartFarm(Player* bot, uint32 creatureEntry, float radius)
     LOG_INFO("module.coa-playerbots", "BotAI: bot '{}' farms entry {} within {:.0f} yd of ({:.0f} {:.0f} {:.0f}) on map {}.",
         bot->GetName(), creatureEntry, state.farmRadius, state.farmAnchorX, state.farmAnchorY, state.farmAnchorZ, state.farmMapId);
     return true;
+}
+
+CollectStart StartCollect(Player* bot, Player* commander, float radius, std::string* objectName)
+{
+    if (!bot || !bot->IsInWorld() || !commander || commander->GetMap() != bot->GetMap())
+        return CollectStart::TooFar;
+    if (!bot->IsAlive())
+        return CollectStart::Dead;
+    if (bot->IsInCombat())
+        return CollectStart::Combat;
+
+    float const range = std::clamp(radius, COLLECT_MIN_RADIUS, COLLECT_MAX_RADIUS);
+    GameObject* target = nullptr;
+    CollectableObjectCheck check(bot, commander, range);
+    Acore::GameObjectLastSearcher<CollectableObjectCheck> searcher(commander, target, check);
+    Cell::VisitObjects(commander, searcher, range);
+    if (!target)
+        return CollectStart::NoObject;
+
+    ObjectGuid const botGuid = bot->GetGUID();
+    CoaBotPerf::MarkCommand(botGuid.GetRawValue());
+    CoaBotScheduling::Notify(botGuid);
+    BotAIState& state = states[botGuid];
+    state.collectTargetGuid = target->GetGUID();
+    state.collectCommanderGuid = commander->GetGUID();
+    state.collectDeadlineMs = getMSTime() + COLLECT_TIMEOUT_MS;
+    state.collectWaitUntilMs = 0;
+    state.collectOpening = false;
+    state.nextFollowCheckAtMs = 0;
+    ClearActiveFollow(bot);
+    if (objectName)
+        *objectName = target->GetName();
+    LOG_INFO("module.coa-playerbots", "BotAI: bot '{}' collects '{}' (entry {}) for '{}'.", bot->GetName(), target->GetName(),
+        target->GetEntry(), commander->GetName());
+    return CollectStart::Started;
 }
 
 void StopFarm(ObjectGuid botGuid)

@@ -194,6 +194,20 @@ namespace BotAI
     // despawn (Forget). Returns false when the bot or entry is unusable.
     bool StartFarm(Player* bot, uint32 creatureEntry, float radius);
     void StopFarm(ObjectGuid botGuid);
+
+    // Collect order (COABOT COLLECT): the bot walks to the nearest object it may still open within
+    // `radius` (5-80 yd) of the commander -- a worldforged pickup first, otherwise a plain chest --
+    // opens it, takes the loot and goes back to following. Ends when done, after 45 s, or on
+    // Follow/Stay/StopAttack. The commander gets an ORDER:<guid>:collect:<ok|failed> reply.
+    enum class CollectStart : uint8
+    {
+        Started,
+        NoObject,
+        Combat,
+        Dead,
+        TooFar
+    };
+    CollectStart StartCollect(Player* bot, Player* commander, float radius, std::string* objectName = nullptr);
     // True while the bot is farming; fills the farmed entry, radius and anchor map.
     bool GetFarm(ObjectGuid botGuid, uint32& creatureEntry, float& radius, uint32& mapId);
 

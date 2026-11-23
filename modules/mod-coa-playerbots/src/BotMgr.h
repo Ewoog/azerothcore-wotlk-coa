@@ -95,8 +95,10 @@ public:
     // Orders bot to gather itemEntry up to targetCount and deposit into guild bank.
     // requesterLowGuid: the player who asked (gets ORDERDONE/ORDERFAIL notices and may cancel
     // the order without being a guild officer). 0 == take it from handler's session, if any.
+    // mailToRequester: the bot needs no guild; what it gathers is mailed to the requester instead
+    // of banked (AltBots' "Farm material" order with mail delivery).
     void GuildGather(ObjectGuid::LowType charLowGuid, uint32 itemEntry, uint32 targetCount, ChatHandler* handler,
-        ObjectGuid::LowType requesterLowGuid = 0);
+        ObjectGuid::LowType requesterLowGuid = 0, bool mailToRequester = false);
 
     // Finds an online guild-mate bot of `requesterCharLowGuid` that knows a recipe spell
     // producing itemEntry (any learned spell with a SPELL_EFFECT_CREATE_ITEM effect targeting
@@ -117,6 +119,18 @@ public:
     // CraftOrder already has for _craftOrders). See docs/addon-protocol.md's GATHERORDER verb.
     void GatherOrder(ObjectGuid::LowType requesterCharLowGuid, uint32 itemEntry, uint32 count, ChatHandler* handler);
 
+    // AltBots orders (COABOT SENDITEM / GIVEITEM). Each returns a result token for the addon
+    // reply: ok, none (no such item), bound (soulbound), tool, noguild, bankfull, busy, combat,
+    // dead, toofar. count 0 means every stack the bot carries.
+    // SendItemToCommander mails the item to `commander` or deposits it in the bot's guild bank;
+    // `moved` gets how many items went.
+    std::string SendItemToCommander(Player* bot, Player* commander, uint32 itemEntry, uint32 count, bool toGuildBank,
+        uint32& moved);
+    // Opens a trade window from the bot to `commander` (who must be within trade range or
+    // reachable by the bot's follow), puts up to six stacks of the item in it and accepts once
+    // the commander accepts. Gives up after a minute.
+    std::string OfferTrade(Player* bot, Player* commander, uint32 itemEntry, uint32 count);
+
     struct GuildGatherOrder
     {
         uint32 itemEntry = 0;
@@ -132,6 +146,8 @@ public:
         // saved before the requester_guid column existed). Notified on completion/failure and
         // allowed to cancel it even without officer rank.
         ObjectGuid::LowType requesterLowGuid = 0;
+        // Deliver by mail to the requester instead of the guild bank (persisted as deliver_mail).
+        bool mailToRequester = false;
         // RetryGuildGatherLocation calls since the last deposit; GUILD_GATHER_MAX_STALLED_RETRIES
         // of them in a row gives the order up (ORDERFAIL). Not persisted -- a restart starts over.
         uint32 stalledRetries = 0;
@@ -719,7 +735,9 @@ private:
     void NotifyGatherOrderDone(Player* bot, GuildGatherOrder const& order, uint32 mailedCount = 0);
     // Mails up to `count` of itemEntry from the bot's bags to the requester (whole stacks, real
     // MailDraft, 12 stacks per mail). Returns how many items went out.
-    uint32 MailGatherItems(Player* bot, ObjectGuid::LowType requesterLowGuid, uint32 itemEntry, uint32 count);
+    uint32 MailGatherItems(Player* bot, ObjectGuid::LowType requesterLowGuid, uint32 itemEntry, uint32 count,
+        std::string const& body = {});
+    static std::string OrderMailBody(Player* bot);
     // Points the order at a new spot: walks there when it is close, teleports when it is on
     // another map or further than GATHER_ORDER_TELEPORT_BEYOND_YARDS (or `rush`).
     void SendBotToOrderSpot(Player* bot, GuildGatherOrder& order, bool rush);
@@ -753,6 +771,19 @@ private:
     uint32 _aiConfigAgeMs = 10000;
     // Trading with a player: how long each bot's open trade window has existed, and whether bots take part at all.
     std::unordered_map<ObjectGuid, uint32> _tradeAgeMs;
+    struct TradeOffer
+    {
+        ObjectGuid playerGuid;
+        uint32 itemEntry = 0;
+        uint32 count = 0;
+        uint32 ageMs = 0;
+        uint32 nextMoveMs = 0;
+        uint32 countBefore = 0;
+        bool initiated = false;
+        bool placed = false;
+    };
+    std::unordered_map<ObjectGuid, TradeOffer> _tradeOffers;
+    void UpdateTradeOffers(uint32 diff);
     bool _tradeEnabled = true;
     bool _autoLootInGroup = false;
     bool _lootNeedOnUpgrades = true;
