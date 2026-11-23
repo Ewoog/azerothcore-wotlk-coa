@@ -787,6 +787,7 @@ private:
     bool _tradeEnabled = true;
     bool _autoLootInGroup = false;
     bool _lootNeedOnUpgrades = true;
+    uint8 _lootNeedLevelsAhead = 2;
     bool _inventorySellWhenNearVendor = true;
     bool _inventorySellOnLeaderVendor = true;
     uint32 _inventoryKeepQuality = 3;
@@ -811,6 +812,7 @@ public:
     // already-running server without needing a restart.
     uint32 QueueAllBotsForAutoLogin(uint32 maxCountOverride = 0);
     bool AutoLootInGroup() const { return _autoLootInGroup; }
+    uint8 LootNeedLevelsAhead() const { return _lootNeedLevelsAhead; }
     bool InventorySellWhenNearVendor() const { return _inventorySellWhenNearVendor; }
     bool InventorySellOnLeaderVendor() const { return _inventorySellOnLeaderVendor; }
     uint32 InventoryKeepQuality() const { return _inventoryKeepQuality; }

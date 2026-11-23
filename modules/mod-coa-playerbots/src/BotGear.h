@@ -18,6 +18,11 @@ void SetProbeUnlock(Player* bot, bool unlocked);
 void LockTraining(Player* bot);
 bool Allowed(Player* bot, ItemTemplate const* item);
 bool AllowedAtLevel(uint8 level, ItemTemplate const* item);
+// Allowed, or would be once the bot gains up to `levelsAhead` levels (class, proficiency and gear
+// rules still apply now).
+bool AllowedSoon(Player* bot, ItemTemplate const* item, uint8 levelsAhead);
+// The proficiency part of CanUseItem for an item whose only blocker is the bot's level.
+bool ProficientIgnoringLevel(Player const* bot, ItemTemplate const* item);
 float PowerScore(Player* bot, ItemTemplate const* item);
 bool PreserveSlot(Player* bot, uint8 slot);
 bool Archived(Item const* item);

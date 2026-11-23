@@ -15,6 +15,7 @@
 #include "Player.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
+#include "World.h"
 #include "WorldSession.h"
 #include <algorithm>
 #include <cctype>
@@ -177,6 +178,35 @@ bool AllowedAtLevel(uint8 level, ItemTemplate const* item)
 bool Allowed(Player* bot, ItemTemplate const* item)
 {
     if (!bot || !AllowedAtLevel(bot->GetLevel(), item) || bot->CanUseItem(item) != EQUIP_ERR_OK)
+        return false;
+    bool pvp = bot->InBattleground() || bot->InArena() || bot->GetPlayerSetting("coa.bot.gear", 0).value == 1;
+    return !ItemPower(item, !pvp) || ItemPower(item, pvp);
+}
+
+bool ProficientIgnoringLevel(Player const* bot, ItemTemplate const* item)
+{
+    if (!bot || !item)
+        return false;
+    InventoryResult const use = bot->CanUseItem(item);
+    if (use == EQUIP_ERR_OK)
+        return true;
+    if (use != EQUIP_ERR_CANT_EQUIP_LEVEL_I)
+        return false;
+    uint32 const skill = item->GetSkill();
+    return !skill || bot->GetSkillValue(skill);
+}
+
+bool AllowedSoon(Player* bot, ItemTemplate const* item, uint8 levelsAhead)
+{
+    if (!bot || !item)
+        return false;
+    if (item->RequiredLevel <= bot->GetLevel() || !levelsAhead)
+        return Allowed(bot, item);
+    unsigned const maxLevel = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
+    if (!BotGearPolicy::WithinReach(bot->GetLevel(), item->RequiredLevel, levelsAhead, maxLevel))
+        return false;
+    uint8 const reach = uint8(BotGearPolicy::ReachLevel(bot->GetLevel(), levelsAhead, maxLevel));
+    if (!AllowedAtLevel(reach, item) || !ProficientIgnoringLevel(bot, item))
         return false;
     bool pvp = bot->InBattleground() || bot->InArena() || bot->GetPlayerSetting("coa.bot.gear", 0).value == 1;
     return !ItemPower(item, !pvp) || ItemPower(item, pvp);
