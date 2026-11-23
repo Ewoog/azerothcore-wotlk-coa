@@ -1786,7 +1786,7 @@ void BotMgr::DepositLooseResourcesToGuildBank(Player* bot)
 }
 
 void BotMgr::GuildGather(ObjectGuid::LowType charLowGuid, uint32 itemEntry, uint32 targetCount, ChatHandler* handler,
-    ObjectGuid::LowType requesterLowGuid)
+    ObjectGuid::LowType requesterLowGuid, bool mailToRequester)
 {
     WorldSession* session = FindBotSession(charLowGuid);
     if (!session)
@@ -1803,7 +1803,7 @@ void BotMgr::GuildGather(ObjectGuid::LowType charLowGuid, uint32 itemEntry, uint
         return;
     }
     Guild* guild = bot->GetGuild();
-    if (!guild)
+    if (!guild && !mailToRequester)
     {
         if (handler)
             handler->PSendSysMessage("BotMgr: bot '{}' is not in a guild.", bot->GetName());
@@ -1814,23 +1814,34 @@ void BotMgr::GuildGather(ObjectGuid::LowType charLowGuid, uint32 itemEntry, uint
     if (!requesterLowGuid && handler && handler->GetSession() && handler->GetSession()->GetPlayer())
         requesterLowGuid = handler->GetSession()->GetPlayer()->GetGUID().GetCounter();
 
-    EnsureBotBankRights(bot, guild);
+    if (mailToRequester && (!requesterLowGuid || FindBotSession(requesterLowGuid)))
+    {
+        if (handler)
+            handler->SendSysMessage("BotMgr: a mailed gather order needs a player to mail the items to.");
+        return;
+    }
+
+    if (guild)
+        EnsureBotBankRights(bot, guild);
 
     // Hand out a task with clean bags: bank whatever raw materials it's already carrying (worth
     // more in the guild bank than sold for coppers or just sitting there) and clear out grey
     // vendor trash / gear this bot has already outgrown. Without this, a bot that had been
     // leveling unattended for a long time could have zero room left for the very thing it's about
     // to be sent to fetch -- confirmed live 2026-09-29 across several of 21 bots.
-    DepositLooseResourcesToGuildBank(bot);
+    if (!mailToRequester)
+        DepositLooseResourcesToGuildBank(bot);
     BotAI::PrepareBagsForTask(bot);
 
     GuildGatherOrder order;
     order.itemEntry = itemEntry;
     order.targetCount = targetCount;
     order.requesterLowGuid = requesterLowGuid;
+    order.mailToRequester = mailToRequester;
 
-    // 1. Immediately deposit any matching items already held in inventory
-    uint32 deposited = GuildDepositItem(charLowGuid, itemEntry, targetCount, nullptr);
+    // 1. Immediately hand over any matching items already held in inventory
+    uint32 deposited = mailToRequester ? MailGatherItems(bot, requesterLowGuid, itemEntry, targetCount, OrderMailBody(bot))
+                                       : GuildDepositItem(charLowGuid, itemEntry, targetCount, nullptr);
 
     if (deposited >= targetCount)
     {
@@ -1840,7 +1851,7 @@ void BotMgr::GuildGather(ObjectGuid::LowType charLowGuid, uint32 itemEntry, uint
         _guildGatherOrders.erase(bot->GetGUID());
         DeleteGuildGatherOrder(bot->GetGUID());
         order.gatheredCount = deposited;
-        NotifyGatherOrderDone(bot, order);
+        NotifyGatherOrderDone(bot, order, mailToRequester ? deposited : 0);
         return;
     }
 
@@ -1929,7 +1940,7 @@ void BotMgr::GuildGather(ObjectGuid::LowType charLowGuid, uint32 itemEntry, uint
     order.hasTargetLocation = true;
     order.heldCount = std::min(bot->GetItemCount(itemEntry, false), remaining);
     // Anything it still carries after the deposit above did not fit in the guild bank.
-    order.bankBlocked = order.heldCount > 0;
+    order.bankBlocked = mailToRequester || order.heldCount > 0;
     SendBotToOrderSpot(bot, order, false);
     order.orderNo = _nextGatherOrderNo++;
     order.startProgress = GatherOrderProgress(order);
@@ -1941,8 +1952,9 @@ void BotMgr::GuildGather(ObjectGuid::LowType charLowGuid, uint32 itemEntry, uint
         handler->PSendSysMessage("BotMgr: guildgather order placed for bot '{}': need {}x item {} (already deposited {}x).",
             bot->GetName(), remaining, itemEntry, deposited);
     if (requesterPlayer && requesterPlayer->GetSession() && (!handler || handler->GetSession() != requesterPlayer->GetSession()))
-        ChatHandler(requesterPlayer->GetSession()).PSendSysMessage("|cff33ff99Guild order #{}:|r {} is {} {}x {} for the guild bank ({}).",
-            order.orderNo, bot->GetName(), info.IsHunt() ? "hunting for" : "gathering", targetCount, itemName, order.status);
+        ChatHandler(requesterPlayer->GetSession()).PSendSysMessage("|cff33ff99Guild order #{}:|r {} is {} {}x {} for {} ({}).",
+            order.orderNo, bot->GetName(), info.IsHunt() ? "hunting for" : "gathering", targetCount, itemName,
+            mailToRequester ? "your mailbox" : "the guild bank", order.status);
     LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotMgr: guildgather order for bot '{}': item {} need {} (already deposited {}){}.",
         bot->GetName(), itemEntry, remaining, deposited, info.IsHunt() ? ", targeted hunt" : "");
 }
@@ -2215,7 +2227,10 @@ void BotMgr::NotifyGatherOrderDone(Player* bot, GuildGatherOrder const& order, u
     Player* requester = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(order.requesterLowGuid));
     if (!requester || !requester->GetSession())
         return;
-    if (mailedCount)
+    if (mailedCount && order.mailToRequester)
+        ChatHandler(requester->GetSession()).PSendSysMessage("|cff33ff99Order done:|r {} gathered {}x {} and mailed {} to you.",
+            bot ? bot->GetName() : std::string("A bot"), order.targetCount, GatherItemName(order.itemEntry), mailedCount);
+    else if (mailedCount)
         ChatHandler(requester->GetSession()).PSendSysMessage(
             "|cff33ff99Guild order done:|r {} gathered {}x {} -- the guild bank had no room, so {}x {} mailed to you (check your mailbox).",
             bot ? bot->GetName() : std::string("A bot"), order.targetCount, GatherItemName(order.itemEntry), mailedCount,
@@ -2261,7 +2276,13 @@ void BotMgr::FailGuildGatherOrder(ObjectGuid const& botGuid, std::string const& 
     NotifyGatherOrderFail(botGuid, name, order, reason);
 }
 
-uint32 BotMgr::MailGatherItems(Player* bot, ObjectGuid::LowType requesterLowGuid, uint32 itemEntry, uint32 count)
+std::string BotMgr::OrderMailBody(Player* bot)
+{
+    return bot->GetName() + " gathered this for you.";
+}
+
+uint32 BotMgr::MailGatherItems(Player* bot, ObjectGuid::LowType requesterLowGuid, uint32 itemEntry, uint32 count,
+    std::string const& body)
 {
     if (!bot || !requesterLowGuid || !count)
         return 0;
@@ -2271,6 +2292,8 @@ uint32 BotMgr::MailGatherItems(Player* bot, ObjectGuid::LowType requesterLowGuid
     auto consider = [&](Item* item)
     {
         if (!item || item->GetEntry() != itemEntry || total >= count || item->IsInTrade() || item->IsNotEmptyBag())
+            return;
+        if (item->IsSoulBound() && !item->IsBoundAccountWide())
             return;
         if (bot->GetLootGUID() == item->GetGUID())
             return;
@@ -2288,13 +2311,13 @@ uint32 BotMgr::MailGatherItems(Player* bot, ObjectGuid::LowType requesterLowGuid
 
     ObjectGuid const receiverGuid = ObjectGuid::Create<HighGuid::Player>(requesterLowGuid);
     Player* receiverPlayer = ObjectAccessor::FindConnectedPlayer(receiverGuid);
-    std::string const subject = "Guild order: " + GatherItemName(itemEntry);
+    std::string const subject = (body.empty() ? "Guild order: " : "Order: ") + GatherItemName(itemEntry);
     uint32 mailed = 0;
     std::size_t next = 0;
     while (next < stacks.size())
     {
         CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
-        MailDraft draft(subject, bot->GetName() + " gathered this for you. The guild bank had no free slot for it.");
+        MailDraft draft(subject, body.empty() ? bot->GetName() + " gathered this for you. The guild bank had no free slot for it." : body);
         for (std::size_t n = 0; n < MAX_MAIL_ITEMS && next < stacks.size(); ++n, ++next)
         {
             Item* item = stacks[next];
@@ -2504,6 +2527,8 @@ bool BotMgr::MakeRoomForGatherOrder(Player* bot)
     }
     for (auto const& [entry, count] : other)
     {
+        if (order.mailToRequester)
+            break;
         GuildDepositItem(bot->GetGUID().GetCounter(), entry, 0, nullptr);
         if (roomy())
             return true;
@@ -2643,10 +2668,10 @@ void BotMgr::DescribeGatherOrders(ChatHandler* handler) const
 
 bool BotMgr::CanManageGatherOrder(Player* commander, uint32 guildId, ObjectGuid::LowType requesterLowGuid) const
 {
+    if (commander && requesterLowGuid && commander->GetGUID().GetCounter() == requesterLowGuid)
+        return true;
     if (!commander || !guildId || commander->GetGuildId() != guildId)
         return false;
-    if (requesterLowGuid && commander->GetGUID().GetCounter() == requesterLowGuid)
-        return true;
     Guild* guild = sGuildMgr->GetGuildById(guildId);
     Guild::Member const* member = guild ? guild->GetMember(commander->GetGUID()) : nullptr;
     return member && member->GetRankId() <= 1; // guild master or officer
@@ -2766,12 +2791,15 @@ void BotMgr::LoadGuildGatherOrders()
     if (!CharacterDatabase.Query("SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "
             "AND TABLE_NAME = 'mod_coa_bot_guild_gather_orders' AND COLUMN_NAME = 'requester_guid'"))
         CharacterDatabase.DirectExecute("ALTER TABLE mod_coa_bot_guild_gather_orders ADD COLUMN requester_guid INT UNSIGNED NOT NULL DEFAULT 0");
+    if (!CharacterDatabase.Query("SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() "
+            "AND TABLE_NAME = 'mod_coa_bot_guild_gather_orders' AND COLUMN_NAME = 'deliver_mail'"))
+        CharacterDatabase.DirectExecute("ALTER TABLE mod_coa_bot_guild_gather_orders ADD COLUMN deliver_mail TINYINT UNSIGNED NOT NULL DEFAULT 0");
 
     LoadGatherQueue();
 
     QueryResult result = CharacterDatabase.Query(
-        "SELECT bot_guid, item_entry, target_count, gathered_count, remaining_count, target_map, target_x, target_y, target_z, has_target_location, requester_guid "
-        "FROM mod_coa_bot_guild_gather_orders"
+        "SELECT bot_guid, item_entry, target_count, gathered_count, remaining_count, target_map, target_x, target_y, target_z, has_target_location, requester_guid, "
+        "deliver_mail FROM mod_coa_bot_guild_gather_orders"
     );
 
     if (!result)
@@ -2795,6 +2823,8 @@ void BotMgr::LoadGuildGatherOrders()
         order.targetZ = fields[8].Get<float>();
         order.hasTargetLocation = fields[9].Get<uint8>() != 0;
         order.requesterLowGuid = fields[10].Get<uint32>();
+        order.mailToRequester = fields[11].Get<uint8>() != 0;
+        order.bankBlocked = order.mailToRequester;
         order.orderNo = _nextGatherOrderNo++;
         // Carried items are only known once the bot is online; the first update loop pass
         // counts them, so a restart re-announces "first progress" only for new items.
@@ -2811,10 +2841,11 @@ void BotMgr::SaveGuildGatherOrder(ObjectGuid const& guid, GuildGatherOrder const
 {
     CharacterDatabase.Execute(
         "REPLACE INTO mod_coa_bot_guild_gather_orders "
-        "(bot_guid, item_entry, target_count, gathered_count, remaining_count, target_map, target_x, target_y, target_z, has_target_location, requester_guid) "
-        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        "(bot_guid, item_entry, target_count, gathered_count, remaining_count, target_map, target_x, target_y, target_z, has_target_location, requester_guid, deliver_mail) "
+        "VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
         guid.GetCounter(), order.itemEntry, order.targetCount, order.gatheredCount, order.remainingCount,
-        order.targetMapId, order.targetX, order.targetY, order.targetZ, order.hasTargetLocation ? 1 : 0, order.requesterLowGuid
+        order.targetMapId, order.targetX, order.targetY, order.targetZ, order.hasTargetLocation ? 1 : 0, order.requesterLowGuid,
+        order.mailToRequester ? 1 : 0
     );
 }
 
@@ -4847,7 +4878,7 @@ uint32 BotMgr::QueueAllBotsForAutoLogin(uint32 maxCountOverride)
 // closed after two minutes so the bot does not stay "busy" for everyone else.
 void BotMgr::UpdateTrades(uint32 diff)
 {
-    if (!_tradeEnabled)
+    if (!_tradeEnabled && _tradeOffers.empty())
     {
         _tradeAgeMs.clear();
         return;
@@ -4866,6 +4897,8 @@ void BotMgr::UpdateTrades(uint32 diff)
                 _tradeAgeMs.erase(bot->GetGUID());
             continue;
         }
+        if (!_tradeEnabled && !_tradeOffers.count(bot->GetGUID()))
+            continue;
 
         Player* other = mine->GetTrader();
         TradeData* theirs = other ? other->GetTradeData() : nullptr;
@@ -4888,6 +4921,309 @@ void BotMgr::UpdateTrades(uint32 diff)
         }
         else if (age->second > 120000)
             bot->TradeCancel(true);
+    }
+
+    UpdateTradeOffers(diff);
+}
+
+namespace
+{
+    constexpr uint32 TRADE_OFFER_TIMEOUT_MS = 60000;
+    constexpr float TRADE_OFFER_REACH_YARDS = 100.0f;
+
+    void TellOrder(Player* commander, Player* bot, char const* kind, std::string const& token, std::string const& text)
+    {
+        if (!commander || !commander->GetSession())
+            return;
+        if (!text.empty())
+            ChatHandler(commander->GetSession()).PSendSysMessage("|cff33ccffAltBots:|r {} {}", bot->GetName(), text);
+        CoaBotSendAddonReply(commander, "ORDER:" + std::to_string(bot->GetGUID().GetCounter()) + ":" + kind + ":" + token);
+    }
+
+    template<class Fn>
+    void ForEachBagItem(Player* bot, Fn&& fn)
+    {
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                fn(item, uint8(INVENTORY_SLOT_BAG_0), slot);
+        for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+            if (Bag* bag = bot->GetBagByPos(bagSlot))
+                for (uint32 slot = 0; slot < bag->GetBagSize(); ++slot)
+                    if (Item* item = bag->GetItemByPos(uint8(slot)))
+                        fn(item, bagSlot, uint8(slot));
+    }
+
+    bool IsBoundForOthers(Item const* item)
+    {
+        return item->IsSoulBound() && !item->IsBoundAccountWide();
+    }
+}
+
+std::string BotMgr::SendItemToCommander(Player* bot, Player* commander, uint32 itemEntry, uint32 count, bool toGuildBank,
+    uint32& moved)
+{
+    moved = 0;
+    if (!bot || !commander)
+        return "none";
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemEntry);
+    if (!proto || !bot->GetItemCount(itemEntry, false))
+        return "none";
+    if (BotAI::IsProfessionTool(proto))
+        return "tool";
+
+    uint32 free = 0;
+    ForEachBagItem(bot, [&](Item* item, uint8, uint8)
+    {
+        if (item->GetEntry() == itemEntry && !IsBoundForOthers(item) && !item->IsInTrade())
+            free += item->GetCount();
+    });
+    if (!free)
+        return "bound";
+    uint32 const wanted = count ? std::min(count, free) : free;
+
+    if (toGuildBank)
+    {
+        if (!bot->GetGuild())
+            return "noguild";
+        moved = GuildDepositItem(bot->GetGUID().GetCounter(), itemEntry, wanted, nullptr);
+        return moved ? "ok" : "bankfull";
+    }
+
+    moved = MailGatherItems(bot, commander->GetGUID().GetCounter(), itemEntry, wanted,
+        bot->GetName() + " sent this to you on your order.");
+    return moved ? "ok" : "none";
+}
+
+std::string BotMgr::OfferTrade(Player* bot, Player* commander, uint32 itemEntry, uint32 count)
+{
+    if (!bot || !commander)
+        return "none";
+    if (!bot->IsAlive())
+        return "dead";
+    if (bot->IsInCombat())
+        return "combat";
+    if (bot->GetTradeData() || commander->GetTradeData() || _tradeOffers.count(bot->GetGUID()))
+        return "busy";
+    if (bot->GetMap() != commander->GetMap() || bot->GetDistance(commander) > TRADE_OFFER_REACH_YARDS)
+        return "toofar";
+    if (!bot->GetItemCount(itemEntry, false))
+        return "none";
+
+    bool tradeable = false;
+    ForEachBagItem(bot, [&](Item* item, uint8, uint8)
+    {
+        if (item->GetEntry() == itemEntry && item->CanBeTraded(false, true))
+            tradeable = true;
+    });
+    if (!tradeable)
+        return "bound";
+
+    TradeOffer offer;
+    offer.playerGuid = commander->GetGUID();
+    offer.itemEntry = itemEntry;
+    offer.count = count;
+    offer.countBefore = bot->GetItemCount(itemEntry, false);
+    _tradeOffers[bot->GetGUID()] = offer;
+    return "ok";
+}
+
+namespace
+{
+    constexpr uint32 STANDING_BANK_INTERVAL_MS = 30 * IN_MILLISECONDS;
+    constexpr uint32 STANDING_MAIL_INTERVAL_MS = 5 * MINUTE * IN_MILLISECONDS;
+}
+
+void BotMgr::SetStandingRule(Player* owner, uint32 itemEntry, bool toGuildBank, bool enabled)
+{
+    if (!owner || !owner->GetSession() || !itemEntry || !sObjectMgr->GetItemTemplate(itemEntry))
+        return;
+    StandingRules& rules = _standingRules[owner->GetGUID().GetCounter()];
+    rules.accountId = owner->GetSession()->GetAccountId();
+    if (enabled)
+        rules.toGuildBankByItem[itemEntry] = toGuildBank;
+    else
+        rules.toGuildBankByItem.erase(itemEntry);
+    if (rules.toGuildBankByItem.empty())
+        _standingRules.erase(owner->GetGUID().GetCounter());
+}
+
+void BotMgr::ClearStandingRules(Player* owner)
+{
+    if (owner)
+        _standingRules.erase(owner->GetGUID().GetCounter());
+}
+
+void BotMgr::UpdateStandingRules(uint32 diff)
+{
+    if (_standingRules.empty())
+        return;
+    _standingTimerMs += diff;
+    if (_standingTimerMs < STANDING_BANK_INTERVAL_MS)
+        return;
+    _standingTimerMs = 0;
+    uint32 const now = getMSTime();
+
+    for (WorldSession* session : _botSessions)
+    {
+        Player* bot = session ? session->GetPlayer() : nullptr;
+        if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->GetTradeData())
+            continue;
+
+        uint32 orderItem = 0;
+        GetGatherOrderItem(bot->GetGUID(), &orderItem);
+        for (auto const& [ownerLow, rules] : _standingRules)
+        {
+            if (rules.accountId != session->GetAccountId() || ownerLow == bot->GetGUID().GetCounter())
+                continue;
+
+            auto mailAt = _standingMailAtMs.find(bot->GetGUID());
+            bool const mailDue = mailAt == _standingMailAtMs.end() || getMSTimeDiff(mailAt->second, now) >= STANDING_MAIL_INTERVAL_MS;
+            bool mailed = false;
+            for (auto const& [itemEntry, toGuildBank] : rules.toGuildBankByItem)
+            {
+                if (itemEntry == orderItem || !bot->GetItemCount(itemEntry, false))
+                    continue;
+                if (toGuildBank && !bot->GetGuild())
+                    continue;
+                if (!toGuildBank && !mailDue)
+                    continue;
+                uint32 moved = 0;
+                if (toGuildBank)
+                    SendItemToCommander(bot, bot, itemEntry, 0, true, moved);
+                else if (!BotAI::IsProfessionTool(sObjectMgr->GetItemTemplate(itemEntry)))
+                {
+                    moved = MailGatherItems(bot, ownerLow, itemEntry, bot->GetItemCount(itemEntry, false),
+                        bot->GetName() + " sent this on your standing mail rule.");
+                    mailed = mailed || moved > 0;
+                }
+                if (moved)
+                    LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotMgr: standing rule -- bot '{}' {} {}x item {} for owner {}.",
+                        bot->GetName(), toGuildBank ? "banked" : "mailed", moved, itemEntry, ownerLow);
+            }
+            if (mailed || mailDue)
+                _standingMailAtMs[bot->GetGUID()] = now;
+        }
+    }
+}
+
+void BotMgr::UpdateTradeOffers(uint32 diff)
+{
+    for (auto itr = _tradeOffers.begin(); itr != _tradeOffers.end();)
+    {
+        TradeOffer& offer = itr->second;
+        Player* bot = FindBotPlayer(itr->first.GetCounter());
+        Player* commander = ObjectAccessor::FindPlayer(offer.playerGuid);
+        if (!bot || !commander || !bot->IsInWorld() || !commander->IsInWorld())
+        {
+            itr = _tradeOffers.erase(itr);
+            continue;
+        }
+
+        offer.ageMs += diff;
+        TradeData* mine = bot->GetTradeData();
+        bool const withCommander = mine && mine->GetTrader() == commander;
+
+        if (offer.placed)
+        {
+            if (!mine)
+            {
+                bool const traded = bot->GetItemCount(offer.itemEntry, false) < offer.countBefore;
+                TellOrder(commander, bot, "trade", traded ? "ok" : "cancelled",
+                    traded ? "handed the item over." : "the trade was cancelled.");
+                itr = _tradeOffers.erase(itr);
+                continue;
+            }
+            if (offer.ageMs > TRADE_OFFER_TIMEOUT_MS)
+            {
+                bot->TradeCancel(true);
+                TellOrder(commander, bot, "trade", "timeout", "closed the trade after a minute without an accept.");
+                itr = _tradeOffers.erase(itr);
+                continue;
+            }
+            ++itr;
+            continue;
+        }
+
+        if (offer.ageMs > TRADE_OFFER_TIMEOUT_MS || bot->IsInCombat() || !bot->IsAlive())
+        {
+            if (withCommander)
+                bot->TradeCancel(true);
+            TellOrder(commander, bot, "trade", "failed", "could not start the trade.");
+            itr = _tradeOffers.erase(itr);
+            continue;
+        }
+
+        if (!offer.initiated)
+        {
+            if (mine || commander->GetTradeData())
+            {
+                ++itr;
+                continue;
+            }
+            if (bot->GetMap() != commander->GetMap() || bot->GetDistance(commander) > TRADE_OFFER_REACH_YARDS)
+            {
+                TellOrder(commander, bot, "trade", "toofar", "is too far away to trade.");
+                itr = _tradeOffers.erase(itr);
+                continue;
+            }
+            if (!bot->IsWithinDistInMap(commander, TRADE_DISTANCE - 2.0f, false))
+            {
+                if (!offer.nextMoveMs || offer.ageMs >= offer.nextMoveMs)
+                {
+                    offer.nextMoveMs = offer.ageMs + 2000;
+                    BotMovement::MoveTo(bot, MoveOwner::Travel, commander->GetPositionX(), commander->GetPositionY(),
+                        commander->GetPositionZ());
+                }
+                ++itr;
+                continue;
+            }
+            WorldPacket initiate(CMSG_INITIATE_TRADE, 8);
+            initiate << commander->GetGUID();
+            bot->GetSession()->HandleInitiateTradeOpcode(initiate);
+            if (!bot->GetTradeData())
+            {
+                TellOrder(commander, bot, "trade", "failed", "could not open a trade with you.");
+                itr = _tradeOffers.erase(itr);
+                continue;
+            }
+            offer.initiated = true;
+            WorldPacket begin(CMSG_BEGIN_TRADE);
+            bot->GetSession()->HandleBeginTradeOpcode(begin);
+            ++itr;
+            continue;
+        }
+
+        if (!withCommander)
+        {
+            TellOrder(commander, bot, "trade", "cancelled", "the trade was cancelled.");
+            itr = _tradeOffers.erase(itr);
+            continue;
+        }
+
+        uint8 tradeSlot = 0;
+        uint32 offered = 0;
+        ForEachBagItem(bot, [&](Item* item, uint8 bag, uint8 slot)
+        {
+            if (tradeSlot >= TRADE_SLOT_TRADED_COUNT || (offer.count && offered >= offer.count))
+                return;
+            if (item->GetEntry() != offer.itemEntry || !item->CanBeTraded(false, true) || mine->HasItem(item->GetGUID()))
+                return;
+            WorldPacket set(CMSG_SET_TRADE_ITEM, 3);
+            set << tradeSlot << bag << slot;
+            bot->GetSession()->HandleSetTradeItemOpcode(set);
+            ++tradeSlot;
+            offered += item->GetCount();
+        });
+        offer.placed = true;
+        if (!bot->GetTradeData())
+        {
+            TellOrder(commander, bot, "trade", "failed", "could not put the item in the trade window.");
+            itr = _tradeOffers.erase(itr);
+            continue;
+        }
+        TellOrder(commander, bot, "trade", "open",
+            Acore::StringFormat("put {}x {} in the trade window. Accept the trade to take it.", offered, GatherItemName(offer.itemEntry)));
+        ++itr;
     }
 }
 
@@ -5126,6 +5462,7 @@ void BotMgr::Update(uint32 diff)
     {
         CoaBotPerf::Scope scope(CoaBotPerf::Metric::ManagerTrades);
         UpdateTrades(diff);
+        UpdateStandingRules(diff);
     }
     {
         CoaBotPerf::Scope scope(CoaBotPerf::Metric::Economy);
@@ -5195,7 +5532,7 @@ void BotMgr::Update(uint32 diff)
                 continue;
             }
 
-            if (!bot->GetGuild())
+            if (!bot->GetGuild() && !itr->second.mailToRequester)
             {
                 GuildGatherOrder const order = itr->second;
                 DeleteGuildGatherOrder(itr->first);
@@ -5222,7 +5559,7 @@ void BotMgr::Update(uint32 diff)
                 order.status = "paused - in a group (remove it from the group to resume)";
                 // What it picks up while following still counts on the board.
                 order.heldCount = std::min(bot->GetItemCount(itemEntry, false), order.remainingCount);
-                if (getMSTimeDiff(order.groupedSinceMs, nowMs) >= GUILD_GATHER_GROUPED_HANDOFF_MS)
+                if (!order.mailToRequester && getMSTimeDiff(order.groupedSinceMs, nowMs) >= GUILD_GATHER_GROUPED_HANDOFF_MS)
                 {
                     uint32 const banked = GuildDepositItem(bot->GetGUID().GetCounter(), itemEntry, order.remainingCount, nullptr);
                     order.gatheredCount += banked;
@@ -5347,7 +5684,24 @@ void BotMgr::Update(uint32 diff)
                     order.bagsFull = false;
             }
 
-            if (held > 0 && (!order.lastDepositTryMs || getMSTimeDiff(order.lastDepositTryMs, nowMs) >= GATHER_DEPOSIT_RETRY_MS ||
+            if (order.mailToRequester)
+            {
+                if (heldCapped >= remaining && (!order.lastDepositTryMs || getMSTimeDiff(order.lastDepositTryMs, nowMs) >= GATHER_DEPOSIT_RETRY_MS))
+                {
+                    order.lastDepositTryMs = nowMs;
+                    uint32 const mailed = MailGatherItems(bot, order.requesterLowGuid, itemEntry, remaining, OrderMailBody(bot));
+                    if (mailed > 0)
+                    {
+                        GuildGatherOrder done = order;
+                        done.gatheredCount += mailed;
+                        DeleteGuildGatherOrder(itr->first);
+                        itr = _guildGatherOrders.erase(itr);
+                        NotifyGatherOrderDone(bot, done, mailed);
+                        continue;
+                    }
+                }
+            }
+            else if (held > 0 && (!order.lastDepositTryMs || getMSTimeDiff(order.lastDepositTryMs, nowMs) >= GATHER_DEPOSIT_RETRY_MS ||
                 (heldCapped >= remaining && !order.bankBlocked)))
             {
                 order.lastDepositTryMs = nowMs;

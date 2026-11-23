@@ -205,7 +205,7 @@ namespace
             case RACE_TROLL:         return 8395;  // Emerald Raptor
             case RACE_BLOODELF:      return 34795; // Red Hawkstrider
             case RACE_DRAENEI:       return 34406; // Brown Elekk
-            default:                 return 0;
+            default:                 return Player::TeamIdForRace(race) == TEAM_ALLIANCE ? 458 : 6654;
         }
     }
 
