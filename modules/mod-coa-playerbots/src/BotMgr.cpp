@@ -5027,6 +5027,85 @@ std::string BotMgr::OfferTrade(Player* bot, Player* commander, uint32 itemEntry,
     return "ok";
 }
 
+namespace
+{
+    constexpr uint32 STANDING_BANK_INTERVAL_MS = 30 * IN_MILLISECONDS;
+    constexpr uint32 STANDING_MAIL_INTERVAL_MS = 5 * MINUTE * IN_MILLISECONDS;
+}
+
+void BotMgr::SetStandingRule(Player* owner, uint32 itemEntry, bool toGuildBank, bool enabled)
+{
+    if (!owner || !owner->GetSession() || !itemEntry || !sObjectMgr->GetItemTemplate(itemEntry))
+        return;
+    StandingRules& rules = _standingRules[owner->GetGUID().GetCounter()];
+    rules.accountId = owner->GetSession()->GetAccountId();
+    if (enabled)
+        rules.toGuildBankByItem[itemEntry] = toGuildBank;
+    else
+        rules.toGuildBankByItem.erase(itemEntry);
+    if (rules.toGuildBankByItem.empty())
+        _standingRules.erase(owner->GetGUID().GetCounter());
+}
+
+void BotMgr::ClearStandingRules(Player* owner)
+{
+    if (owner)
+        _standingRules.erase(owner->GetGUID().GetCounter());
+}
+
+void BotMgr::UpdateStandingRules(uint32 diff)
+{
+    if (_standingRules.empty())
+        return;
+    _standingTimerMs += diff;
+    if (_standingTimerMs < STANDING_BANK_INTERVAL_MS)
+        return;
+    _standingTimerMs = 0;
+    uint32 const now = getMSTime();
+
+    for (WorldSession* session : _botSessions)
+    {
+        Player* bot = session ? session->GetPlayer() : nullptr;
+        if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->GetTradeData())
+            continue;
+
+        uint32 orderItem = 0;
+        GetGatherOrderItem(bot->GetGUID(), &orderItem);
+        for (auto const& [ownerLow, rules] : _standingRules)
+        {
+            if (rules.accountId != session->GetAccountId() || ownerLow == bot->GetGUID().GetCounter())
+                continue;
+
+            auto mailAt = _standingMailAtMs.find(bot->GetGUID());
+            bool const mailDue = mailAt == _standingMailAtMs.end() || getMSTimeDiff(mailAt->second, now) >= STANDING_MAIL_INTERVAL_MS;
+            bool mailed = false;
+            for (auto const& [itemEntry, toGuildBank] : rules.toGuildBankByItem)
+            {
+                if (itemEntry == orderItem || !bot->GetItemCount(itemEntry, false))
+                    continue;
+                if (toGuildBank && !bot->GetGuild())
+                    continue;
+                if (!toGuildBank && !mailDue)
+                    continue;
+                uint32 moved = 0;
+                if (toGuildBank)
+                    SendItemToCommander(bot, bot, itemEntry, 0, true, moved);
+                else if (!BotAI::IsProfessionTool(sObjectMgr->GetItemTemplate(itemEntry)))
+                {
+                    moved = MailGatherItems(bot, ownerLow, itemEntry, bot->GetItemCount(itemEntry, false),
+                        bot->GetName() + " sent this on your standing mail rule.");
+                    mailed = mailed || moved > 0;
+                }
+                if (moved)
+                    LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotMgr: standing rule -- bot '{}' {} {}x item {} for owner {}.",
+                        bot->GetName(), toGuildBank ? "banked" : "mailed", moved, itemEntry, ownerLow);
+            }
+            if (mailed || mailDue)
+                _standingMailAtMs[bot->GetGUID()] = now;
+        }
+    }
+}
+
 void BotMgr::UpdateTradeOffers(uint32 diff)
 {
     for (auto itr = _tradeOffers.begin(); itr != _tradeOffers.end();)
@@ -5383,6 +5462,7 @@ void BotMgr::Update(uint32 diff)
     {
         CoaBotPerf::Scope scope(CoaBotPerf::Metric::ManagerTrades);
         UpdateTrades(diff);
+        UpdateStandingRules(diff);
     }
     {
         CoaBotPerf::Scope scope(CoaBotPerf::Metric::Economy);

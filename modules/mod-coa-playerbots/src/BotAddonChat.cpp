@@ -1021,6 +1021,22 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
         return;
     }
 
+    // AltBots standing rules (Rules tab), for every bot on the sender's account:
+    //   RULE:0:<itemEntry>:<mail|bank|off>   RULECLEAR:0
+    if (verb == "RULECLEAR")
+    {
+        sBotMgr->ClearStandingRules(commander);
+        return;
+    }
+    if (verb == "RULE" && parts.size() >= 4)
+    {
+        uint32 const itemEntry = std::strtoul(parts[2].c_str(), nullptr, 10);
+        bool const off = parts[3] == "off";
+        sBotMgr->SetStandingRule(commander, itemEntry, parts[3] == "bank", !off);
+        LOG_INFO("module.coa-playerbots", "BotAddonChat: '{}' -> RULE item {} {}.", commander->GetName(), itemEntry, parts[3]);
+        return;
+    }
+
     // AltBots orders:
     //   GATHER:<botGuidLow>:<itemEntry>:<count>:<mail|bank> -> ORDER:<guid>:gather:<placed|noguild|failed>
     //   GATHERSTOP:<botGuidLow>                          -> ORDER:<guid>:gatherstop:<ok|denied|none>

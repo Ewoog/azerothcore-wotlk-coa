@@ -8,6 +8,8 @@
 -- your group, and live health, power and range cards. Materials: farm a material (a gather
 -- order delivered by mail or to the guild bank), or mail/bank it now.
 -- Party tab bags: left-click an item to trade it to you, mail it, bank it or farm more of it.
+-- Rules tab: standing rules ("keep mailing/banking this item") for every alt on your account;
+-- sent to the server at login and on every change (RULECLEAR / RULE).
 -- Quick bar and key bindings (Bindings.xml): the same orders for every grouped alt.
 -- Quests tab: each bot's quest log, an All bots view that shows who is missing which
 -- quest, a filter, and Share quests (SHAREQUESTS) for your own alts.
@@ -101,7 +103,7 @@ end
 local DB_VERSION = 2
 local SETTING_KEYS = {
     version = true, realms = true, farmRadius = true, minimapAngle = true, minimapHidden = true, tab = true,
-    winPos = true, quickBarPos = true, quickBar = true, scale = true, matDeliver = true, matCount = true,
+    winPos = true, quickBarPos = true, quickBar = true, scale = true, matDeliver = true, matCount = true, sendRules = true,
 }
 local SYNC_DELAY, SYNC_TIMEOUT, SYNC_REFRESH = 3, 8, 60
 
@@ -363,6 +365,7 @@ local delayedRefreshAt, delayedRefreshGuids = nil, nil
 local RefreshParty, RefreshPartyBags, RefreshPartyGear, RefreshPartyProfs, RefreshAlts, RefreshCommands
 local EnsureWindow, ShowTab, SetStatus, UpdateBagHeader, RequestGearAndBags, LayoutPartyDetail
 local BuildQuestPane, RefreshQuests, OnQuestLogArrived
+local BuildRulesPane, RefreshRules, SyncRules
 -- Quest tab: questLog[guid] is the last complete GETQUESTS answer, questBuild[guid] the one
 -- still arriving, questPending[guid] the GetTime() a request went out (nil once answered).
 local questLog, questBuild, questPending = {}, {}, {}
@@ -1552,6 +1555,7 @@ local function InitPools()
         roleBtns = {}, specBtns = {},
         prefArm = {}, prefWep = {},
         questListRows = {}, questRows = {}, questObjRows = {},
+        ruleRows = {},
     }
 end
 
@@ -1811,6 +1815,7 @@ EnsureWindow = function()
         { id = "commands", label = "Commands", tip = "Orders, plus live health, mana and range of grouped alts." },
         { id = "party", label = "Party", tip = "Role, spec, gear, professions and bags of grouped bots." },
         { id = "quests", label = "Quests", tip = "Each grouped bot's quest log, or all of them side by side." },
+        { id = "rules", label = "Rules", tip = "Standing rules: your alts keep mailing or banking the items you list while a rule is on." },
     }) do
         local t = MakeTab(nav, info.label)
         if prevTab then t:SetPoint("LEFT", prevTab, "RIGHT", 2, 0) else t:SetPoint("BOTTOMLEFT", 8, 0) end
@@ -2011,11 +2016,17 @@ EnsureWindow = function()
         else Tip(self, "Material", "Type an item ID, shift-click an item link while this box has focus, or use Catalog.") end
     end)
     ui.matBox:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    ui.linkBoxes = ui.linkBoxes or {}
+    table.insert(ui.linkBoxes, ui.matBox)
     if ChatEdit_InsertLink then
         hooksecurefunc("ChatEdit_InsertLink", function(link)
-            if ui.matBox and ui.matBox:HasFocus() and link then
-                ui.matBox:SetText(link)
-                ui.matBox:ClearFocus()
+            if not link then return end
+            for _, box in ipairs(ui.linkBoxes) do
+                if box:HasFocus() then
+                    box:SetText(link)
+                    box:ClearFocus()
+                    return
+                end
             end
         end)
     end
@@ -2389,6 +2400,7 @@ EnsureWindow = function()
     end
 
     BuildQuestPane(body)
+    BuildRulesPane(body)
 end
 
 
@@ -3358,6 +3370,163 @@ local function QuestStateText(q)
     return st[1], st
 end
 
+local function MyRules()
+    AltBotsDB.sendRules = AltBotsDB.sendRules or {}
+    local key = Realm() .. "-" .. (UnitName("player") or "?")
+    AltBotsDB.sendRules[key] = AltBotsDB.sendRules[key] or {}
+    return AltBotsDB.sendRules[key]
+end
+
+SyncRules = function()
+    Queue({ addon = "RULECLEAR:0" })
+    for _, rule in ipairs(MyRules()) do
+        if rule.on then Queue({ addon = "RULE:0:" .. rule.id .. ":" .. (rule.mode == "bank" and "bank" or "mail") }) end
+    end
+end
+
+local function MakeRuleRow(parent)
+    local row = CreateFrame("Frame", nil, parent)
+    row:SetWidth(ROW_W); row:SetHeight(36)
+    Skin(row, C.row, C.border)
+    row.item = MakeItemButton(row, 28)
+    row.item:SetPoint("LEFT", 4, 0)
+    row.name = row:CreateFontString(nil, "OVERLAY", "AltBotsFontBody")
+    row.name:SetPoint("LEFT", row.item, "RIGHT", 8, 0)
+    row.name:SetWidth(300)
+    row.name:SetJustifyH("LEFT")
+    row.remove = MakeTextBtn(row, 64, 24, "Remove")
+    row.remove:SetPoint("RIGHT", -6, 0)
+    row.toggle = MakeTextBtn(row, 64, 24, "")
+    row.toggle:SetPoint("RIGHT", row.remove, "LEFT", -6, 0)
+    row.mode = MakeTextBtn(row, 96, 24, "")
+    row.mode:SetPoint("RIGHT", row.toggle, "LEFT", -6, 0)
+    return row
+end
+
+RefreshRules = function()
+    if not win or not ui.rulesChild then return end
+    HidePool(ui.pools.ruleRows)
+    local rules = MyRules()
+    if #rules == 0 then
+        ui.rulesEmpty:Show()
+        ui.rulesChild:SetHeight(1)
+        return
+    end
+    ui.rulesEmpty:Hide()
+    local y = 0
+    for i, rule in ipairs(rules) do
+        local row = TakeRow(ui.pools.ruleRows, ui.rulesChild, MakeRuleRow)
+        row:ClearAllPoints()
+        row:SetPoint("TOPLEFT", 0, y)
+        local r, index = rule, i
+        SetItemIcon(row.item, r.id)
+        row.item.count:SetText("")
+        row.item:SetScript("OnEnter", function(self) ShowItemTip(self, r.id) end)
+        row.name:SetText(ItemLabel(r.id))
+        TextColor(row.name, r.on and C.text or C.faint)
+        row.mode:SetText(r.mode == "bank" and "Guild bank" or "Mail to me")
+        HookTip(row.mode, "Where it goes", "Mail: every 5 minutes your alts mail what they carry of it to you. "
+            .. "Guild bank: every 30 seconds they deposit it in their guild bank (alts without a guild skip it). Click to switch.")
+        row.mode:SetScript("OnClick", function()
+            r.mode = r.mode == "bank" and "mail" or "bank"
+            SyncRules(); RefreshRules()
+        end)
+        row.toggle:SetText(r.on and "On" or "Off")
+        row.toggle:SetActive(r.on)
+        HookTip(row.toggle, "On or off", "Turn the rule on or off without removing it.")
+        row.toggle:SetScript("OnClick", function()
+            r.on = not r.on
+            SyncRules(); RefreshRules()
+            SetStatus(ItemLabel(r.id) .. (r.on and ": rule on." or ": rule off."))
+        end)
+        row.remove:SetScript("OnClick", function()
+            table.remove(MyRules(), index)
+            SyncRules(); RefreshRules()
+        end)
+        y = y - 40
+    end
+    ui.rulesChild:SetHeight(math.max(1, -y + 4))
+end
+
+BuildRulesPane = function(body)
+    local pane = CreateFrame("Frame", nil, body)
+    pane:SetAllPoints()
+    pane:Hide()
+    ui.rulesPane = pane
+
+    local h, r = SectionHeader(pane, "Standing rules")
+    h:SetPoint("TOPLEFT", 0, -2)
+    r:SetPoint("LEFT", h, "RIGHT", 8, 0)
+    r:SetPoint("RIGHT", 0, 0)
+
+    local help = pane:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
+    help:SetPoint("TOPLEFT", 0, -22)
+    help:SetWidth(ROW_W)
+    help:SetJustifyH("LEFT")
+    TextColor(help, C.muted)
+    help:SetText("While a rule is on, every alt of yours that is spawned keeps sending that item: by mail to this character "
+        .. "every 5 minutes, or into its guild bank every 30 seconds. Soulbound items and profession tools are never sent.")
+
+    local box = MakeEditBox(pane, 240, 24)
+    box:SetPoint("TOPLEFT", 0, -56)
+    box.placeholder = box:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
+    box.placeholder:SetPoint("LEFT", 8, 0)
+    box.placeholder:SetText("Shift-click an item link, or type its ID")
+    TextColor(box.placeholder, C.faint)
+    ui.linkBoxes = ui.linkBoxes or {}
+    table.insert(ui.linkBoxes, box)
+
+    local mode = "mail"
+    local modeBtn = MakeTextBtn(pane, 96, 24, "Mail to me")
+    modeBtn:SetPoint("LEFT", box, "RIGHT", 6, 0)
+    modeBtn:SetScript("OnClick", function(self)
+        mode = mode == "bank" and "mail" or "bank"
+        self:SetText(mode == "bank" and "Guild bank" or "Mail to me")
+    end)
+    HookTip(modeBtn, "Where it goes", "Mail to this character, or the alt's guild bank. Click to switch.")
+
+    local addBtn = MakeTextBtn(pane, 80, 24, "Add rule")
+    addBtn:SetPoint("LEFT", modeBtn, "RIGHT", 6, 0)
+    addBtn:SetScript("OnClick", function()
+        box:ClearFocus()
+        local id = ItemIdFrom(box:GetText())
+        if not id then
+            Print("Shift-click an item link into the box, or type an item ID.")
+            return
+        end
+        local rules = MyRules()
+        for _, rule in ipairs(rules) do
+            if rule.id == id then
+                rule.mode, rule.on = mode, true
+                SyncRules(); RefreshRules()
+                return
+            end
+        end
+        table.insert(rules, { id = id, mode = mode, on = true })
+        box:SetText("")
+        if box.placeholder then box.placeholder:Show() end
+        SyncRules(); RefreshRules()
+        SetStatus(ItemLabel(id) .. ": rule added.")
+    end)
+
+    local allOff = MakeTextBtn(pane, 80, 24, "All off")
+    allOff:SetPoint("LEFT", addBtn, "RIGHT", 6, 0)
+    HookTip(allOff, "All off", "Turn every rule off.")
+    allOff:SetScript("OnClick", function()
+        for _, rule in ipairs(MyRules()) do rule.on = false end
+        SyncRules(); RefreshRules()
+    end)
+
+    ui.rulesEmpty = EmptyText(pane, "AltBotsFontBody")
+    ui.rulesEmpty:SetPoint("CENTER", 0, -40)
+    TextColor(ui.rulesEmpty, C.muted)
+    ui.rulesEmpty:SetText("No rules yet.\nShift-click an item into the box above, pick Mail or Guild bank, and press Add rule.")
+    local sf, child = MakeScroll("AltBotsRulesScroll", pane, ROW_W)
+    sf:SetPoint("TOPLEFT", 0, -92)
+    sf:SetPoint("BOTTOMRIGHT", -18, 0)
+    ui.rulesChild = child
+end
+
 BuildQuestPane = function(body)
     local pane = CreateFrame("Frame", nil, body)
     pane:SetAllPoints()
@@ -3821,11 +3990,12 @@ ShowTab = function(id)
     HidePopup()
     ui.activeTab = id
     AltBotsDB.tab = id
-    ui.altsPane:Hide(); ui.cmdPane:Hide(); ui.partyPane:Hide(); ui.questPane:Hide()
+    ui.altsPane:Hide(); ui.cmdPane:Hide(); ui.partyPane:Hide(); ui.questPane:Hide(); ui.rulesPane:Hide()
     SetTabState(ui.tabs.alts, id == "alts")
     SetTabState(ui.tabs.commands, id == "commands")
     SetTabState(ui.tabs.party, id == "party")
     SetTabState(ui.tabs.quests, id == "quests")
+    SetTabState(ui.tabs.rules, id == "rules")
     UpdateHeaderSummary()
     UpdateQuestBadge()
     if id == "alts" then
@@ -3838,6 +4008,8 @@ ShowTab = function(id)
         ui.cmdPane:Show(); RefreshCommands()
     elseif id == "quests" then
         ui.questPane:Show(); RefreshQuests(true)
+    elseif id == "rules" then
+        ui.rulesPane:Show(); RefreshRules()
     else
         ui.partyPane:Show(); RefreshParty()
     end
@@ -3864,6 +4036,7 @@ frame:SetScript("OnUpdate", function()
     if syncAt and now >= syncAt then
         syncAt = nil
         RequestAltSync(true)
+        SyncRules()
     end
     if altSync.state == "waiting" and now - (altSync.sentAt or now) > SYNC_TIMEOUT then
         OnAltSyncTimeout()
