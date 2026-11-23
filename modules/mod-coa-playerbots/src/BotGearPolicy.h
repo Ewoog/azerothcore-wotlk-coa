@@ -30,6 +30,16 @@ constexpr unsigned PvpPower(unsigned spell)
     return spell == 9930954 ? 5 : spell == 9930955 ? 6 : spell == 9930956 ? 7 : spell == 9930957 ? 10 : 0;
 }
 
+constexpr unsigned ReachLevel(unsigned level, unsigned levelsAhead, unsigned maxLevel)
+{
+    return level + levelsAhead < maxLevel ? level + levelsAhead : maxLevel > level ? maxLevel : level;
+}
+
+constexpr bool WithinReach(unsigned level, unsigned requiredLevel, unsigned levelsAhead, unsigned maxLevel)
+{
+    return requiredLevel <= ReachLevel(level, levelsAhead, maxLevel);
+}
+
 enum class LootRoll : std::uint8_t { Pass, Need, Greed };
 
 constexpr bool BeatsWorn(float candidateScore, float wornScore)

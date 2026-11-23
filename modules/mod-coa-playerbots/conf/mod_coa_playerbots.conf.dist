@@ -9,11 +9,17 @@
 # Does not change Need/Greed rolls (see CoaBots.Loot.NeedOnUpgrades) or gathering and fishing loot.
 CoaBots.Loot.AutoLootInGroup = 0
 
-# Bots roll Need on group-loot armor and weapons that are an upgrade for them: gear they can equip now,
-# that matches their gear preference, and that scores at least 5% better than what they wear in that
-# slot (an empty slot always counts). Everything else is Greed, or Pass for armor/weapon types they
-# cannot wear or do not prefer. 0 = never Need (Greed/Pass only, the old behavior).
+# Bots roll Need on group-loot armor and weapons that are an upgrade for them: gear they can equip now
+# (or within CoaBots.Loot.NeedLevelsAhead levels), that matches their gear preference, and that scores
+# at least 5% better than what they wear in that slot (an empty slot always counts). Everything else
+# is Greed, or Pass for armor/weapon types they cannot wear or do not prefer.
+# 0 = never Need (Greed/Pass only, the old behavior).
 CoaBots.Loot.NeedOnUpgrades = 1
+
+# How many levels below an item's required level a bot may still Need-roll on it as an upgrade.
+# The bot keeps the item in its bags (bag cleanup and vendoring leave it alone while it is still an
+# upgrade) and equips it once it reaches the level. 0 = only gear it can wear right now. Max 10.
+CoaBots.Loot.NeedLevelsAhead = 2
 
 #
 #    CoaBots.Enable

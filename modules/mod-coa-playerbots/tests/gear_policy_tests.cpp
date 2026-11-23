@@ -31,6 +31,13 @@ int main()
     assert(!BeatsWorn(0.0f, 0.0f));
     assert(!BeatsWorn(104.0f, 100.0f));
     assert(BeatsWorn(106.0f, 100.0f));
+    assert(WithinReach(20, 22, 2, 60));
+    assert(!WithinReach(20, 23, 2, 60));
+    assert(!WithinReach(20, 21, 0, 60));
+    assert(WithinReach(20, 20, 0, 60));
+    assert(ReachLevel(59, 2, 60) == 60);
+    assert(!WithinReach(60, 61, 2, 60));
+    assert(ReachLevel(80, 2, 60) == 80);
     assert(ChooseLootRoll(true, true, true, true) == LootRoll::Need);
     assert(ChooseLootRoll(true, false, true, true) == LootRoll::Greed);
     assert(ChooseLootRoll(false, true, true, true) == LootRoll::Greed);
