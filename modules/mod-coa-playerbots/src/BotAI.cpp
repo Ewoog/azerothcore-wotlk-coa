@@ -1082,17 +1082,22 @@ static uint8 PairedEquipSlot(uint8 slot)
     }
 }
 
+static bool CanWearSoon(Player* bot, ItemTemplate const* proto)
+{
+    if (!sBotMgr->MatchesGearPreference(bot, proto->ItemId))
+        return false;
+    uint16 dest = 0;
+    InventoryResult const equip = bot->CanEquipNewItem(NULL_SLOT, dest, proto->ItemId, true);
+    if (equip == EQUIP_ERR_OK)
+        return true;
+    return equip == EQUIP_ERR_CANT_EQUIP_LEVEL_I && BotGear::ProficientIgnoringLevel(bot, proto);
+}
+
 bool IsLootUpgrade(Player* bot, ItemTemplate const* proto)
 {
     if (!bot || !proto || (proto->Class != ITEM_CLASS_ARMOR && proto->Class != ITEM_CLASS_WEAPON))
         return false;
-    if (!BotGear::Allowed(bot, proto) || BotAI::IsProfessionTool(proto))
-        return false;
-    if (!sBotMgr->MatchesGearPreference(bot, proto->ItemId))
-        return false;
-
-    uint16 dest = 0;
-    if (bot->CanEquipNewItem(NULL_SLOT, dest, proto->ItemId, true) != EQUIP_ERR_OK)
+    if (BotAI::IsProfessionTool(proto) || !BotGear::AllowedSoon(bot, proto, sBotMgr->LootNeedLevelsAhead()))
         return false;
 
     uint8 const eslot = bot->FindEquipSlot(proto, NULL_SLOT, true);
@@ -1112,11 +1117,11 @@ bool IsLootUpgrade(Player* bot, ItemTemplate const* proto)
             continue;
         Item* current = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
         if (!current || !BotGear::Allowed(bot, current->GetTemplate()))
-            return true;
+            return CanWearSoon(bot, proto);
         ItemTemplate const* worn = current->GetTemplate();
         float const currentScore = ScoreItemForBot(bot, worn, role) + BotGear::PowerScore(bot, worn);
         if (BotGearPolicy::BeatsWorn(newScore, currentScore))
-            return true;
+            return CanWearSoon(bot, proto);
     }
     return false;
 }
@@ -1319,6 +1324,8 @@ bool IsClutterItem(Player* bot, Item const* item, BotRole role)
 
     if (proto->Class != ITEM_CLASS_ARMOR && proto->Class != ITEM_CLASS_WEAPON)
         return false;
+    if (BotAI::IsLootUpgrade(bot, proto))
+        return false; // an upgrade it is holding until it reaches the level
 
     uint8 eslot = bot->FindEquipSlot(proto, NULL_SLOT, true);
     if (eslot == NULL_SLOT)
@@ -6568,7 +6575,7 @@ uint32 FreeBagSlots(Player* bot, uint32 wanted)
         // (BotMgr banks or mails those to make room instead of destroying them).
         if (onOrder && (proto->ItemId == orderItem || proto->Class == ITEM_CLASS_TRADE_GOODS))
             return;
-        if (BotEconomy::IsReservedItem(bot, item))
+        if (BotEconomy::IsReservedItem(bot, item) || BotAI::IsLootUpgrade(bot, proto))
             return;
         stacks.push_back({ item, uint64(proto->SellPrice) * item->GetCount() });
     };

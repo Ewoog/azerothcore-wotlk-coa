@@ -351,7 +351,7 @@ namespace
     // upgrade pass uses). Gear that would fill an empty slot is not dead weight: the bot will put it on.
     bool IsDeadWeightGear(Player* bot, ItemTemplate const* proto, char const*& reason)
     {
-        if (BotAI::IsProfessionTool(proto))
+        if (BotAI::IsProfessionTool(proto) || BotAI::IsLootUpgrade(bot, proto))
             return false;
         uint8 const slot = bot->FindEquipSlot(proto, NULL_SLOT, true);
         if (slot == NULL_SLOT)

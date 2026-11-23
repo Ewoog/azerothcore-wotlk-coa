@@ -4687,7 +4687,9 @@ bool BotMgr::MatchesGearPreference(Player* bot, uint32 itemEntry) const
         return true;
 
     uint16 dest = 0;
-    if (bot->CanEquipNewItem(NULL_SLOT, dest, itemEntry, true) != EQUIP_ERR_OK)
+    InventoryResult const equip = bot->CanEquipNewItem(NULL_SLOT, dest, itemEntry, true);
+    bool const levelOnly = equip == EQUIP_ERR_CANT_EQUIP_LEVEL_I && BotGear::ProficientIgnoringLevel(bot, proto);
+    if (equip != EQUIP_ERR_OK && !levelOnly)
         return false;
 
     if (isBasicArmor)
@@ -5104,6 +5106,8 @@ void BotMgr::Update(uint32 diff)
         _tradeEnabled = sConfigMgr->GetOption<bool>("CoaBots.Trade.Enable", true);
         _autoLootInGroup = sConfigMgr->GetOption<bool>("CoaBots.Loot.AutoLootInGroup", false);
         _lootNeedOnUpgrades = sConfigMgr->GetOption<bool>("CoaBots.Loot.NeedOnUpgrades", true);
+        uint32 const levelsAhead = sConfigMgr->GetOption<uint32>("CoaBots.Loot.NeedLevelsAhead", 2);
+        _lootNeedLevelsAhead = uint8(std::min<uint32>(levelsAhead, 10));
         _inventorySellWhenNearVendor = sConfigMgr->GetOption<bool>("CoaBots.Inventory.SellWhenNearVendor", true);
         _inventorySellOnLeaderVendor = sConfigMgr->GetOption<bool>("CoaBots.Inventory.SellOnLeaderVendor", true);
         _inventoryKeepQuality = sConfigMgr->GetOption<uint32>("CoaBots.Inventory.KeepQuality", 3);
