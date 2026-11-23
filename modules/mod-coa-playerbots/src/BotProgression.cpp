@@ -312,6 +312,13 @@ namespace BotProgression
         }
 
         bool alliance = Player::TeamIdForRace(bot->getRace()) == TEAM_ALLIANCE;
+        // CoA's custom races have no stock racial mount: give them their faction's horse or wolf,
+        // or they could only ever fly and never follow a leader on a ground mount.
+        if (mounts.empty())
+        {
+            mounts.push_back(alliance ? 458u : 6654u);
+            mounts.push_back(alliance ? 23229u : 23250u);
+        }
         mounts.push_back(alliance ? FLYING_ALLIANCE_150 : FLYING_HORDE_150);
         mounts.push_back(alliance ? FLYING_ALLIANCE_280 : FLYING_HORDE_280);
 

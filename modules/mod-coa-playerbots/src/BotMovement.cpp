@@ -205,7 +205,7 @@ namespace
             case RACE_TROLL:         return 8395;  // Emerald Raptor
             case RACE_BLOODELF:      return 34795; // Red Hawkstrider
             case RACE_DRAENEI:       return 34406; // Brown Elekk
-            default:                 return 0;
+            default:                 return Player::TeamIdForRace(race) == TEAM_ALLIANCE ? 458 : 6654;
         }
     }
 
@@ -487,6 +487,19 @@ namespace
             req.backtrackCommandId = token.commandId;
 
         return token;
+    }
+}
+
+namespace
+{
+    // MountStateMachine refuses to mount below level 20. CoA hands out riding from level 1
+    // (CoA.MaxRidingFromStart, the same switch BotProgression::GrantMounts follows), so low-level
+    // bots must pass that gate too, or they stay on foot while their mounted leader rides off.
+    uint8 MountGateLevel(Player const* bot)
+    {
+        uint8 const level = bot->GetLevel();
+        bool const ridingFromStart = sConfigMgr->GetOption<bool>("CoA.MaxRidingFromStart", true);
+        return ridingFromStart ? std::max<uint8>(level, 20) : level;
     }
 }
 
@@ -1857,7 +1870,7 @@ namespace BotMovement
         std::lock_guard<std::mutex> lock(shard.mutex);
         return LocomotionStateStore::CanMountLocked(shard, bot->GetGUID(), travelDistance, NowMs(),
             bot->IsOutdoors(), bot->IsInCombat(), bot->IsNonMeleeSpellCast(false),
-            bot->GetLevel(), IsExternallyControlled(bot), isDungeon, isRaid, isInWater, isSwimming);
+            MountGateLevel(bot), IsExternallyControlled(bot), isDungeon, isRaid, isInWater, isSwimming);
     }
 
     bool IsMounted(Player const* bot)
@@ -1979,7 +1992,7 @@ namespace BotMovement
 
             if (!LocomotionStateStore::CanMountLocked(shard, bot->GetGUID(), travelDistance, now,
                     bot->IsOutdoors(), bot->IsInCombat(), bot->IsNonMeleeSpellCast(false),
-                    bot->GetLevel(), false, isDungeon, isRaid, isInWater, isSwimming))
+                    MountGateLevel(bot), false, isDungeon, isRaid, isInWater, isSwimming))
                 return false;
 
             if (!LocomotionStateStore::CanClaimLocked(shard, bot->GetGUID(), owner, false))
@@ -2306,7 +2319,7 @@ namespace BotMovement
                 bot->IsOutdoors(),
                 bot->IsInCombat(),
                 bot->IsNonMeleeSpellCast(false),
-                bot->GetLevel(),
+                MountGateLevel(bot),
                 BotMovement::IsExternallyControlled(bot),
                 mRec.state,
                 mRec.remountCooldownUntilMs,
