@@ -28,7 +28,7 @@ CHARACTER_CREATE_XML = 'Interface/GlueXML/CharacterCreate.xml'
 OVERLAY = 'Interface/GlueXML/CoACustomRaces.lua'
 OVERLAY_SOURCE = Path(__file__).resolve().parents[1] / 'client' / OVERLAY
 ARCHIVE_MEMBERS = {
-    'patch-M.MPQ': [CHR_RACES, CAMERAS],
+    'patch-M.MPQ': [CHR_RACES, CAMERAS, START_OUTFITS],
     'patch-T.MPQ': [CHAR_BASE_INFO],
     'patch-B.MPQ': [CHARACTER_CREATE_XML],
 }
@@ -36,6 +36,7 @@ ARCHIVE_ADDITIONS = {
     'patch-B.MPQ': {OVERLAY: OVERLAY_SOURCE},
 }
 STOCK_RACE_BUTTONS = 11
+SERVER_MEMBERS = {START_OUTFITS}
 RACE_BUTTONS = 10 + len(RACES)
 
 
@@ -201,6 +202,10 @@ def package_archive(baseline, output, executable, members, additions=None):
                 raise ValueError(f'{baseline.name} does not contain {member}')
             patched = payload / Path(member).name
             patched.write_bytes(PATCHERS[member](source.read_bytes()))
+            if member in SERVER_MEMBERS:
+                server = output.parent / 'server-dbc' / Path(member).name
+                server.parent.mkdir(exist_ok=True)
+                shutil.copyfile(patched, server)
             run('add', '--overwrite', '--game', 'wow-wotlk', '--path', member.replace('/', '\\'), candidate, patched)
             wanted[member.lower()] = sha(patched)
         for member, source in (additions or {}).items():
