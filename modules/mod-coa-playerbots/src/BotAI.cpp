@@ -1303,7 +1303,7 @@ bool IsClutterItem(Player* bot, Item const* item, BotRole role)
         return false;
 
     if (proto->Class == ITEM_CLASS_QUEST || proto->StartQuest || proto->Bonding == BIND_QUEST_ITEM ||
-        proto->Bonding == BIND_QUEST_ITEM1 || bot->HasQuestForItem(proto->ItemId))
+        proto->Bonding == BIND_QUEST_ITEM1 || bot->HasQuestForItem(proto->ItemId, 0, true))
         return false;
     uint32 orderItem = 0; // a gather order's own item is never junk, whatever its class
     if (sBotMgr->GetGatherOrderItem(bot->GetGUID(), &orderItem) && orderItem == proto->ItemId)
@@ -6562,7 +6562,7 @@ uint32 FreeBagSlots(Player* bot, uint32 wanted)
         ItemTemplate const* proto = item->GetTemplate();
         if (!proto || proto->Class == ITEM_CLASS_QUEST || proto->StartQuest || proto->Class == ITEM_CLASS_CONTAINER ||
             proto->Class == ITEM_CLASS_CONSUMABLE || proto->Quality >= ITEM_QUALITY_EPIC || IsProfessionTool(proto) ||
-            bot->HasQuestForItem(proto->ItemId))
+            bot->HasQuestForItem(proto->ItemId, 0, true))
             return;
         // A bot on a gather order keeps its materials: the order item and every Trade Good
         // (BotMgr banks or mails those to make room instead of destroying them).

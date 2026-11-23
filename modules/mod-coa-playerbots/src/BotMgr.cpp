@@ -2497,7 +2497,7 @@ bool BotMgr::MakeRoomForGatherOrder(Player* bot)
     for (auto otherItr = other.begin(); otherItr != other.end();)
     {
         ItemTemplate const* proto = sObjectMgr->GetItemTemplate(otherItr->first);
-        if (bot->HasQuestForItem(otherItr->first) || BotAI::IsProfessionTool(proto) || BotEconomy::IsReservedReagent(bot, otherItr->first))
+        if (bot->HasQuestForItem(otherItr->first, 0, true) || BotAI::IsProfessionTool(proto) || BotEconomy::IsReservedReagent(bot, otherItr->first))
             otherItr = other.erase(otherItr);
         else
             ++otherItr;
