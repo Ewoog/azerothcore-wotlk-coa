@@ -4,7 +4,7 @@ import struct
 import unittest
 
 from package_custom_races_client import (OVERLAY_SOURCE, RACES, extend_cameras, extend_char_base_info,
-                                         extend_character_create_xml, patch_chr_races)
+                                         extend_character_create_xml, extend_start_outfits, patch_chr_races)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,6 +112,36 @@ class CharacterCreateXmlTest(unittest.TestCase):
     def test_overlay_supports_sixteen_races(self):
         text = OVERLAY_SOURCE.read_text(encoding='utf-8')
         self.assertIn(f'MAX_RACES = {10 + len(RACES)}', text)
+
+
+def outfit(record_id, race, cls, sex, item):
+    values = [0] * 72
+    values[0] = item
+    return struct.pack('<I4B72I', record_id, race, cls, sex, 0, *values)
+
+
+class StartOutfitTest(unittest.TestCase):
+    def test_custom_races_get_missing_base_race_outfits_only(self):
+        rows = [outfit(1, 2, 1, 0, 100), outfit(2, 2, 30, 0, 130), outfit(3, 2, 30, 1, 131),
+                outfit(4, 19, 1, 0, 900), outfit(5, 1, 30, 0, 230), outfit(6, 8, 30, 1, 330),
+                outfit(7, 3, 30, 0, 430)]
+        result = {}
+        ids = []
+        for row in records(extend_start_outfits(dbc(rows, 77, 296, b'')), 296):
+            ids.append(struct.unpack_from('<I', row)[0])
+            result[tuple(row[4:7])] = struct.unpack_from('<I', row, 8)[0]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(result[(19, 1, 0)], 900)
+        self.assertEqual(result[(19, 30, 0)], 130)
+        self.assertEqual(result[(19, 30, 1)], 131)
+        self.assertEqual(result[(13, 30, 0)], 230)
+        self.assertEqual(result[(12, 30, 1)], 330)
+        self.assertEqual(result[(20, 30, 0)], 430)
+        self.assertNotIn((13, 1, 0), result)
+
+    def test_complete_file_fails(self):
+        with self.assertRaises(ValueError):
+            extend_start_outfits(dbc([outfit(1, 5, 1, 0, 1)], 77, 296, b''))
 
 
 class ServerDataTest(unittest.TestCase):

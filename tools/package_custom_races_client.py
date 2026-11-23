@@ -23,6 +23,7 @@ CAN_MOUNT = 0x04
 CHR_RACES = 'DBFilesClient/ChrRaces.dbc'
 CHAR_BASE_INFO = 'DBFilesClient/CharBaseInfo.dbc'
 CAMERAS = 'DBFilesClient/UICameraAppearanceChrRaces.dbc'
+START_OUTFITS = 'DBFilesClient/CharStartOutfit.dbc'
 CHARACTER_CREATE_XML = 'Interface/GlueXML/CharacterCreate.xml'
 OVERLAY = 'Interface/GlueXML/CoACustomRaces.lua'
 OVERLAY_SOURCE = Path(__file__).resolve().parents[1] / 'client' / OVERLAY
@@ -107,6 +108,28 @@ def extend_cameras(data):
     return dbc.pack()
 
 
+def extend_start_outfits(data):
+    dbc = Dbc(data, fields=77, record_size=296)
+    present = {tuple(record[4:7]) for record in dbc.records}
+    next_id = max(struct.unpack_from('<I', record)[0] for record in dbc.records) + 1
+    added = 0
+    for race, settings in RACES.items():
+        for record in list(dbc.records):
+            base, cls, sex = record[4:7]
+            if base != settings['base'] or (race, cls, sex) in present:
+                continue
+            copy = bytearray(record)
+            struct.pack_into('<I', copy, 0, next_id)
+            copy[4] = race
+            dbc.records.append(copy)
+            present.add((race, cls, sex))
+            next_id += 1
+            added += 1
+    if not added:
+        raise ValueError('CharStartOutfit already has every base race outfit for the custom races')
+    return dbc.pack()
+
+
 def extend_character_create_xml(data):
     text = data.decode('utf-8-sig')
     newline = '\r\n' if '\r\n' in text else '\n'
@@ -137,7 +160,7 @@ def extend_character_create_xml(data):
 
 
 PATCHERS = {CHR_RACES: patch_chr_races, CHAR_BASE_INFO: extend_char_base_info, CAMERAS: extend_cameras,
-            CHARACTER_CREATE_XML: extend_character_create_xml}
+            START_OUTFITS: extend_start_outfits, CHARACTER_CREATE_XML: extend_character_create_xml}
 
 
 def sha(path):
