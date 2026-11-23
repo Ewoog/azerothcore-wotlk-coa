@@ -3,18 +3,40 @@ MAX_RACES = 16
 local STOCK_RACE_ICONS = "Interface\\Glues\\CharacterCreate\\UI-CHARACTERCREATE-RACES_Round"
 local CUSTOM_RACE_ICON_COORDS = { 0.07, 0.93, 0.07, 0.93 }
 local CUSTOM_RACE_ICONS = {
-    ["GOBLIN"] = "Interface\\Icons\\GOBLIN_ICON",
-    ["ZANDALARI TROLL"] = "Interface\\Icons\\achievement_alliedrace_zandalaritroll",
-    ["WORGEN"] = "Interface\\Icons\\WORGEN_ICON",
-    ["KULTIRAN"] = "Interface\\Icons\\achievement_alliedrace_kultiranhuman",
-    ["VULPERA"] = "Interface\\Icons\\achievement_alliedrace_vulpera",
-    ["PANDAREN"] = "Interface\\Icons\\achievement_character_pandaren_female",
+    ["GOBLIN"] = { "achievement_goblinhead", "achievement_femalegoblinhead" },
+    ["ZANDALARI TROLL"] = { "achievement_alliedrace_zandalaritroll" },
+    ["WORGEN"] = { "achievement_worganhead" },
+    ["KULTIRAN"] = { "achievement_alliedrace_kultiranhuman" },
+    ["VULPERA"] = { "achievement_alliedrace_vulpera" },
+    ["PANDAREN"] = { "achievement_character_pandaren_female" },
+}
+local BACKGROUND_RACES = {
+    ["GOBLIN"] = "Orc",
+    ["ZANDALARI TROLL"] = "Troll",
+    ["WORGEN"] = "Human",
+    ["KULTIRAN"] = "Human",
+    ["VULPERA"] = "Orc",
+    ["PANDAREN"] = "Dwarf",
 }
 local COMPACT_ROW_SPACING = 66
 
 for raceEnglishName in pairs(CUSTOM_RACE_ICONS) do
     RACE_ICON_TCOORDS[raceEnglishName .. "_MALE"] = CUSTOM_RACE_ICON_COORDS
     RACE_ICON_TCOORDS[raceEnglishName .. "_FEMALE"] = CUSTOM_RACE_ICON_COORDS
+end
+
+local function RaceIcon(raceEnglishName, gender)
+    local icons = CUSTOM_RACE_ICONS[raceEnglishName]
+    if not icons then
+        return STOCK_RACE_ICONS
+    end
+    local icon = gender == "FEMALE" and icons[2] or icons[1]
+    return "Interface\\Icons\\" .. icon
+end
+
+local stockSetBackgroundModel = SetBackgroundModel
+function SetBackgroundModel(model, name)
+    return stockSetBackgroundModel(model, BACKGROUND_RACES[strupper(name)] or name)
 end
 
 local stockGetFlavorText = GetFlavorText
@@ -24,7 +46,7 @@ end
 
 local stockSetRace = CharCreateRaceButtonMixin.SetRace
 function CharCreateRaceButtonMixin:SetRace(raceName, raceEnglishName, gender, enabled)
-    local icon = CUSTOM_RACE_ICONS[raceEnglishName] or STOCK_RACE_ICONS
+    local icon = RaceIcon(raceEnglishName, gender)
     self:GetNormalTexture():SetTexture(icon)
     self:GetPushedTexture():SetTexture(icon)
     stockSetRace(self, raceName, raceEnglishName, gender, enabled)
