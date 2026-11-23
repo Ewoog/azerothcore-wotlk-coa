@@ -485,9 +485,18 @@ constexpr float FOLLOW_GATHER_LEADER_RANGE = 40.0f;
 constexpr uint32 GUILD_GATHER_RETELEPORT_MS = 45000;
 // A node order standing at its spot with no node of its item in GATHER_ORDER_SEARCH_RADIUS gives the
 // spot up sooner than a hunt (nodes don't wander in; a spot with nothing up is just empty).
-constexpr uint32 GUILD_GATHER_NODE_STALL_MS = 25000;
+constexpr uint32 GUILD_GATHER_NODE_STALL_MS = 12000;
 // How far an order's targeted node search looks around the bot.
 constexpr float GATHER_ORDER_SEARCH_RADIUS = 80.0f;
+// An order bot rescans this often (idle solo gathering waits GATHER_SCAN_INTERVAL_MS), so it goes
+// straight on to the next node instead of standing at the last one.
+constexpr uint32 GATHER_ORDER_SCAN_INTERVAL_MS = 1000;
+// When nothing is up within GATHER_ORDER_SEARCH_RADIUS, an order checks the known spawn points of
+// its node types this far out (loaded grids only, live objects only) and rides to the nearest one
+// before giving the spot up.
+constexpr float GATHER_ORDER_SPAWN_SEARCH_RADIUS = 400.0f;
+// Order bots mount for shorter walks than idle gatherers.
+constexpr float GATHER_ORDER_MOUNT_DISTANCE = 50.0f;
 // The walk to an order's spot must get this many yards closer at least once every
 // GATHER_ORDER_TRAVEL_NO_GAIN_MS, or the bot is teleported the rest of the way.
 constexpr float GATHER_ORDER_TRAVEL_MIN_GAIN = 10.0f;
@@ -3305,6 +3314,68 @@ void TryContinueGatherWalk(Player* bot, uint32 diff, BotAIState& state)
     CastGatherAt(bot, state, node, gatherSpellId);
 }
 
+// Wide search for a gather order whose close scan came up empty: the known spawn points of the
+// order's node types within GATHER_ORDER_SPAWN_SEARCH_RADIUS on this map, nearest first, checked
+// against the live object (spawned, openable by this bot, not claimed or on cooldown). Starts the
+// walk (or ride) to the first one that qualifies; TryContinueGatherWalk takes it from there.
+bool TryWalkToKnownOrderNode(Player* bot, BotAIState& state, uint32 itemEntry, std::vector<uint32> const& nodeEntries)
+{
+    Map* map = bot->GetMap();
+    if (!map || nodeEntries.empty())
+        return false;
+
+    float const maxSq = GATHER_ORDER_SPAWN_SEARCH_RADIUS * GATHER_ORDER_SPAWN_SEARCH_RADIUS;
+    std::vector<std::pair<float, uint32>> candidates;
+    for (uint32 entry : nodeEntries)
+    {
+        std::vector<SpawnPoint> const* spawns = QuestKB::GameObjectSpawns(entry);
+        if (!spawns)
+            continue;
+        for (SpawnPoint const& spawn : *spawns)
+        {
+            if (spawn.mapId != bot->GetMapId())
+                continue;
+            float const dx = spawn.x - bot->GetPositionX();
+            float const dy = spawn.y - bot->GetPositionY();
+            float const distSq = dx * dx + dy * dy;
+            if (distSq <= maxSq)
+                candidates.emplace_back(distSq, spawn.spawnId);
+        }
+    }
+    if (candidates.empty())
+        return false;
+    std::sort(candidates.begin(), candidates.end());
+
+    uint32 gatherSpellId = 0;
+    GatherableNodeCheck check(bot, GATHER_ORDER_SPAWN_SEARCH_RADIUS, gatherSpellId, state, itemEntry);
+    auto const& store = map->GetGameObjectBySpawnIdStore();
+    for (auto const& [distSq, spawnId] : candidates)
+    {
+        auto range = store.equal_range(spawnId);
+        for (auto itr = range.first; itr != range.second; ++itr)
+        {
+            GameObject* node = itr->second;
+            if (!node || !node->IsInWorld() || node->getLootState() != GO_READY || !check(node))
+                continue;
+
+            ClaimGatherNode(node->GetGUID(), bot->GetGUID());
+            float const dist = bot->GetDistance(node);
+            state.gatherWalkTargetGuid = node->GetGUID();
+            state.gatherWalkTimeoutMs = std::max<uint32>(GATHER_WALK_TIMEOUT_MS, uint32(dist / 5.0f * IN_MILLISECONDS) + 10000);
+            if (dist >= GATHER_ORDER_MOUNT_DISTANCE && !bot->IsMounted() && BotMovement::RequestMount(bot, MoveOwner::Gather, dist))
+                return true;
+            if (!MoveBotToPoint(bot, MoveOwner::Gather, node->GetPositionX(), node->GetPositionY(), node->GetPositionZ()))
+            {
+                state.gatherWalkTargetGuid = ObjectGuid::Empty;
+                ReleaseGatherClaim(bot->GetGUID());
+                return false;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 // Called from the idle-solo routine (same scope as TryGrindWhenSolo), only when no gathering
 // cast or walk is already in progress. Scans for a nearby eligible node and either casts the
 // real gathering spell at it immediately (already in range) or starts walking toward it and
@@ -3318,7 +3389,7 @@ bool TryStartGathering(Player* bot, uint32 diff, BotAIState& state, uint32 requi
         state.nextGatherScanMs -= diff;
         return false;
     }
-    state.nextGatherScanMs = GATHER_SCAN_INTERVAL_MS;
+    state.nextGatherScanMs = requiredItemEntry ? GATHER_ORDER_SCAN_INTERVAL_MS : GATHER_SCAN_INTERVAL_MS;
 
     // A targeted order is worth searching further for than idle ambient gathering: the bot was
     // deliberately sent here for this one item, not just topping up materials on the way past.
@@ -3341,7 +3412,7 @@ bool TryStartGathering(Player* bot, uint32 diff, BotAIState& state, uint32 requi
         state.gatherWalkTimeoutMs = GATHER_WALK_TIMEOUT_MS;
 
         float dist = bot->GetDistance(node);
-        if (dist >= 90.0f && !bot->IsMounted())
+        if (dist >= (requiredItemEntry ? GATHER_ORDER_MOUNT_DISTANCE : 90.0f) && !bot->IsMounted())
         {
             if (BotMovement::RequestMount(bot, MoveOwner::Gather, dist))
                 return true; // Mount cast initiated; TryContinueGatherWalk will resume walk after cast
@@ -4735,6 +4806,12 @@ void UpdateSoloWorld(Player* bot, uint32 diff, BotAIState& state)
         {
             state.gatherOrderStallMs = 0;
             status(!state.gatherWalkTargetGuid.IsEmpty() ? "walking to a node" : "gathering a node");
+        }
+        else if (itemIsNodeSourced && state.gatherWalkTargetGuid.IsEmpty() &&
+                 TryWalkToKnownOrderNode(bot, state, gatherOrder->itemEntry, sourceInfo.nodeGoEntries))
+        {
+            state.gatherOrderStallMs = 0;
+            status("heading to a node further out");
         }
         else if (itemIsNodeSourced)
         {
