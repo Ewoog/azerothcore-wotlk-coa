@@ -32,6 +32,25 @@ CoaBots.Loot.NeedLevelsAhead = 2
 CoaBots.Enable = 1
 
 #
+#    CoACustomRaces.Enable
+#        Description: Allow bots of the custom playable races (Goblin, Zandalari Troll, Worgen, Kul Tiran,
+#                     Vulpera, Pandaren) to log in. Turn on only when every client has the custom races
+#                     client patch; a client without the race models crashes on these units.
+#        Default:     0 - (Stock races only)
+#
+
+CoACustomRaces.Enable = 0
+
+#
+#    CoACustomRaces.BotsEnable
+#        Description: Allow '.botcmd spawnrandom' and the other bot spawners to create bots of the custom
+#                     playable races. Requires CoACustomRaces.Enable.
+#        Default:     0 - (Stock races only)
+#
+
+CoACustomRaces.BotsEnable = 0
+
+#
 #    CoaBots.CustomRaces.Enable
 #        Description: Allow companion bots to use custom races only when both
 #                     CoACustomRaces.Enable and CoACustomRaces.BotsEnable are enabled.

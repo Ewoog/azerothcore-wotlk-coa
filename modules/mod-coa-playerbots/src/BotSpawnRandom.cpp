@@ -642,20 +642,17 @@ std::vector<uint8> GetValidBotRaces()
 
     if (customRacesEnabled)
     {
-        static const std::unordered_set<uint8> defaultExpExclusions = {
-            16, 19, 27, 32, 50, 52, 53, 65, 66, 67, 68, 69, 70, 71, 72, 74, 77, 80, 81
-        };
-
-        for (uint8 r = 12; r <= 128; ++r)
+        for (uint8 r = 9; r <= 128; ++r)
         {
-            if (excluded.empty() && defaultExpExclusions.count(r))
+            if (r == 10 || r == 11)
                 continue;
             if (excluded.count(r))
                 continue;
             if (crashing.count(r))
                 continue;
 
-            if (sChrRacesStore.LookupEntry(r))
+            ChrRacesEntry const* entry = sChrRacesStore.LookupEntry(r);
+            if (entry && !(entry->Flags & CHRRACES_FLAGS_NOT_PLAYABLE))
                 races.push_back(r);
         }
     }

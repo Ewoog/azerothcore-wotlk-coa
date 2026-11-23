@@ -75,6 +75,11 @@ namespace
     {
         return !sConfigMgr->GetOption<bool>("CoACustomRaces.Enable", false);
     }
+
+    bool IsCustomRace(uint8 race)
+    {
+        return race == 9 || race > 11;
+    }
 }
 
 namespace
@@ -1227,7 +1232,7 @@ ObjectGuid::LowType BotMgr::FindEligibleOfflineBot(TeamId team, uint8 minLevel, 
         if (team != TEAM_NEUTRAL && Player::TeamIdForRace(race) != team)
             continue;
 
-        if (race > 11 && CustomRacesOff())
+        if (IsCustomRace(race) && CustomRacesOff())
             continue;
 
         if (excludedGuids.count(guid) || FindBotSession(guid))
@@ -4810,7 +4815,7 @@ uint32 BotMgr::QueueAllBotsForAutoLogin(uint32 maxCountOverride)
         "LEFT JOIN mod_coa_bot_guild_gather_orders go ON c.guid = go.bot_guid "
         "WHERE c.account IN ({}){} "
         "ORDER BY (gm.guildid IS NOT NULL OR go.bot_guid IS NOT NULL) DESC, c.guid ASC",
-        idList, CustomRacesOff() ? " AND c.race BETWEEN 1 AND 11" : ""
+        idList, CustomRacesOff() ? " AND c.race IN (1, 2, 3, 4, 5, 6, 7, 8, 10, 11)" : ""
     );
     if (!chars)
         return 0;

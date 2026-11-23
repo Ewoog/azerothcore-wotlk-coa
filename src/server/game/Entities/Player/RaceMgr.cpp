@@ -30,6 +30,8 @@ uint32 RaceMgr::_playableRaceMask = 0;
 uint32 RaceMgr::_allianceRaceMask = 0;
 uint32 RaceMgr::_hordeRaceMask = 0;
 
+std::array<uint8, 33> RaceMgr::_baseRace = {};
+
 RaceMgr::RaceMgr()
 {
 }
@@ -50,6 +52,8 @@ void RaceMgr::LoadRaces()
     _playableRaceMask = 0;
     _hordeRaceMask    = 0;
     _allianceRaceMask = 0;
+
+    LoadBaseRaces();
 
     for (auto const& raceEntry : sChrRacesStore)
     {
@@ -74,4 +78,40 @@ void RaceMgr::LoadRaces()
         else if (alliance == ALLIANCE_ALLIANCE)
             _allianceRaceMask |= raceBit;
     }
+}
+
+void RaceMgr::LoadBaseRaces()
+{
+    _baseRace.fill(0);
+
+    QueryResult result = WorldDatabase.Query("SELECT Race, BaseRace FROM coa_custom_race");
+    if (!result)
+        return;
+
+    do
+    {
+        Field* fields = result->Fetch();
+        uint8 race = fields[0].Get<uint8>();
+        uint8 baseRace = fields[1].Get<uint8>();
+        if (!race || race >= _baseRace.size() || !baseRace || baseRace >= _baseRace.size() || race == baseRace
+            || !sChrRacesStore.LookupEntry(race) || !sChrRacesStore.LookupEntry(baseRace))
+        {
+            LOG_ERROR("sql.sql", "coa_custom_race: invalid race {} or base race {}, ignoring.", race, baseRace);
+            continue;
+        }
+
+        _baseRace[race] = baseRace;
+    } while (result->NextRow());
+}
+
+uint32 RaceMgr::GetRuleRaceMask(uint8 race)
+{
+    if (!race || race >= _baseRace.size())
+        return 0;
+
+    uint32 mask = uint32(1) << (race - 1);
+    if (uint8 baseRace = _baseRace[race])
+        mask |= uint32(1) << (baseRace - 1);
+
+    return mask;
 }

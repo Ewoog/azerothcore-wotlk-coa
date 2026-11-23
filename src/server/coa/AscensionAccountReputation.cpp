@@ -4,13 +4,14 @@
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
 #include "Player.h"
+#include "RaceMgr.h"
 #include "ReputationMgr.h"
 #include "ScriptMgr.h"
 #include "WorldSession.h"
 
 namespace
 {
-uint32 RaceMask(uint8 race) { return uint32(1) << (race - 1); }
+uint32 RaceMask(uint8 race) { return sRaceMgr->GetRuleRaceMask(race); }
 uint32 ClassMask(uint8 playerClass) { return uint32(1) << (playerClass - 1); }
 
 std::vector<AccountReputation::SiblingStanding> LoadSiblingStandings(Player* player)
