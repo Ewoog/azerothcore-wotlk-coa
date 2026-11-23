@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import struct
 import subprocess
@@ -22,10 +23,19 @@ CAN_MOUNT = 0x04
 CHR_RACES = 'DBFilesClient/ChrRaces.dbc'
 CHAR_BASE_INFO = 'DBFilesClient/CharBaseInfo.dbc'
 CAMERAS = 'DBFilesClient/UICameraAppearanceChrRaces.dbc'
+CHARACTER_CREATE_XML = 'Interface/GlueXML/CharacterCreate.xml'
+OVERLAY = 'Interface/GlueXML/CoACustomRaces.lua'
+OVERLAY_SOURCE = Path(__file__).resolve().parents[1] / 'client' / OVERLAY
 ARCHIVE_MEMBERS = {
     'patch-M.MPQ': [CHR_RACES, CAMERAS],
     'patch-T.MPQ': [CHAR_BASE_INFO],
+    'patch-B.MPQ': [CHARACTER_CREATE_XML],
 }
+ARCHIVE_ADDITIONS = {
+    'patch-B.MPQ': {OVERLAY: OVERLAY_SOURCE},
+}
+STOCK_RACE_BUTTONS = 11
+RACE_BUTTONS = 10 + len(RACES)
 
 
 class Dbc:
@@ -97,14 +107,44 @@ def extend_cameras(data):
     return dbc.pack()
 
 
-PATCHERS = {CHR_RACES: patch_chr_races, CHAR_BASE_INFO: extend_char_base_info, CAMERAS: extend_cameras}
+def extend_character_create_xml(data):
+    text = data.decode('utf-8-sig')
+    newline = '\r\n' if '\r\n' in text else '\n'
+    if 'CoACustomRaces.lua' in text or f'CharCreateRaceButton{STOCK_RACE_BUTTONS + 1}"' in text:
+        raise ValueError('CharacterCreate.xml already carries the custom race buttons')
+    include = re.compile(r'([ \t]*)<Script\s+file\s*=\s*"CharacterCreate\.lua"\s*/>', re.I)
+    matches = include.findall(text)
+    if len(matches) != 1:
+        raise ValueError('Expected exactly one CharacterCreate.lua script include')
+    text = include.sub(lambda m: m.group(0) + newline + m.group(1) + '<Script file="CoACustomRaces.lua"/>', text)
+    last = re.compile(r'([ \t]*)<CheckButton\s+name="CharCreateRaceButton%d"[^>]*>.*?</CheckButton>'
+                      % STOCK_RACE_BUTTONS, re.S)
+    matches = last.findall(text)
+    if len(matches) != 1:
+        raise ValueError(f'Expected exactly one CharCreateRaceButton{STOCK_RACE_BUTTONS}')
+
+    def buttons(match):
+        indent = match.group(1)
+        added = [f'{indent}<CheckButton name="CharCreateRaceButton{index}" inherits="CharCreateRaceButtonTemplate" '
+                 f'id="{index}"><Anchors><Anchor point="TOPLEFT" relativeTo="CharCreateRaceButtonsFrame" '
+                 f'x="32" y="-75"/></Anchors></CheckButton>'
+                 for index in range(STOCK_RACE_BUTTONS + 1, RACE_BUTTONS + 1)]
+        return match.group(0) + newline + newline.join(added)
+
+    text = last.sub(buttons, text)
+    prefix = b'\xef\xbb\xbf' if data.startswith(b'\xef\xbb\xbf') else b''
+    return prefix + text.encode('utf-8')
+
+
+PATCHERS = {CHR_RACES: patch_chr_races, CHAR_BASE_INFO: extend_char_base_info, CAMERAS: extend_cameras,
+            CHARACTER_CREATE_XML: extend_character_create_xml}
 
 
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def package_archive(baseline, output, executable, members):
+def package_archive(baseline, output, executable, members, additions=None):
     baseline, output = Path(baseline).resolve(), Path(output).resolve()
     if baseline == output or output.exists():
         raise ValueError(f'{output} must be a new file, separate from the installed client')
@@ -140,6 +180,11 @@ def package_archive(baseline, output, executable, members):
             patched.write_bytes(PATCHERS[member](source.read_bytes()))
             run('add', '--overwrite', '--game', 'wow-wotlk', '--path', member.replace('/', '\\'), candidate, patched)
             wanted[member.lower()] = sha(patched)
+        for member, source in (additions or {}).items():
+            if member.lower() in wanted:
+                raise ValueError(f'{baseline.name} already contains {member}')
+            run('add', '--game', 'wow-wotlk', '--path', member.replace('/', '\\'), candidate, source)
+            wanted[member.lower()] = sha(source)
         run('extract', '--keep', '--output', after, candidate)
         if inventory(after) != wanted:
             raise RuntimeError(f'{baseline.name} readback differed from the expected member inventory')
@@ -147,13 +192,14 @@ def package_archive(baseline, output, executable, members):
             raise RuntimeError('Baseline changed while building; discard this candidate and retry')
         shutil.copyfile(candidate, output)
     return dict(archive=baseline.name, baseline_sha256=original_hash, candidate_sha256=sha(output),
-                changed_members=members)
+                changed_members=members, added_members=sorted(additions or {}))
 
 
 def package(client_data, output_directory, executable):
     client_data, output_directory = Path(client_data), Path(output_directory)
     executable = str(Path(executable).resolve())
-    reports = [package_archive(client_data / name, output_directory / name, executable, members)
+    reports = [package_archive(client_data / name, output_directory / name, executable, members,
+                               ARCHIVE_ADDITIONS.get(name))
                for name, members in ARCHIVE_MEMBERS.items()]
     report = dict(mpqcli_sha256=sha(executable), archives=reports, state='built; not installed or published')
     (output_directory / 'custom-races-client.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')

@@ -3,7 +3,8 @@ import re
 import struct
 import unittest
 
-from package_custom_races_client import (RACES, extend_cameras, extend_char_base_info, patch_chr_races)
+from package_custom_races_client import (OVERLAY_SOURCE, RACES, extend_cameras, extend_char_base_info,
+                                         extend_character_create_xml, patch_chr_races)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,6 +77,41 @@ class CameraTest(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
         worgen = [row[2:] for row in result if row[1] == 13]
         self.assertEqual(worgen, [(1, 7, 100), (0, 7, 101)])
+
+
+XML = '''<Ui>\r
+\t<Script file="CharacterCreate.lua"/>\r
+\t<Frame name="CharCreateRaceButtonsFrame">\r
+\t\t<CheckButton name="CharCreateRaceButton10" inherits="CharCreateRaceButtonTemplate" id="10">\r
+\t\t</CheckButton>\r
+\t\t<CheckButton name="CharCreateRaceButton11" inherits="CharCreateRaceButtonTemplate" id="11">\r
+\t\t\t<Anchors><Anchor point="TOPLEFT" relativeTo="CharCreateRaceButton10"/></Anchors>\r
+\t\t</CheckButton>\r
+\t</Frame>\r
+</Ui>\r
+'''
+
+
+class CharacterCreateXmlTest(unittest.TestCase):
+    def test_overlay_loads_after_stock_script_and_buttons_follow_the_last_stock_button(self):
+        text = extend_character_create_xml(XML.encode()).decode()
+        self.assertIn('<Script file="CharacterCreate.lua"/>\r\n\t<Script file="CoACustomRaces.lua"/>', text)
+        positions = [text.index(f'name="CharCreateRaceButton{index}"') for index in range(10, 17)]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('id="16"', text)
+        self.assertNotIn('id="17"', text)
+        self.assertNotIn('\n\n', text.replace('\r', ''))
+
+    def test_unknown_or_already_patched_sources_fail(self):
+        patched = extend_character_create_xml(XML.encode())
+        for source in (patched, XML.replace('CharacterCreate.lua', 'Other.lua').encode(),
+                       XML.replace('CharCreateRaceButton11', 'CharCreateRaceButtonX').encode()):
+            with self.assertRaises(ValueError):
+                extend_character_create_xml(source)
+
+    def test_overlay_supports_sixteen_races(self):
+        text = OVERLAY_SOURCE.read_text(encoding='utf-8')
+        self.assertIn(f'MAX_RACES = {10 + len(RACES)}', text)
 
 
 class ServerDataTest(unittest.TestCase):
