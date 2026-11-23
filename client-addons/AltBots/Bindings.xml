@@ -1,0 +1,26 @@
+<Bindings>
+  <Binding name="ALTBOTS_TOGGLE" header="ALTBOTS">
+    AltBots_Toggle()
+  </Binding>
+  <Binding name="ALTBOTS_QUICKBAR">
+    AltBots_ToggleQuickBar()
+  </Binding>
+  <Binding name="ALTBOTS_FOLLOW">
+    AltBots_Order("follow")
+  </Binding>
+  <Binding name="ALTBOTS_STAY">
+    AltBots_Order("stay")
+  </Binding>
+  <Binding name="ALTBOTS_ATTACK">
+    AltBots_Order("attack")
+  </Binding>
+  <Binding name="ALTBOTS_STOPATTACK">
+    AltBots_Order("stopattack")
+  </Binding>
+  <Binding name="ALTBOTS_PULL">
+    AltBots_Order("pull")
+  </Binding>
+  <Binding name="ALTBOTS_SHARE">
+    AltBots_Share()
+  </Binding>
+</Bindings>

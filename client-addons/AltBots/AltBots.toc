@@ -1,6 +1,6 @@
 ## Interface: 30300
 ## Title: AltBots
-## Notes: Spawn and command your CoA Companion alts. The alt list syncs with your account, so wiped characters drop off. Party tab for role, spec, professions, gear and bags; Quests tab for each bot's quest log and sharing your quests with your alts. Minimap button, slash /alt.
-## Version: 2.1
+## Notes: Spawn and command your CoA Companion alts. The alt list syncs with your account, so wiped characters drop off. Commands tab with live health, mana and range of grouped alts; a movable quick bar and key bindings for orders; Party tab for role, spec, professions, gear and bags; Quests tab for each bot's quest log, an all-bots view and sharing your quests with your alts. Minimap button, slash /alt.
+## Version: 3.0
 ## SavedVariables: AltBotsDB
 AltBots.lua
