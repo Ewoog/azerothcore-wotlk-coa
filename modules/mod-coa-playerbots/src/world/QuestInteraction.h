@@ -74,8 +74,9 @@ namespace QuestInteraction
 
     // A real player in a group accepted or turned in a quest. Nearby grouped bots (40 yards)
     // take or hand in the same quest when CoaBots.Quest.ShareAccept / ShareTurnIn is on.
-    // The commander's own alts (same account) skip the eligibility check when
-    // CoaBots.Quest.ShareIgnoreEligibility is on; other bots still need CanTakeQuest.
+    // The commander's own alts (same account) get an accepted quest at any range, skip the
+    // eligibility check when CoaBots.Quest.ShareIgnoreEligibility is on, and are summed up in one
+    // chat line; other bots still need CanTakeQuest and the 40-yard range.
     // Turn-in uses PickRewardIndex, CanRewardQuest and RewardQuest; accept uses CanTakeQuest,
     // CanAddQuest and AddQuestAndCheckCompletion. Bots as the source are ignored so a bot's
     // own turn-in cannot recurse or reward the player a second time.

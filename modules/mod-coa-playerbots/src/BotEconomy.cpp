@@ -1482,7 +1482,7 @@ namespace BotEconomy
                 }
                 // Gathered and looted materials (herbs, ore, leather, cloth, meat...), above what the bot keeps and what
                 // its guild bank is short of. Crafting-order reagents stay (IsReservedItem above).
-                if (sellsTradeGoods && !BotAI::IsProfessionTool(proto) && !bot->HasQuestForItem(entry))
+                if (sellsTradeGoods && !BotAI::IsProfessionTool(proto) && !bot->HasQuestForItem(entry, 0, true))
                 {
                     if (!consumableDone.insert(entry).second)
                         return;

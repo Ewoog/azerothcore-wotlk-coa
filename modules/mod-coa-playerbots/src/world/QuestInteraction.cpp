@@ -854,14 +854,56 @@ namespace QuestInteraction
         Object* source = giver ? giver : FindNearbyQuestObject(player, quest->GetQuestId(), false);
         ForNearbyGroupedBots(player, [&](Player* bot)
         {
-            ShareResult const result = ShareQuest(player, bot, quest, source);
             if (!IsOwnAlt(player, bot))
-                return;
-            if (result == ShareResult::AddedIneligible)
-                Tell(player, Acore::StringFormat("{} took \"{}\" with you (not normally eligible).", bot->GetName(), quest->GetTitle()));
-            else if (result == ShareResult::LogFull || result == ShareResult::NoBagSpace || result == ShareResult::AlreadyRewarded)
-                Tell(player, Acore::StringFormat("{} could not take \"{}\": {}.", bot->GetName(), quest->GetTitle(), ShareResultText(result)));
+                ShareQuest(player, bot, quest, source);
         });
+
+        // Own alts get the quest wherever they are in the group (no range, alive or not), and the
+        // commander gets one summary of who took it and why anyone did not.
+        std::vector<std::string> took, tookIneligible, had;
+        Group* group = player->GetGroup();
+        for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player* bot = ref->GetSource();
+            if (!bot || bot == player || !bot->IsInWorld() || bot->IsBeingTeleported() || !IsOwnAlt(player, bot))
+                continue;
+            if (!sBotMgr->FindBotPlayer(bot->GetGUID().GetCounter()))
+                continue;
+
+            bool const inRange = bot->GetMap() == player->GetMap() && bot->IsWithinDistInMap(player, COMPANION_SHARE_RANGE);
+            switch (ShareResult const result = ShareQuest(player, bot, quest, inRange ? source : nullptr))
+            {
+                case ShareResult::Added:
+                    took.push_back(bot->GetName());
+                    break;
+                case ShareResult::AddedIneligible:
+                    tookIneligible.push_back(bot->GetName());
+                    break;
+                case ShareResult::AlreadyHas:
+                    had.push_back(bot->GetName());
+                    break;
+                default:
+                    Tell(player, Acore::StringFormat("{} could not take \"{}\": {}.", bot->GetName(), quest->GetTitle(), ShareResultText(result)));
+                    break;
+            }
+        }
+
+        auto join = [](std::vector<std::string> const& names)
+        {
+            std::string out;
+            for (std::size_t i = 0; i < names.size(); ++i)
+                out += (i ? ", " : "") + names[i];
+            return out;
+        };
+        std::vector<std::string> parts;
+        if (!took.empty())
+            parts.push_back(join(took) + " took it");
+        if (!tookIneligible.empty())
+            parts.push_back(join(tookIneligible) + " took it (not normally eligible)");
+        if (!had.empty())
+            parts.push_back(join(had) + " already had it");
+        if (!parts.empty())
+            Tell(player, Acore::StringFormat("\"{}\": {}.", quest->GetTitle(), join(parts)));
     }
 
     void ShareQuestLogWithAlts(Player* player)

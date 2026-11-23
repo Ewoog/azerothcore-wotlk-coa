@@ -522,7 +522,7 @@ namespace
     {
         if (!proto)
             return false;
-        if (bot->HasQuestForItem(proto->ItemId))
+        if (bot->HasQuestForItem(proto->ItemId, 0, true))
             return false;
         if (proto->StartQuest)
         {
@@ -1139,7 +1139,7 @@ namespace
             return proto->SellPrice > 0 ? BagItemFate::Sell : BagItemFate::Destroy;
 
         if (proto->Class == ITEM_CLASS_QUEST || proto->StartQuest || proto->Bonding == BIND_QUEST_ITEM
-            || proto->Bonding == BIND_QUEST_ITEM1 || bot->HasQuestForItem(proto->ItemId))
+            || proto->Bonding == BIND_QUEST_ITEM1 || bot->HasQuestForItem(proto->ItemId, 0, true))
             return BagItemFate::Keep;
 
         if (proto->Quality == ITEM_QUALITY_POOR)
