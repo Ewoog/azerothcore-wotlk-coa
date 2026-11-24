@@ -105,6 +105,7 @@ local DB_VERSION = 2
 local SETTING_KEYS = {
     version = true, realms = true, farmRadius = true, minimapAngle = true, minimapHidden = true, tab = true,
     winPos = true, quickBarPos = true, quickBar = true, scale = true, matDeliver = true, matCount = true, sendRules = true,
+    winHeight = true,
 }
 local SYNC_DELAY, SYNC_TIMEOUT, SYNC_REFRESH = 3, 8, 60
 
@@ -1849,9 +1850,31 @@ EnsureWindow = function()
     ui.status:SetJustifyH("LEFT")
     ui.status:SetText("Ready.")
     local version = footer:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
-    version:SetPoint("RIGHT", -12, 0)
+    version:SetPoint("RIGHT", -22, 0)
     W.TextColor(version, C.faint)
     version:SetText("v" .. (GetAddOnMetadata("AltBots", "Version") or "?") .. "  |  /alt help")
+
+    win:SetResizable(true)
+    win:SetMinResize(WIN_W, WIN_H)
+    win:SetMaxResize(WIN_W, 2000)
+    local savedH = tonumber(AltBotsDB.winHeight)
+    if savedH and savedH > WIN_H then win:SetHeight(savedH) end
+    local grip = CreateFrame("Button", nil, win)
+    grip:SetWidth(16); grip:SetHeight(16)
+    grip:SetPoint("BOTTOMRIGHT", -2, 2)
+    grip:SetFrameLevel(footer:GetFrameLevel() + 2)
+    grip:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+    grip:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight")
+    grip:SetPushedTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Down")
+    grip:SetScript("OnMouseDown", function() win:StartSizing("BOTTOMRIGHT") end)
+    grip:SetScript("OnMouseUp", function()
+        win:StopMovingOrSizing()
+        W.SavePosition(win, "winPos")
+        local h = math.floor((win:GetHeight() or WIN_H) + 0.5)
+        AltBotsDB.winHeight = h > WIN_H and h or nil
+        if LayoutPartyDetail then LayoutPartyDetail() end
+    end)
+    W.HookTip(grip, "Resize", "Drag to make the window taller. AltBots remembers the height.")
 
     -- Alts pane
     local alts = CreateFrame("Frame", nil, body)
@@ -2385,14 +2408,15 @@ EnsureWindow = function()
 
         -- Grow the window so the bag grid always shows at least MIN_BAG_ROWS rows,
         -- capped to the screen.
-        local MIN_BAG_ROWS = 4
+        local MIN_BAG_ROWS = 6
         local minBagH = MIN_BAG_ROWS * 36 + 8
+        local baseH = math.max(WIN_H, tonumber(AltBotsDB.winHeight) or 0)
         local curH = win:GetHeight() or WIN_H
         local detailH = ui.detail:GetHeight() or 0
         if detailH > 0 then
-            local detailAtBase = detailH - (curH - WIN_H)
+            local detailAtBase = detailH - (curH - baseH)
             local bagAtBase = detailAtBase + y - 4
-            local wantH = WIN_H + math.max(0, minBagH - bagAtBase)
+            local wantH = baseH + math.max(0, minBagH - bagAtBase)
             local maxH = ((UIParent:GetHeight() or 768) / (win:GetScale() or 1)) - 40
             if wantH > maxH then wantH = maxH end
             if wantH < WIN_H then wantH = WIN_H end
