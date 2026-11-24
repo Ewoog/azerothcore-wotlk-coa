@@ -74,6 +74,7 @@
 #include "Pet.h"
 #include "PetitionMgr.h"
 #include "QuestDef.h"
+#include "RaceMgr.h"
 #include "RBAC.h"
 #include "Realm.h"
 #include "ReputationMgr.h"
