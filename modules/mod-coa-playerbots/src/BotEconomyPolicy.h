@@ -9,8 +9,10 @@
 #ifndef COA_PLAYERBOTS_BOT_ECONOMY_POLICY_H
 #define COA_PLAYERBOTS_BOT_ECONOMY_POLICY_H
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 namespace BotEconomyPolicy
 {
@@ -117,6 +119,51 @@ namespace BotEconomyPolicy
         if (planned == PlannedSale::Auction)
             return false;
         return !economyJudgesClass;
+    }
+
+    // How much food (and, separately, drink) a bot keeps for its own eating: `base`, plus `perTenLevels` for every ten
+    // levels, and never less than what it buys up to on a trip to town.
+    constexpr std::uint32_t SupplyKeep(std::uint32_t level, std::uint32_t base, std::uint32_t perTenLevels,
+        std::uint32_t buyTarget)
+    {
+        std::uint32_t const scaled = base + level / 10 * perTenLevels;
+        return scaled > buyTarget ? scaled : buyTarget;
+    }
+
+    // One food or drink item the bot carries, all of its stacks together.
+    struct SupplyStock
+    {
+        std::uint32_t entry = 0;
+        std::uint32_t requiredLevel = 0;
+        std::uint32_t count = 0;
+    };
+
+    // What is left over once the bot has kept `keep` items of one kind, the best it may eat first (highest required
+    // level, then the biggest pile). Items above its level are neither kept nor surplus: it will grow into them.
+    // Returns the surplus per item, leaving out items with none.
+    inline std::vector<SupplyStock> SupplySurplus(std::vector<SupplyStock> held, std::uint32_t level,
+        std::uint32_t keep)
+    {
+        std::sort(held.begin(), held.end(), [](SupplyStock const& a, SupplyStock const& b)
+        {
+            if (a.requiredLevel != b.requiredLevel)
+                return a.requiredLevel > b.requiredLevel;
+            if (a.count != b.count)
+                return a.count > b.count;
+            return a.entry < b.entry;
+        });
+        std::vector<SupplyStock> surplus;
+        std::uint32_t left = keep;
+        for (SupplyStock const& stock : held)
+        {
+            if (stock.requiredLevel > level)
+                continue;
+            std::uint32_t const kept = stock.count < left ? stock.count : left;
+            left -= kept;
+            if (stock.count > kept)
+                surplus.push_back({ stock.entry, stock.requiredLevel, stock.count - kept });
+        }
+        return surplus;
     }
 
     // A recipe is worth crafting for the market when the product fetches marginPercent more than its reagents are worth.

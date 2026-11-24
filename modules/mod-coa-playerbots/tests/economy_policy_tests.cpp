@@ -1,6 +1,7 @@
 #include "BotEconomyPolicy.h"
 #include <cassert>
 #include <iostream>
+#include <vector>
 
 int main()
 {
@@ -84,6 +85,29 @@ int main()
     assert(!CleanupMayVendor(true, false, PlannedSale::NotPlanned, true));
     assert(CleanupMayVendor(true, false, PlannedSale::NotPlanned, false));
 
+    assert(SupplyKeep(1, 10, 5, 20) == 20);
+    assert(SupplyKeep(39, 10, 5, 20) == 25);
+    assert(SupplyKeep(60, 10, 5, 20) == 40);
+    assert(SupplyKeep(80, 10, 5, 0) == 50);
+
+    {
+        std::vector<SupplyStock> const held = { { 101, 5, 30 }, { 102, 25, 15 }, { 103, 35, 10 }, { 104, 45, 20 } };
+        std::vector<SupplyStock> const surplus = SupplySurplus(held, 40, 30);
+        assert(surplus.size() == 1);
+        assert(surplus[0].entry == 101 && surplus[0].count == 25);
+        assert(SupplySurplus(held, 40, 200).empty());
+        std::vector<SupplyStock> const nothingKept = SupplySurplus(held, 40, 0);
+        assert(nothingKept.size() == 3);
+    }
+    {
+        std::vector<SupplyStock> const sameLevel = { { 201, 15, 5 }, { 202, 15, 30 } };
+        std::vector<SupplyStock> const surplus = SupplySurplus(sameLevel, 20, 20);
+        assert(surplus.size() == 2);
+        assert(surplus[0].entry == 202 && surplus[0].count == 10);
+        assert(surplus[1].entry == 201 && surplus[1].count == 5);
+    }
+
     std::cout << "Economy policy: keep rules, purchase window, price ceiling, hourly cap, upgrade margin, give-up limit, "
-                 "vendor cost, craft margin, price estimate, trade goods for sale, unsold listings and cleanup vendoring passed.\n";
+                 "vendor cost, craft margin, price estimate, trade goods for sale, unsold listings, cleanup vendoring and "
+                 "food and drink surplus passed.\n";
 }

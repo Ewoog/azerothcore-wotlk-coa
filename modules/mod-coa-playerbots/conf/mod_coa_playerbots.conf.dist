@@ -596,7 +596,8 @@ CoaBots.MarkSessionsAsBots = 1
 #        Default:     50000 - (5 gold)
 #
 #    CoaBots.Economy.KeepConsumables
-#        Description: How many potions / food items of its own level range a bot keeps of each kind.
+#        Description: How many potions, bandages and other consumables of its own level range a bot keeps of
+#                     each kind. Food and drink to eat follow SupplyKeepBase / SupplyKeepPerTenLevels instead.
 #        Default:     10
 #
 #    CoaBots.Economy.OutdatedBelowLevels
@@ -659,6 +660,14 @@ CoaBots.MarkSessionsAsBots = 1
 #        Description: How many food and how many drink items a bot likes to carry; what one bot may spend on them in
 #                     a day.
 #        Default:     20 / 20000 - (2 gold)
+#
+#    CoaBots.Economy.SupplyKeepBase / SupplyKeepPerTenLevels
+#        Description: How much food, and separately how much drink, a bot keeps for its own eating: SupplyKeepBase plus
+#                     SupplyKeepPerTenLevels for every ten levels, never less than SupplyTarget. The best food and
+#                     drink it may eat is kept first; the rest is sold (white food to a vendor, finer cooking to the
+#                     auction house) on economy trips and by bag cleanup whenever the bot is at a vendor, with or
+#                     without the economy. Quest items, protected items and conjured food are never sold this way.
+#        Default:     10 / 5 - (20 kept up to level 29, 25 at 30, 40 at 60, 50 at 80)
 #
 #    Stock limits (no setting)
 #        Description: The guild master and officers set limits from the addon's Stock tab ("keep N of this resource").
@@ -759,6 +768,8 @@ CoaBots.Economy.MoneyReserveCopper = 50000
 CoaBots.Economy.MaxListings = 40
 CoaBots.Economy.ConsumeSupplies = 0
 CoaBots.Economy.SupplyTarget = 20
+CoaBots.Economy.SupplyKeepBase = 10
+CoaBots.Economy.SupplyKeepPerTenLevels = 5
 CoaBots.Economy.DailyBudgetCopper = 20000
 CoaBots.Economy.MinListingCopper = 1000
 CoaBots.Economy.ListingMinutes = 2880
