@@ -11,14 +11,16 @@ CoaBots.Loot.AutoLootInGroup = 0
 
 # Bots roll Need on group-loot armor and weapons that are an upgrade for them: gear they can equip now
 # (or within CoaBots.Loot.NeedLevelsAhead levels), that matches their gear preference, and that scores
-# at least 5% better than what they wear in that slot (an empty slot always counts). Everything else
-# is Greed, or Pass for armor/weapon types they cannot wear or do not prefer.
+# at least 5% better than what they wear in that slot (an empty slot always counts) and better than the
+# upgrade they already saved for that slot. Everything else is Greed, or Pass for armor/weapon types
+# they cannot wear or do not prefer.
 # 0 = never Need (Greed/Pass only, the old behavior).
 CoaBots.Loot.NeedOnUpgrades = 1
 
 # How many levels below an item's required level a bot may still Need-roll on it as an upgrade.
-# The bot keeps the item in its bags (bag cleanup and vendoring leave it alone while it is still an
-# upgrade) and equips it once it reaches the level. 0 = only gear it can wear right now. Max 10.
+# The bot keeps the item in its bags and equips it once it reaches the level. It saves one upgrade per
+# equipment slot (two for rings and trinkets), the best-scoring one; bag cleanup, vendoring and the
+# auction economy sell the rest like outgrown gear. 0 = only gear it can wear right now. Max 10.
 CoaBots.Loot.NeedLevelsAhead = 2
 
 #
@@ -324,7 +326,7 @@ CoaBots.Trade.Enable = 1
 #                     grouped bots within CoaBots.Maintenance.ShareRange of that player clear their
 #                     bags: grey junk, outgrown or unusable gear, leftover quest items, white vendor
 #                     trash, known recipes and surplus trade goods and consumables are sold, and each
-#                     item sold is listed in chat. Quest items still needed, possible upgrades,
+#                     item sold is listed in chat. Quest items still needed, saved upgrades,
 #                     crafting-order and gather-order items and protected items stay. With the live
 #                     economy (CoaBots.Economy.DryRun = 0) what the economy plans for the auction
 #                     house is listed there first (CoaBots.Economy.ListFromAnywhere) instead of

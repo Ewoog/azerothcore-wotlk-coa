@@ -354,11 +354,18 @@ namespace
     }
 
     // Gear the bot cannot wear, or that does not beat what it already wears in the slot (the same 5% margin the
-    // upgrade pass uses). Gear that would fill an empty slot is not dead weight: the bot will put it on.
-    bool IsDeadWeightGear(Player* bot, ItemTemplate const* proto, char const*& reason)
+    // upgrade pass uses). Gear that would fill an empty slot is not dead weight: the bot will put it on. Of several
+    // upgrades saved for one slot only the best stays (two for rings and trinkets); the rest are surplus.
+    bool IsDeadWeightGear(Player* bot, Item const* item, ItemTemplate const* proto, BotAI::KeptUpgradeSet const& kept,
+        char const*& reason)
     {
-        if (BotAI::IsProfessionTool(proto) || BotAI::IsLootUpgrade(bot, proto))
+        if (BotAI::IsProfessionTool(proto))
             return false;
+        if (BotAI::IsLootUpgrade(bot, proto))
+        {
+            reason = "surplus-upgrade";
+            return !BotAI::IsKeptUpgrade(kept, item);
+        }
         uint8 const slot = bot->FindEquipSlot(proto, NULL_SLOT, true);
         if (slot == NULL_SLOT)
         {
@@ -1427,6 +1434,7 @@ namespace BotEconomy
         uint8 const botLevel = bot->GetLevel();
 
         std::unordered_map<uint32, uint32> const supplySurplus = BotEconomy::SurplusSupplies(bot);
+        BotAI::KeptUpgradeSet const keptUpgrades = BotAI::KeptUpgrades(bot);
 
         // Consumables are judged per item over all stacks together.
         std::unordered_map<uint32, uint32> consumableTotal;
@@ -1538,7 +1546,7 @@ namespace BotEconomy
             if (proto->Class == ITEM_CLASS_ARMOR || proto->Class == ITEM_CLASS_WEAPON)
             {
                 char const* reason = "";
-                if (!IsDeadWeightGear(bot, proto, reason))
+                if (!IsDeadWeightGear(bot, item, proto, keptUpgrades, reason))
                     return;
                 line.count = item->GetCount();
                 line.reason = reason;
