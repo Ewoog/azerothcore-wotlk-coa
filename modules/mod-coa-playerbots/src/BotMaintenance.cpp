@@ -1107,7 +1107,8 @@ namespace
         }
     }
 
-    BagItemFate FateOfItem(Player* bot, Item const* item, uint32 heldTrade, uint32 heldConsumable, bool bagsTight)
+    BagItemFate FateOfItem(Player* bot, Item const* item, uint32 heldTrade, uint32 heldConsumable, uint32 supplySurplus,
+        bool bagsTight)
     {
         if (IsProtectedBagItem(bot, item))
             return BagItemFate::Keep;
@@ -1158,6 +1159,10 @@ namespace
         {
             if (proto->RequiredLevel && bot->GetLevel() < proto->RequiredLevel)
                 return bagsTight && proto->SellPrice > 0 ? BagItemFate::Sell : BagItemFate::Keep;
+            // Food and drink to eat: what is left over after the bot's own level-scaled stack
+            // (BotEconomy::SurplusSupplies) goes, a vendor visit at a time.
+            if (BotEconomy::IsEatenSupply(proto))
+                return supplySurplus && proto->SellPrice > 0 ? BagItemFate::Sell : BagItemFate::Keep;
             uint32 limit = ConsumableKeepLimit(proto);
             if (bagsTight && heldConsumable > limit)
                 return proto->SellPrice > 0 ? BagItemFate::Sell : BagItemFate::Keep;
@@ -1236,6 +1241,7 @@ namespace
             return 0;
         std::unordered_map<uint32, BotEconomy::Verdict> liveVerdicts;
         bool const live = TryLiveVerdicts(bot, liveVerdicts);
+        std::unordered_map<uint32, uint32> const supplySurplus = BotEconomy::SurplusSupplies(bot);
         std::unordered_map<uint32, uint32> tradeCount;
         std::unordered_map<uint32, uint32> consCount;
         ForEachInventoryItem(bot, [&](Item* item)
@@ -1265,7 +1271,9 @@ namespace
             }
             uint32 traded = proto && proto->Class == ITEM_CLASS_TRADE_GOODS ? tradeCount[item->GetEntry()] : 0;
             uint32 consumed = proto && proto->Class == ITEM_CLASS_CONSUMABLE ? consCount[item->GetEntry()] : 0;
-            if (FateOfItem(bot, item, traded, consumed, true) == BagItemFate::Sell)
+            auto const surplus = supplySurplus.find(item->GetEntry());
+            uint32 const spare = surplus == supplySurplus.end() ? 0 : surplus->second;
+            if (FateOfItem(bot, item, traded, consumed, spare, true) == BagItemFate::Sell)
                 ++count;
         });
         return count;
@@ -2021,6 +2029,7 @@ namespace BotMaintenance
             GearPlan gear = ClassifyGear(bot);
             std::unordered_map<uint32, BotEconomy::Verdict> liveVerdicts;
             bool const live = TryLiveVerdicts(bot, liveVerdicts);
+            std::unordered_map<uint32, uint32> supplySurplus = BotEconomy::SurplusSupplies(bot);
 
             std::unordered_map<uint32, uint32> tradeCount;
             std::unordered_map<uint32, uint32> consCount;
@@ -2062,11 +2071,13 @@ namespace BotMaintenance
 
                 uint32 traded = proto->Class == ITEM_CLASS_TRADE_GOODS ? tradeCount[item->GetEntry()] : 0;
                 uint32 consumed = proto->Class == ITEM_CLASS_CONSUMABLE ? consCount[item->GetEntry()] : 0;
+                bool const eaten = BotEconomy::IsEatenSupply(proto);
+                uint32& spare = supplySurplus[item->GetEntry()];
                 BagItemFate fate = BagItemFate::Keep;
                 if (tools.sell.count(guid) || gear.sell.count(guid))
                     fate = proto->SellPrice > 0 ? BagItemFate::Sell : BagItemFate::Destroy;
-                else if (bagsTight)
-                    fate = FateOfItem(bot, item, traded, consumed, true);
+                else if (bagsTight || (eaten && vendor))
+                    fate = FateOfItem(bot, item, traded, consumed, spare, bagsTight);
                 if (fate == BagItemFate::Keep)
                     continue;
 
@@ -2078,10 +2089,21 @@ namespace BotMaintenance
                 if (fate == BagItemFate::Sell && vendor && proto->SellPrice > 0
                     && sScriptMgr->OnPlayerCanSellItem(bot, item, vendor))
                 {
+                    if (eaten && spare)
+                    {
+                        count = std::min(count, spare);
+                        spare -= count;
+                    }
                     uint32 money = proto->SellPrice * count;
                     bot->ModifyMoney(money);
                     result.copperEarned += money;
-                    bot->DestroyItem(bagSlot, slot, true);
+                    if (count < item->GetCount())
+                    {
+                        uint32 left = count;
+                        bot->DestroyItemCount(item, left, true);
+                    }
+                    else
+                        bot->DestroyItem(bagSlot, slot, true);
                     ++result.stacksSold;
                     result.sold.push_back({ entry, count });
                     if (live)

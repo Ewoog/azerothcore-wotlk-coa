@@ -75,6 +75,8 @@ namespace
         uint32 listingMinutes = 2880;      // how long a listing runs
         bool consumeSupplies = false;      // eating and drinking use up food and drink
         uint32 supplyTarget = 20;          // how many of each a bot likes to carry
+        uint32 supplyKeepBase = 10;        // food (and drink) a bot keeps for itself before selling the rest ...
+        uint32 supplyKeepPerTenLevels = 5; // ... plus this many for every ten levels
         uint32 dailyBudgetCopper = 20000;  // what one bot spends on supplies in a day
         bool auctionBuyGear = false;       // bots buy gear upgrades at the auction house
         uint32 auctionBuyBudgetPercent = 25;   // of the money above the reserve, spent on one shopping visit
@@ -185,6 +187,10 @@ namespace
         g_settings.spreadMin = std::min<uint32>(50, sConfigMgr->GetOption<uint32>("CoaBots.Economy.PriceSpreadMinPercent", 5));
         g_settings.consumeSupplies = sConfigMgr->GetOption<bool>("CoaBots.Economy.ConsumeSupplies", false);
         g_settings.supplyTarget = std::max<uint32>(1, std::min<uint32>(200, sConfigMgr->GetOption<uint32>("CoaBots.Economy.SupplyTarget", 20)));
+        g_settings.supplyKeepBase = std::min<uint32>(200,
+            sConfigMgr->GetOption<uint32>("CoaBots.Economy.SupplyKeepBase", 10));
+        g_settings.supplyKeepPerTenLevels = std::min<uint32>(50,
+            sConfigMgr->GetOption<uint32>("CoaBots.Economy.SupplyKeepPerTenLevels", 5));
         g_settings.dailyBudgetCopper = sConfigMgr->GetOption<uint32>("CoaBots.Economy.DailyBudgetCopper", 20000);
         g_settings.minListingCopper = sConfigMgr->GetOption<uint32>("CoaBots.Economy.MinListingCopper", 1000);
         g_settings.listingMinutes = std::max<uint32>(5, std::min<uint32>(2880, sConfigMgr->GetOption<uint32>("CoaBots.Economy.ListingMinutes", 2880)));
@@ -1420,6 +1426,8 @@ namespace BotEconomy
 
         uint8 const botLevel = bot->GetLevel();
 
+        std::unordered_map<uint32, uint32> const supplySurplus = BotEconomy::SurplusSupplies(bot);
+
         // Consumables are judged per item over all stacks together.
         std::unordered_map<uint32, uint32> consumableTotal;
         ForEachBagItem(bot, [&](Item* item)
@@ -1539,7 +1547,23 @@ namespace BotEconomy
                 return;
             }
 
-            // Potions, elixirs, flasks, food, bandages.
+            // Food and drink beyond what the bot keeps for its own eating. White food goes to a vendor, finer cooking
+            // to the auction house.
+            if (BotEconomy::IsEatenSupply(proto))
+            {
+                if (!consumableDone.insert(entry).second)
+                    return;
+                auto const surplus = supplySurplus.find(entry);
+                if (surplus == supplySurplus.end())
+                    return;
+                line.count = surplus->second;
+                line.reason = "surplus-supplies";
+                Decide(item, proto, true, line);
+                add(std::move(line));
+                return;
+            }
+
+            // Potions, elixirs, flasks, other food, bandages.
             if (IsConsumableOfInterest(proto))
             {
                 if (!consumableDone.insert(entry).second)
@@ -2428,6 +2452,56 @@ namespace BotEconomy
     bool IsProtectedItem(uint32 itemEntry)
     {
         return g_protected.count(itemEntry) != 0;
+    }
+
+    bool IsEatenSupply(ItemTemplate const* proto)
+    {
+        return proto && proto->Class == ITEM_CLASS_CONSUMABLE && proto->SubClass == ITEM_SUBCLASS_FOOD
+            && (proto->Spells[0].SpellCategory == 11 || proto->Spells[0].SpellCategory == 59);
+    }
+
+    std::unordered_map<uint32, uint32> SurplusSupplies(Player* bot)
+    {
+        std::unordered_map<uint32, uint32> out;
+        if (!bot)
+            return out;
+        std::unordered_map<uint32, BotEconomyPolicy::SupplyStock> food;
+        std::unordered_map<uint32, BotEconomyPolicy::SupplyStock> drink;
+        std::unordered_set<uint32> held;
+        ForEachBagItem(bot, [&](Item* item)
+        {
+            ItemTemplate const* proto = item->GetTemplate();
+            if (!IsEatenSupply(proto) || item->IsConjuredConsumable())
+                return;
+            uint32 const entry = item->GetEntry();
+            if (proto->StartQuest || proto->Bonding == BIND_QUEST_ITEM || proto->Bonding == BIND_QUEST_ITEM1
+                || g_protected.count(entry) || bot->HasQuestForItem(entry, 0, true)
+                || BotEconomy::IsReservedItem(bot, item))
+            {
+                held.insert(entry);
+                return;
+            }
+            auto& kind = proto->Spells[0].SpellCategory == 11 ? food : drink;
+            BotEconomyPolicy::SupplyStock& stock = kind[entry];
+            stock.entry = entry;
+            stock.requiredLevel = proto->RequiredLevel;
+            stock.count += item->GetCount();
+        });
+        uint32 const level = bot->GetLevel();
+        uint32 const keep = BotEconomyPolicy::SupplyKeep(level, g_settings.supplyKeepBase,
+            g_settings.supplyKeepPerTenLevels, g_settings.supplyTarget);
+        for (auto const* kind : { &food, &drink })
+        {
+            std::vector<BotEconomyPolicy::SupplyStock> stocks;
+            for (auto const& [entry, stock] : *kind)
+                if (!held.count(entry))
+                    stocks.push_back(stock);
+            std::vector<BotEconomyPolicy::SupplyStock> const spares =
+                BotEconomyPolicy::SupplySurplus(std::move(stocks), level, keep);
+            for (BotEconomyPolicy::SupplyStock const& spare : spares)
+                out[spare.entry] = spare.count;
+        }
+        return out;
     }
 
     bool IsLive()

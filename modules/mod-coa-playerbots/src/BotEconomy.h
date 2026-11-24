@@ -27,12 +27,14 @@
 #include "Define.h"
 #include "ObjectGuid.h"
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 class ChatHandler;
 class Item;
 class Player;
 class SpellInfo;
+struct ItemTemplate;
 class WorldSession;
 
 namespace BotEconomy
@@ -112,6 +114,14 @@ namespace BotEconomy
     // True when item_entry is in mod_coa_bot_protected_items and that table has been loaded.
     // False when the economy tables have not been created yet.
     bool IsProtectedItem(uint32 itemEntry);
+
+    // Food (spell category 11) or drink (59) a bot sits down to eat.
+    bool IsEatenSupply(ItemTemplate const* proto);
+
+    // Food and drink above what the bot keeps for its own eating, by item entry. Each kind keeps
+    // CoaBots.Economy.SupplyKeepBase plus SupplyKeepPerTenLevels for every ten levels (at least SupplyTarget), the
+    // best items it may eat first. Quest items, protected, reserved and conjured items are never surplus.
+    std::unordered_map<uint32, uint32> SurplusSupplies(Player* bot);
 
     // CoaBots.Economy.Enable = 1 and DryRun = 0: bots actually trade, not just plan.
     bool IsLive();
