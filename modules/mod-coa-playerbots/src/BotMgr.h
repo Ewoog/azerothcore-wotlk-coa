@@ -130,6 +130,7 @@ public:
     // reachable by the bot's follow), puts up to six stacks of the item in it and accepts once
     // the commander accepts. Gives up after a minute.
     std::string OfferTrade(Player* bot, Player* commander, uint32 itemEntry, uint32 count);
+    void OnTradeWindowAccepted(Player* player);
 
     // Standing send rules (AltBots Rules tab, COABOT RULE / RULECLEAR): while a rule is on, every
     // online bot on the owner's account keeps sending that item to the owner -- by mail every
@@ -788,6 +789,7 @@ private:
         uint32 nextMoveMs = 0;
         uint32 countBefore = 0;
         bool initiated = false;
+        bool windowOpen = false;
         bool placed = false;
     };
     std::unordered_map<ObjectGuid, TradeOffer> _tradeOffers;

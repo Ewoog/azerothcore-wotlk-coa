@@ -57,6 +57,7 @@
 #include "QueryHolder.h"
 #include "Realm.h"
 #include "ScriptMgr.h"
+#include "ServerScript.h"
 #include "SharedDefines.h"
 #include "TradeData.h"
 #include "SpellAuraDefines.h"
@@ -4960,7 +4961,7 @@ void BotMgr::UpdateTrades(uint32 diff)
             continue;
 
         auto [age, isNew] = _tradeAgeMs.try_emplace(bot->GetGUID(), 0u);
-        if (isNew)
+        if (isNew && !_tradeOffers.count(bot->GetGUID()))
         {
             WorldPacket begin(CMSG_BEGIN_TRADE);
             session->HandleBeginTradeOpcode(begin);
@@ -5160,6 +5161,17 @@ void BotMgr::UpdateStandingRules(uint32 diff)
     }
 }
 
+void BotMgr::OnTradeWindowAccepted(Player* player)
+{
+    TradeData* trade = player ? player->GetTradeData() : nullptr;
+    Player* bot = trade ? trade->GetTrader() : nullptr;
+    if (!bot)
+        return;
+    auto itr = _tradeOffers.find(bot->GetGUID());
+    if (itr != _tradeOffers.end() && itr->second.initiated && itr->second.playerGuid == player->GetGUID())
+        itr->second.windowOpen = true;
+}
+
 void BotMgr::UpdateTradeOffers(uint32 diff)
 {
     for (auto itr = _tradeOffers.begin(); itr != _tradeOffers.end();)
@@ -5241,8 +5253,7 @@ void BotMgr::UpdateTradeOffers(uint32 diff)
                 continue;
             }
             offer.initiated = true;
-            WorldPacket begin(CMSG_BEGIN_TRADE);
-            bot->GetSession()->HandleBeginTradeOpcode(begin);
+            offer.ageMs = 0;
             ++itr;
             continue;
         }
@@ -5251,6 +5262,15 @@ void BotMgr::UpdateTradeOffers(uint32 diff)
         {
             TellOrder(commander, bot, "trade", "cancelled", "the trade was cancelled.");
             itr = _tradeOffers.erase(itr);
+            continue;
+        }
+
+        // The bot initiated, so the commander's client answers the request (its "wishes to trade" popup) with
+        // CMSG_BEGIN_TRADE. Opening the window from the bot's side as well left the client's trade state out of
+        // step and it closed the window at once, so items go in only after the commander's own begin.
+        if (!offer.windowOpen)
+        {
+            ++itr;
             continue;
         }
 
@@ -5269,6 +5289,7 @@ void BotMgr::UpdateTradeOffers(uint32 diff)
             offered += item->GetCount();
         });
         offer.placed = true;
+        offer.ageMs = 0;
         if (!bot->GetTradeData())
         {
             TellOrder(commander, bot, "trade", "failed", "could not put the item in the trade window.");
@@ -5929,6 +5950,27 @@ public:
 void AddSC_coa_bot_restore_group_script()
 {
     new coa_bot_restore_group_script();
+}
+
+namespace
+{
+class coa_bot_trade_offer_script : public ServerScript
+{
+public:
+    coa_bot_trade_offer_script() : ServerScript("coa_bot_trade_offer_script", { SERVERHOOK_CAN_PACKET_RECEIVE }) { }
+
+    bool CanPacketReceive(WorldSession* session, WorldPacket const& packet) override
+    {
+        if (packet.GetOpcode() == CMSG_BEGIN_TRADE && session)
+            sBotMgr->OnTradeWindowAccepted(session->GetPlayer());
+        return true;
+    }
+};
+}
+
+void AddSC_coa_bot_trade_offer_script()
+{
+    new coa_bot_trade_offer_script();
 }
 
 namespace
