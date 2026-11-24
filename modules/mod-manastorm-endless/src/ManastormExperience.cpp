@@ -1,6 +1,7 @@
 #include "ManastormExperience.h"
 #include "ManastormModuleConfig.h"
 #include "ManastormRun.h"
+#include "ExperienceBuffPolicy.h"
 #include "LFGMgr.h"
 #include "Log.h"
 #include "ObjectAccessor.h"
@@ -192,9 +193,9 @@ void ManastormExperience::Settle(Player* player)
     // Use the core's RDF quest rate and quest XP auras, including its RAF exclusion.
     bool const recruitAFriend = player->GetsRecruitAFriendBonus(true);
     double const auraMultiplier = player->GetTotalAuraMultiplier(SPELL_AURA_MOD_XP_QUEST_PCT,
-        [recruitAFriend](AuraEffect const* effect)
+        [player, recruitAFriend](AuraEffect const* effect)
         {
-            return effect->GetId() != 818059 || !recruitAFriend;
+            return ExperienceBuffPolicy::Applies(player, effect, recruitAFriend);
         });
     uint32 amount = ClampXP(double(ClampXP(double(claimed) * player->GetQuestRate(true))) * auraMultiplier);
     sScriptMgr->OnPlayerGiveXP(player, amount, nullptr, PlayerXPSource::XPSOURCE_QUEST_DF);

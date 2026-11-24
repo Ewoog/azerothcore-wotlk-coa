@@ -18,6 +18,7 @@
 #include "CreatureAI.h"
 #include "DatabaseEnv.h"
 #include "EventMap.h"
+#include "ExperienceBuffPolicy.h"
 #include "GameObject.h"
 #include "GameTime.h"
 #include "GossipDef.h"
@@ -1672,9 +1673,9 @@ namespace
             uint32 const depth = run.encounter->depth;
             bool const recruitAFriend = player->GetsRecruitAFriendBonus(true);
             float const xpMultiplier = player->GetTotalAuraMultiplier(SPELL_AURA_MOD_XP_PCT,
-                [recruitAFriend](AuraEffect const* effect)
+                [player, recruitAFriend](AuraEffect const* effect)
                 {
-                    return effect->GetId() != 818059 || !recruitAFriend;
+                    return ExperienceBuffPolicy::Applies(player, effect, recruitAFriend);
                 });
             uint32 const xp = mode < 4 ? uint32(sObjectMgr->GetXPForLevel(player->GetLevel()) *
                 (first ? 0.075f : 0.06f) * xpMultiplier) : 0;

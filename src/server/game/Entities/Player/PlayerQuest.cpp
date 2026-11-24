@@ -19,6 +19,7 @@
 #include "AscensionQuestLog.h"
 #include "CreatureAI.h"
 #include "DisableMgr.h"
+#include "ExperienceBuffPolicy.h"
 #include "GameEventMgr.h"
 #include "GameObjectAI.h"
 #include "GameTime.h"
@@ -1562,10 +1563,10 @@ uint32 Player::CalculateQuestRewardXP(Quest const* quest)
     // the positive bonuses but keeps penalties.
     bool const recruitAFriend = GetsRecruitAFriendBonus(true);
     bool const noBonusExperience = sScriptMgr->OnPlayerHasNoBonusExperience(this);
-    xp *= GetTotalAuraMultiplier(SPELL_AURA_MOD_XP_QUEST_PCT, [recruitAFriend, noBonusExperience](AuraEffect const* effect)
+    xp *= GetTotalAuraMultiplier(SPELL_AURA_MOD_XP_QUEST_PCT, [this, recruitAFriend, noBonusExperience](AuraEffect const* effect)
     {
-        // CoA's party Aura of Experience explicitly excludes the recruit-a-friend bonus.
-        if (effect->GetId() == 818059 && recruitAFriend)
+        // CoA's Aura/Potion of Experience: no recruit-a-friend stacking, and only below the account's highest level.
+        if (!ExperienceBuffPolicy::Applies(this, effect, recruitAFriend))
             return false;
         return !noBonusExperience || effect->GetAmount() <= 0;
     });

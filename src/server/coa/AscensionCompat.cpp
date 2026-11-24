@@ -451,7 +451,6 @@ constexpr uint32 VANITY_CATEGORY_MOUNTS = 0x04000000;
 constexpr uint32 SPELL_TALENT_LEARNING_CUE = 47292;
 constexpr uint32 VANITY_CATEGORY_COMPANIONS = 0x08000000;
 constexpr uint32 VANITY_CATEGORY_CONSUMABLE = 0x40000000;
-constexpr uint32 ITEM_AURA_OF_EXPERIENCE = 818059;
 constexpr uint8 VANITY_REALM_LEVEL = 60;
 constexpr uint32 ITEM_WONDROUS_WISDOMBALL = 101169;
 constexpr uint32 ITEM_FIX_O_TRON_5000 = 97330;
@@ -6253,8 +6252,7 @@ public:
 
     [[nodiscard]] bool RequiresVanityRealmLevel(ItemTemplate const* proto) const
     {
-        return proto->ItemId == ITEM_AURA_OF_EXPERIENCE || proto->ItemId == 818046 ||
-            (proto->Quality == ITEM_QUALITY_HEIRLOOM && _vanityItems.contains(proto->ItemId));
+        return proto->Quality == ITEM_QUALITY_HEIRLOOM && _vanityItems.contains(proto->ItemId);
     }
 
     static bool AccountHasVanityRealmLevel(Player* player)
