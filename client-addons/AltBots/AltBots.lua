@@ -21,6 +21,7 @@
 AltBotsDB = AltBotsDB or {}
 
 local PREFIX = "COABOT"
+local W = {}
 local SPAWN_DELAY = 4
 local SEND_GAP = 0.25
 local ALL_GROUPED = "*"
@@ -957,7 +958,7 @@ local FLAT_BACKDROP = {
     insets = { left = 1, right = 1, top = 1, bottom = 1 },
 }
 
-local function Skin(f, bg, border)
+function W.Skin(f, bg, border)
     f:SetBackdrop(FLAT_BACKDROP)
     bg = bg or C.panel
     border = border or C.border
@@ -965,20 +966,20 @@ local function Skin(f, bg, border)
     f:SetBackdropBorderColor(border[1], border[2], border[3], border[4] or 1)
 end
 
-local function Paint(tex, c, alpha)
+function W.Paint(tex, c, alpha)
     tex:SetTexture(c[1], c[2], c[3], alpha or c[4] or 1)
 end
 
-local function TextColor(fs, c)
+function W.TextColor(fs, c)
     fs:SetTextColor(c[1], c[2], c[3])
 end
 
-local function Hex(c)
+function W.Hex(c)
     return string.format("|cff%02x%02x%02x",
         math.floor(c[1] * 255 + 0.5), math.floor(c[2] * 255 + 0.5), math.floor(c[3] * 255 + 0.5))
 end
 
-local function AddHover(b, alpha)
+function W.AddHover(b, alpha)
     local hl = b:CreateTexture(nil, "HIGHLIGHT")
     hl:SetPoint("TOPLEFT", 1, -1)
     hl:SetPoint("BOTTOMRIGHT", -1, 1)
@@ -988,11 +989,11 @@ end
 
 local DOT_COLORS = { green = C.good, yellow = C.warn, red = C.bad, gray = C.faint }
 
-local function SetDot(tex, state)
-    Paint(tex, DOT_COLORS[state] or C.faint)
+function W.SetDot(tex, state)
+    W.Paint(tex, DOT_COLORS[state] or C.faint)
 end
 
-local function SetClassIcon(tex, classFile)
+function W.SetClassIcon(tex, classFile)
     local coords = classFile and CLASS_ICON_TCOORDS and CLASS_ICON_TCOORDS[classFile]
     if coords then
         tex:SetTexture(CLASS_ICON_FILE)
@@ -1003,18 +1004,18 @@ local function SetClassIcon(tex, classFile)
     end
 end
 
-local function SetRowSelected(row, selected)
+function W.SetRowSelected(row, selected)
     if selected then
-        Skin(row, C.rowSel, C.accent)
+        W.Skin(row, C.rowSel, C.accent)
     else
-        Skin(row, C.row, C.border)
+        W.Skin(row, C.row, C.border)
     end
     if row.stripe then
         if selected then row.stripe:Show() else row.stripe:Hide() end
     end
 end
 
-local function ClassFileOf(unit)
+function W.ClassFileOf(unit)
     if not unit then return nil end
     local _, classFile = UnitClass(unit)
     return classFile
@@ -1024,7 +1025,7 @@ SetStatus = function(text)
     if ui.status then ui.status:SetText(text or "") end
 end
 
-local function Tip(owner, title, body)
+function W.Tip(owner, title, body)
     GameTooltip:SetOwner(owner, "ANCHOR_RIGHT")
     GameTooltip:SetText(title or "", 1, 1, 1)
     if body and body ~= "" then
@@ -1033,7 +1034,7 @@ local function Tip(owner, title, body)
     GameTooltip:Show()
 end
 
-local function ShowItemTip(owner, entry, extra)
+function W.ShowItemTip(owner, entry, extra)
     if not entry or entry == 0 then return end
     GameTooltip:SetOwner(owner, "ANCHOR_RIGHT")
     local _, link = GetItemInfo(entry)
@@ -1050,7 +1051,7 @@ local function ShowItemTip(owner, entry, extra)
     GameTooltip:Show()
 end
 
-local function ClassColorText(unit, name)
+function W.ClassColorText(unit, name)
     local _, classFile = UnitClass(unit or "")
     local c = classFile and CLASS_COLORS[classFile]
     if c then
@@ -1060,14 +1061,14 @@ local function ClassColorText(unit, name)
     return name or "?"
 end
 
-local function HidePopup()
+function W.HidePopup()
     if popup then popup:Hide() end
 end
 
-local function ShowPopup(anchor, entries)
+function W.ShowPopup(anchor, entries)
     if not popup then
         popup = CreateFrame("Frame", "AltBotsPopup", UIParent)
-        Skin(popup, C.header, C.borderHi)
+        W.Skin(popup, C.header, C.borderHi)
         popup:SetFrameStrata("DIALOG")
         popup:SetClampedToScreen(true)
         popup.buttons = {}
@@ -1085,7 +1086,7 @@ local function ShowPopup(anchor, entries)
             b.text:SetJustifyH("LEFT")
             local hl = b:CreateTexture(nil, "HIGHLIGHT")
             hl:SetAllPoints()
-            Paint(hl, C.accent, 0.22)
+            W.Paint(hl, C.accent, 0.22)
             popup.buttons[i] = b
         end
         b:SetWidth(width - 8)
@@ -1094,13 +1095,13 @@ local function ShowPopup(anchor, entries)
         b.text:SetWidth(width - 20)
         b.text:SetText(entry.text)
         b:SetScript("OnClick", function()
-            HidePopup()
+            W.HidePopup()
             if entry.func then entry.func() end
         end)
         if entry.disabled then
-            b:Disable(); TextColor(b.text, C.faint)
+            b:Disable(); W.TextColor(b.text, C.faint)
         else
-            b:Enable(); TextColor(b.text, C.text)
+            b:Enable(); W.TextColor(b.text, C.text)
         end
         b:Show()
         y = y - 20
@@ -1112,19 +1113,19 @@ local function ShowPopup(anchor, entries)
     popup:Show()
 end
 
-local function SetBtnActive(b, active)
+function W.SetBtnActive(b, active)
     b.active = active and true or nil
     if active then
-        Skin(b, C.btnOn, C.accent)
+        W.Skin(b, C.btnOn, C.accent)
     else
-        Skin(b, C.btn, C.border)
+        W.Skin(b, C.btn, C.border)
     end
 end
 
-local function MakeTextBtn(parent, w, h, text)
+function W.MakeTextBtn(parent, w, h, text)
     local b = CreateFrame("Button", nil, parent)
     b:SetWidth(w); b:SetHeight(h or 22)
-    Skin(b, C.btn, C.border)
+    W.Skin(b, C.btn, C.border)
     local fs = b:CreateFontString(nil, "OVERLAY", "AltBotsFontButton")
     fs:SetPoint("LEFT", 4, 0)
     fs:SetPoint("RIGHT", -4, 0)
@@ -1132,32 +1133,32 @@ local function MakeTextBtn(parent, w, h, text)
     b:SetNormalFontObject(F.button)
     b:SetHighlightFontObject(F.button)
     b:SetDisabledFontObject(F.buttonOff)
-    AddHover(b, 0.10)
+    W.AddHover(b, 0.10)
     b:SetText(text or "")
-    b.SetActive = SetBtnActive
+    b.SetActive = W.SetBtnActive
     b:SetScript("OnLeave", function() GameTooltip:Hide() end)
     return b
 end
 
-local function HookTip(btn, title, body)
-    btn:SetScript("OnEnter", function(self) Tip(self, title, body) end)
+function W.HookTip(btn, title, body)
+    btn:SetScript("OnEnter", function(self) W.Tip(self, title, body) end)
     btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 end
 
-local function MakeIconBtn(parent, size, texture, title, body, onClick)
+function W.MakeIconBtn(parent, size, texture, title, body, onClick)
     local b = CreateFrame("Button", nil, parent)
     b:SetWidth(size); b:SetHeight(size)
-    Skin(b, C.btn, C.border)
+    W.Skin(b, C.btn, C.border)
     local icon = b:CreateTexture(nil, "ARTWORK")
     icon:SetPoint("TOPLEFT", 2, -2)
     icon:SetPoint("BOTTOMRIGHT", -2, 2)
     icon:SetTexture(texture)
     icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
     b.icon = icon
-    AddHover(b, 0.15)
+    W.AddHover(b, 0.15)
     b:SetScript("OnEnter", function(self)
         self:SetBackdropBorderColor(C.accent[1], C.accent[2], C.accent[3], 1)
-        Tip(self, title, body)
+        W.Tip(self, title, body)
     end)
     b:SetScript("OnLeave", function(self)
         self:SetBackdropBorderColor(C.border[1], C.border[2], C.border[3], 1)
@@ -1168,11 +1169,11 @@ local function MakeIconBtn(parent, size, texture, title, body, onClick)
     return b
 end
 
-local function MakeActionTile(parent, action, onClick)
+function W.MakeActionTile(parent, action, onClick)
     local b = CreateFrame("Button", nil, parent)
     b:SetWidth(70); b:SetHeight(58)
-    Skin(b, C.btn, C.border)
-    AddHover(b, 0.07)
+    W.Skin(b, C.btn, C.border)
+    W.AddHover(b, 0.07)
     b.icon = b:CreateTexture(nil, "ARTWORK")
     b.icon:SetWidth(28); b.icon:SetHeight(28)
     b.icon:SetPoint("TOP", 0, -7)
@@ -1181,10 +1182,10 @@ local function MakeActionTile(parent, action, onClick)
     b.label = b:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
     b.label:SetPoint("BOTTOM", 0, 6)
     b.label:SetText(action.label)
-    TextColor(b.label, C.text)
+    W.TextColor(b.label, C.text)
     b:SetScript("OnEnter", function(self)
         self:SetBackdropBorderColor(C.accent[1], C.accent[2], C.accent[3], 1)
-        Tip(self, action.label, action.tip)
+        W.Tip(self, action.label, action.tip)
     end)
     b:SetScript("OnLeave", function(self)
         self:SetBackdropBorderColor(C.border[1], C.border[2], C.border[3], 1)
@@ -1196,15 +1197,15 @@ local function MakeActionTile(parent, action, onClick)
     return b
 end
 
-local function MakeItemButton(parent, size)
+function W.MakeItemButton(parent, size)
     local b = CreateFrame("Button", nil, parent)
     b:SetWidth(size); b:SetHeight(size)
-    Skin(b, C.row, C.border)
+    W.Skin(b, C.row, C.border)
     b.icon = b:CreateTexture(nil, "ARTWORK")
     b.icon:SetPoint("TOPLEFT", 2, -2)
     b.icon:SetPoint("BOTTOMRIGHT", -2, 2)
     b.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-    AddHover(b, 0.15)
+    W.AddHover(b, 0.15)
     b.count = b:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
     b.count:SetPoint("BOTTOMRIGHT", -2, 2)
     b.lock = b:CreateTexture(nil, "OVERLAY")
@@ -1217,7 +1218,7 @@ local function MakeItemButton(parent, size)
     return b
 end
 
-local function SetItemIcon(btn, entry, emptyTex)
+function W.SetItemIcon(btn, entry, emptyTex)
     if not entry or entry == 0 then
         btn.icon:SetTexture(emptyTex or "Interface\\Buttons\\UI-Slot-Background")
         btn.icon:SetVertexColor(0.40, 0.42, 0.48)
@@ -1241,10 +1242,10 @@ local function SetItemIcon(btn, entry, emptyTex)
     end
 end
 
-local function MakeEditBox(parent, w, h)
+function W.MakeEditBox(parent, w, h)
     local e = CreateFrame("EditBox", nil, parent)
     e:SetWidth(w); e:SetHeight(h or 22)
-    Skin(e, C.row, C.border)
+    W.Skin(e, C.row, C.border)
     e:SetFontObject(F.body)
     e:SetTextInsets(7, 7, 0, 0)
     e:SetAutoFocus(false)
@@ -1262,7 +1263,7 @@ local function MakeEditBox(parent, w, h)
     return e
 end
 
-local function SkinScroll(sf)
+function W.SkinScroll(sf)
     local name = sf:GetName()
     local bar = name and _G[name .. "ScrollBar"]
     if not bar then return end
@@ -1275,7 +1276,7 @@ local function SkinScroll(sf)
     bar:SetWidth(6)
     local track = bar:CreateTexture(nil, "BACKGROUND")
     track:SetAllPoints()
-    Paint(track, C.track)
+    W.Paint(track, C.track)
     local thumb = bar:GetThumbTexture()
     if thumb then
         thumb:SetTexture(C.borderHi[1], C.borderHi[2], C.borderHi[3], 1)
@@ -1284,16 +1285,16 @@ local function SkinScroll(sf)
     end
 end
 
-local function MakeScroll(name, parent, childW)
+function W.MakeScroll(name, parent, childW)
     local sf = CreateFrame("ScrollFrame", name, parent, "UIPanelScrollFrameTemplate")
-    SkinScroll(sf)
+    W.SkinScroll(sf)
     local child = CreateFrame("Frame", nil, sf)
     child:SetWidth(childW); child:SetHeight(1)
     sf:SetScrollChild(child)
     return sf, child
 end
 
-local function MakeBar(parent, height)
+function W.MakeBar(parent, height)
     local bar = CreateFrame("StatusBar", nil, parent)
     bar:SetHeight(height)
     bar:SetStatusBarTexture(FLAT)
@@ -1301,23 +1302,23 @@ local function MakeBar(parent, height)
     bar:SetValue(0)
     bar.bg = bar:CreateTexture(nil, "BACKGROUND")
     bar.bg:SetAllPoints()
-    Paint(bar.bg, C.track)
+    W.Paint(bar.bg, C.track)
     return bar
 end
 
-local function SetTabState(tab, selected)
+function W.SetTabState(tab, selected)
     if selected then
         tab:Disable()
-        TextColor(tab.label, C.text)
+        W.TextColor(tab.label, C.text)
         tab.underline:Show()
     else
         tab:Enable()
-        TextColor(tab.label, C.muted)
+        W.TextColor(tab.label, C.muted)
         tab.underline:Hide()
     end
 end
 
-local function MakeTab(parent, label)
+function W.MakeTab(parent, label)
     local b = CreateFrame("Button", nil, parent)
     b:SetHeight(30)
     b.label = b:CreateFontString(nil, "OVERLAY", "AltBotsFontBig")
@@ -1331,32 +1332,32 @@ local function MakeTab(parent, label)
     b.underline:SetHeight(2)
     b.underline:SetPoint("BOTTOMLEFT", 8, 0)
     b.underline:SetPoint("BOTTOMRIGHT", -8, 0)
-    Paint(b.underline, C.accent)
+    W.Paint(b.underline, C.accent)
     local hl = b:CreateTexture(nil, "HIGHLIGHT")
     hl:SetHeight(2)
     hl:SetPoint("BOTTOMLEFT", 8, 0)
     hl:SetPoint("BOTTOMRIGHT", -8, 0)
-    Paint(hl, C.borderHi)
-    SetTabState(b, false)
+    W.Paint(hl, C.borderHi)
+    W.SetTabState(b, false)
     return b
 end
 
-local function SectionHeader(parent, text)
+function W.SectionHeader(parent, text)
     local fs = parent:CreateFontString(nil, "OVERLAY", "AltBotsFontCaps")
     fs:SetText(text)
     local rule = parent:CreateTexture(nil, "ARTWORK")
     rule:SetHeight(1)
-    Paint(rule, C.border)
+    W.Paint(rule, C.border)
     return fs, rule
 end
 
-local function MakePanel(parent)
+function W.MakePanel(parent)
     local p = CreateFrame("Frame", nil, parent)
-    Skin(p, C.panel, C.border)
+    W.Skin(p, C.panel, C.border)
     return p
 end
 
-local function EmptyText(parent, template)
+function W.EmptyText(parent, template)
     local fs = parent:CreateFontString(nil, "OVERLAY", template or "AltBotsFontSmall")
     fs:SetJustifyH("CENTER")
     fs:SetSpacing(3)
@@ -1386,7 +1387,7 @@ local ORDER_ACTIONS = {
         tip = "Sell greys and outgrown whites and greens. Works immediately, or when the bot is near a vendor." },
 }
 
-local function RunOrder(verb, choice, radius)
+function W.RunOrder(verb, choice, radius)
     if verb == "farm" then
         Order("farm", choice or ALL_GROUPED, radius or AltBotsDB.farmRadius or 40)
     else
@@ -1394,12 +1395,12 @@ local function RunOrder(verb, choice, radius)
     end
 end
 
-local function SavePosition(f, key)
+function W.SavePosition(f, key)
     local point, _, relPoint, x, y = f:GetPoint(1)
     if point then AltBotsDB[key] = { point, relPoint, x, y } end
 end
 
-local function RestorePosition(f, key, fallback)
+function W.RestorePosition(f, key, fallback)
     local pos = AltBotsDB[key]
     f:ClearAllPoints()
     if type(pos) == "table" and pos[1] then
@@ -1409,29 +1410,29 @@ local function RestorePosition(f, key, fallback)
     end
 end
 
-local function ApplyScale()
+function W.ApplyScale()
     local s = tonumber(AltBotsDB.scale) or 1
     if win then win:SetScale(s) end
     if quickBar then quickBar:SetScale(s) end
 end
 
-local function GetQuickBarShown()
+function W.GetQuickBarShown()
     return AltBotsDB.quickBar and true or false
 end
 
 local SetQuickBarShown
 
-local function CreateQuickBar()
+function W.CreateQuickBar()
     if quickBar then return end
     local size, gap = 30, 4
     local b = CreateFrame("Frame", "AltBotsQuickBar", UIParent)
     b:SetHeight(size + 10)
     b:SetWidth(18 + #ORDER_ACTIONS * (size + gap) + 4)
-    Skin(b, C.window, C.border)
+    W.Skin(b, C.window, C.border)
     b:SetFrameStrata("MEDIUM")
     b:SetMovable(true)
     b:SetClampedToScreen(true)
-    RestorePosition(b, "quickBarPos", { "BOTTOM", "BOTTOM", 0, 160 })
+    W.RestorePosition(b, "quickBarPos", { "BOTTOM", "BOTTOM", 0, 160 })
 
     local grip = CreateFrame("Button", nil, b)
     grip:SetWidth(12)
@@ -1441,37 +1442,37 @@ local function CreateQuickBar()
     gripTex:SetWidth(2)
     gripTex:SetPoint("TOP", 0, -4)
     gripTex:SetPoint("BOTTOM", 0, 4)
-    Paint(gripTex, C.accent)
-    AddHover(grip, 0.10)
+    W.Paint(gripTex, C.accent)
+    W.AddHover(grip, 0.10)
     grip:RegisterForDrag("LeftButton")
     grip:RegisterForClicks("RightButtonUp")
     grip:SetScript("OnDragStart", function() b:StartMoving() end)
     grip:SetScript("OnDragStop", function()
         b:StopMovingOrSizing()
-        SavePosition(b, "quickBarPos")
+        W.SavePosition(b, "quickBarPos")
     end)
     grip:SetScript("OnClick", function() SetQuickBarShown(false) end)
-    HookTip(grip, "AltBots quick bar", "Orders for every alt in your group. Drag to move, right-click to hide. "
+    W.HookTip(grip, "AltBots quick bar", "Orders for every alt in your group. Drag to move, right-click to hide. "
         .. "Type /alt bar to show it again.")
 
     b.buttons = {}
     for i, action in ipairs(ORDER_ACTIONS) do
         local verb = action.verb
-        local btn = MakeIconBtn(b, size, action.icon, action.label .. " (all grouped alts)", action.tip, function()
-            RunOrder(verb, ALL_GROUPED)
+        local btn = W.MakeIconBtn(b, size, action.icon, action.label .. " (all grouped alts)", action.tip, function()
+            W.RunOrder(verb, ALL_GROUPED)
         end)
         btn:SetPoint("LEFT", 18 + (i - 1) * (size + gap), 0)
         b.buttons[i] = btn
     end
     quickBar = b
-    ApplyScale()
+    W.ApplyScale()
     b:Hide()
 end
 
 SetQuickBarShown = function(shown)
     AltBotsDB.quickBar = shown and true or nil
     if shown then
-        CreateQuickBar()
+        W.CreateQuickBar()
         quickBar:Show()
     elseif quickBar then
         quickBar:Hide()
@@ -1479,7 +1480,7 @@ SetQuickBarShown = function(shown)
     if ui.quickBarBtn then ui.quickBarBtn:SetActive(shown) end
 end
 
-local function CreateMinimapButton()
+function W.CreateMinimapButton()
     if minimapBtn then return end
     local b = CreateFrame("Button", "AltBotsMinimapButton", Minimap)
     b:SetWidth(32); b:SetHeight(32)
@@ -1517,14 +1518,14 @@ local function CreateMinimapButton()
     b:SetScript("OnDragStop", function(self) self:SetScript("OnUpdate", nil) end)
     b:SetScript("OnClick", function(_, button)
         if button == "RightButton" then
-            SetQuickBarShown(not GetQuickBarShown())
+            SetQuickBarShown(not W.GetQuickBarShown())
             return
         end
         EnsureWindow()
         if win:IsShown() then win:Hide() else win:Show(); ShowTab(ui.activeTab or "alts") end
     end)
     b:SetScript("OnEnter", function(self)
-        Tip(self, "AltBots", "Left-click: open the window.\nRight-click: show or hide the quick bar.\nDrag: move this button."
+        W.Tip(self, "AltBots", "Left-click: open the window.\nRight-click: show or hide the quick bar.\nDrag: move this button."
             .. "\n/alt toggles the window, /alt minimap hides this button.")
     end)
     b:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -1533,14 +1534,14 @@ local function CreateMinimapButton()
     if AltBotsDB.minimapHidden then b:Hide() else Place(); b:Show() end
 end
 
-local function GetMinimapShown()
+function W.GetMinimapShown()
     return not AltBotsDB.minimapHidden
 end
 
-local function SetMinimapShown(shown)
+function W.SetMinimapShown(shown)
     AltBotsDB.minimapHidden = not shown
     if shown then
-        CreateMinimapButton()
+        W.CreateMinimapButton()
         if minimapBtn then minimapBtn.Place(); minimapBtn:Show() end
     elseif minimapBtn then
         minimapBtn:Hide()
@@ -1548,7 +1549,7 @@ local function SetMinimapShown(shown)
 end
 
 -- Widget pools live under the window and are never reparented to nil.
-local function InitPools()
+function W.InitPools()
     ui.pools = ui.pools or {
         altRows = {}, cmdRows = {}, partyRows = {},
         gearSlots = {}, bagSlots = {}, profBtns = {},
@@ -1559,11 +1560,11 @@ local function InitPools()
     }
 end
 
-local function HidePool(list)
+function W.HidePool(list)
     for _, w in ipairs(list or {}) do w:Hide() end
 end
 
-local function TakeRow(pool, parent, maker)
+function W.TakeRow(pool, parent, maker)
     for _, w in ipairs(pool) do
         if not w:IsShown() then
             w:SetParent(parent)
@@ -1577,24 +1578,24 @@ local function TakeRow(pool, parent, maker)
     return w
 end
 
-local function StyleRowButton(b, w, h)
+function W.StyleRowButton(b, w, h)
     b:SetWidth(w); b:SetHeight(h)
-    Skin(b, C.row, C.border)
+    W.Skin(b, C.row, C.border)
 end
 
-local function AddStripe(row)
+function W.AddStripe(row)
     row.stripe = row:CreateTexture(nil, "OVERLAY")
     row.stripe:SetWidth(2)
     row.stripe:SetPoint("TOPLEFT", 1, -1)
     row.stripe:SetPoint("BOTTOMLEFT", 1, 1)
-    Paint(row.stripe, C.accent)
+    W.Paint(row.stripe, C.accent)
     row.stripe:Hide()
 end
 
-local function MakeAltRow(parent)
+function W.MakeAltRow(parent)
     local row = CreateFrame("Frame", nil, parent)
-    StyleRowButton(row, ROW_W, 34)
-    AddStripe(row)
+    W.StyleRowButton(row, ROW_W, 34)
+    W.AddStripe(row)
     row.classIcon = row:CreateTexture(nil, "ARTWORK")
     row.classIcon:SetWidth(22); row.classIcon:SetHeight(22)
     row.classIcon:SetPoint("LEFT", 8, 0)
@@ -1609,22 +1610,22 @@ local function MakeAltRow(parent)
     row.status:SetPoint("LEFT", row.dot, "RIGHT", 7, 0)
     row.status:SetWidth(120)
     row.status:SetJustifyH("LEFT")
-    row.remove = MakeTextBtn(row, 22, 22, "x")
+    row.remove = W.MakeTextBtn(row, 22, 22, "x")
     row.remove:SetPoint("RIGHT", -6, 0)
-    row.invite = MakeTextBtn(row, 70, 22, "Invite")
+    row.invite = W.MakeTextBtn(row, 70, 22, "Invite")
     row.invite:SetPoint("RIGHT", row.remove, "LEFT", -4, 0)
-    row.quest = MakeTextBtn(row, 70, 22, "Quest solo")
+    row.quest = W.MakeTextBtn(row, 70, 22, "Quest solo")
     row.quest:SetPoint("RIGHT", row.invite, "LEFT", -4, 0)
-    row.spawn = MakeTextBtn(row, 70, 22, "Spawn")
+    row.spawn = W.MakeTextBtn(row, 70, 22, "Spawn")
     row.spawn:SetPoint("RIGHT", row.quest, "LEFT", -4, 0)
     return row
 end
 
-local function MakeCmdRow(parent)
+function W.MakeCmdRow(parent)
     local row = CreateFrame("Button", nil, parent)
-    StyleRowButton(row, ROW_W, 40)
-    AddStripe(row)
-    AddHover(row, 0.04)
+    W.StyleRowButton(row, ROW_W, 40)
+    W.AddStripe(row)
+    W.AddHover(row, 0.04)
     row.classIcon = row:CreateTexture(nil, "ARTWORK")
     row.classIcon:SetWidth(26); row.classIcon:SetHeight(26)
     row.classIcon:SetPoint("LEFT", 8, 0)
@@ -1636,14 +1637,14 @@ local function MakeCmdRow(parent)
     row.sub:SetPoint("BOTTOMLEFT", row.classIcon, "BOTTOMRIGHT", 10, -1)
     row.sub:SetJustifyH("LEFT")
     row.sub:SetWidth(170)
-    row.hp = MakeBar(row, 11)
+    row.hp = W.MakeBar(row, 11)
     row.hp:SetPoint("TOPLEFT", 232, -9)
     row.hp:SetPoint("TOPRIGHT", -120, -9)
     row.hp:SetStatusBarColor(C.good[1], C.good[2], C.good[3])
     row.hpText = row.hp:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
     row.hpText:SetPoint("RIGHT", -4, 0)
-    TextColor(row.hpText, C.text)
-    row.mp = MakeBar(row, 5)
+    W.TextColor(row.hpText, C.text)
+    row.mp = W.MakeBar(row, 5)
     row.mp:SetPoint("TOPLEFT", row.hp, "BOTTOMLEFT", 0, -4)
     row.mp:SetPoint("TOPRIGHT", row.hp, "BOTTOMRIGHT", 0, -4)
     row.dot = row:CreateTexture(nil, "OVERLAY")
@@ -1657,11 +1658,11 @@ local function MakeCmdRow(parent)
     return row
 end
 
-local function MakePartyRow(parent)
+function W.MakePartyRow(parent)
     local row = CreateFrame("Button", nil, parent)
-    StyleRowButton(row, 168, 30)
-    AddStripe(row)
-    AddHover(row, 0.05)
+    W.StyleRowButton(row, 168, 30)
+    W.AddStripe(row)
+    W.AddHover(row, 0.05)
     row.classIcon = row:CreateTexture(nil, "ARTWORK")
     row.classIcon:SetWidth(18); row.classIcon:SetHeight(18)
     row.classIcon:SetPoint("LEFT", 7, 0)
@@ -1678,12 +1679,12 @@ local function MakePartyRow(parent)
     return row
 end
 
-local function MakeSidebar(parent, title, emptyText)
-    local left = MakePanel(parent)
+function W.MakeSidebar(parent, title, emptyText)
+    local left = W.MakePanel(parent)
     left:SetPoint("TOPLEFT", 0, 0)
     left:SetPoint("BOTTOMLEFT", 0, 0)
     left:SetWidth(190)
-    local h, r = SectionHeader(left, title)
+    local h, r = W.SectionHeader(left, title)
     h:SetPoint("TOPLEFT", 10, -9)
     r:SetPoint("LEFT", h, "RIGHT", 8, 0)
     r:SetPoint("RIGHT", -10, 0)
@@ -1696,7 +1697,7 @@ local function MakeSidebar(parent, title, emptyText)
     return left, empty
 end
 
-local function AltName(name, info)
+function W.AltName(name, info)
     local c = info and info.classFile and CLASS_COLORS[info.classFile]
     local text = name
     if c then
@@ -1704,12 +1705,12 @@ local function AltName(name, info)
             math.floor(c.r * 255 + 0.5), math.floor(c.g * 255 + 0.5), math.floor(c.b * 255 + 0.5), name)
     end
     if info and info.level and info.level > 0 then
-        text = text .. "  " .. Hex(C.faint) .. info.level .. "|r"
+        text = text .. "  " .. W.Hex(C.faint) .. info.level .. "|r"
     end
     return text
 end
 
-local function UpdateHeaderSummary()
+function W.UpdateHeaderSummary()
     if not ui.summary then return end
     local grouped = GroupedNames()
     local inGroup, solo, total = 0, 0, 0
@@ -1717,8 +1718,8 @@ local function UpdateHeaderSummary()
         total = total + 1
         if grouped[n] then inGroup = inGroup + 1 elseif spawned[n] then solo = solo + 1 end
     end
-    ui.summary:SetText(Hex(C.good) .. inGroup .. "|r in group   " .. Hex(C.warn) .. solo .. "|r solo   "
-        .. Hex(C.muted) .. total .. " saved|r")
+    ui.summary:SetText(W.Hex(C.good) .. inGroup .. "|r in group   " .. W.Hex(C.warn) .. solo .. "|r solo   "
+        .. W.Hex(C.muted) .. total .. " saved|r")
     if ui.tabs and ui.tabs.commands then
         ui.tabs.commands.badge:SetText(inGroup > 0 and tostring(inGroup) or "")
     end
@@ -1726,19 +1727,19 @@ end
 
 EnsureWindow = function()
     if win then return end
-    InitPools()
+    W.InitPools()
     win = CreateFrame("Frame", "AltBotsFrame", UIParent)
     win:SetWidth(WIN_W); win:SetHeight(WIN_H)
-    Skin(win, C.window, C.border)
+    W.Skin(win, C.window, C.border)
     win:SetMovable(true)
     win:EnableMouse(true)
     win:SetToplevel(true)
     win:SetFrameStrata("HIGH")
     win:SetClampedToScreen(true)
-    RestorePosition(win, "winPos", { "CENTER", "CENTER", 0, 0 })
+    W.RestorePosition(win, "winPos", { "CENTER", "CENTER", 0, 0 })
     win:Hide()
     tinsert(UISpecialFrames, "AltBotsFrame")
-    ApplyScale()
+    W.ApplyScale()
 
     local header = CreateFrame("Frame", nil, win)
     header:SetPoint("TOPLEFT", 1, -1)
@@ -1749,16 +1750,16 @@ EnsureWindow = function()
     header:SetScript("OnDragStart", function() win:StartMoving() end)
     header:SetScript("OnDragStop", function()
         win:StopMovingOrSizing()
-        SavePosition(win, "winPos")
+        W.SavePosition(win, "winPos")
     end)
     local headerBg = header:CreateTexture(nil, "BACKGROUND")
     headerBg:SetAllPoints()
-    Paint(headerBg, C.header)
+    W.Paint(headerBg, C.header)
     local accentLine = header:CreateTexture(nil, "ARTWORK")
     accentLine:SetHeight(2)
     accentLine:SetPoint("TOPLEFT")
     accentLine:SetPoint("TOPRIGHT")
-    Paint(accentLine, C.accent)
+    W.Paint(accentLine, C.accent)
 
     local logo = header:CreateTexture(nil, "ARTWORK")
     logo:SetWidth(26); logo:SetHeight(26)
@@ -1779,20 +1780,20 @@ EnsureWindow = function()
     close.text = close:CreateFontString(nil, "OVERLAY", "AltBotsFontTitle")
     close.text:SetPoint("CENTER", 0, 0)
     close.text:SetText("x")
-    TextColor(close.text, C.muted)
+    W.TextColor(close.text, C.muted)
     local closeHl = close:CreateTexture(nil, "HIGHLIGHT")
     closeHl:SetAllPoints()
-    Paint(closeHl, C.bad, 0.25)
-    close:SetScript("OnClick", function() HidePopup(); win:Hide() end)
-    close:SetScript("OnEnter", function(self) TextColor(self.text, C.text); Tip(self, "Close", "Esc or /alt also closes it.") end)
-    close:SetScript("OnLeave", function(self) TextColor(self.text, C.muted); GameTooltip:Hide() end)
+    W.Paint(closeHl, C.bad, 0.25)
+    close:SetScript("OnClick", function() W.HidePopup(); win:Hide() end)
+    close:SetScript("OnEnter", function(self) W.TextColor(self.text, C.text); W.Tip(self, "Close", "Esc or /alt also closes it.") end)
+    close:SetScript("OnLeave", function(self) W.TextColor(self.text, C.muted); GameTooltip:Hide() end)
 
-    ui.quickBarBtn = MakeTextBtn(header, 84, 24, "Quick bar")
+    ui.quickBarBtn = W.MakeTextBtn(header, 84, 24, "Quick bar")
     ui.quickBarBtn:SetPoint("RIGHT", close, "LEFT", -8, 0)
-    ui.quickBarBtn:SetActive(GetQuickBarShown())
-    HookTip(ui.quickBarBtn, "Quick bar", "A small movable bar with every order for all your grouped alts, so you can "
+    ui.quickBarBtn:SetActive(W.GetQuickBarShown())
+    W.HookTip(ui.quickBarBtn, "Quick bar", "A small movable bar with every order for all your grouped alts, so you can "
         .. "command them with this window closed. Also /alt bar, or right-click the minimap button.")
-    ui.quickBarBtn:SetScript("OnClick", function() SetQuickBarShown(not GetQuickBarShown()) end)
+    ui.quickBarBtn:SetScript("OnClick", function() SetQuickBarShown(not W.GetQuickBarShown()) end)
 
     ui.summary = header:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
     ui.summary:SetPoint("RIGHT", ui.quickBarBtn, "LEFT", -14, 0)
@@ -1806,7 +1807,7 @@ EnsureWindow = function()
     navRule:SetHeight(1)
     navRule:SetPoint("BOTTOMLEFT")
     navRule:SetPoint("BOTTOMRIGHT")
-    Paint(navRule, C.border)
+    W.Paint(navRule, C.border)
 
     ui.tabs = {}
     local prevTab
@@ -1817,10 +1818,10 @@ EnsureWindow = function()
         { id = "quests", label = "Quests", tip = "Each grouped bot's quest log, or all of them side by side." },
         { id = "rules", label = "Rules", tip = "Standing rules: your alts keep mailing or banking the items you list while a rule is on." },
     }) do
-        local t = MakeTab(nav, info.label)
+        local t = W.MakeTab(nav, info.label)
         if prevTab then t:SetPoint("LEFT", prevTab, "RIGHT", 2, 0) else t:SetPoint("BOTTOMLEFT", 8, 0) end
         t:SetScript("OnClick", function() ShowTab(info.id) end)
-        HookTip(t, info.label, info.tip)
+        W.HookTip(t, info.label, info.tip)
         ui.tabs[info.id] = t
         prevTab = t
     end
@@ -1836,12 +1837,12 @@ EnsureWindow = function()
     footer:SetHeight(24)
     local footerBg = footer:CreateTexture(nil, "BACKGROUND")
     footerBg:SetAllPoints()
-    Paint(footerBg, C.header)
+    W.Paint(footerBg, C.header)
     local footerRule = footer:CreateTexture(nil, "ARTWORK")
     footerRule:SetHeight(1)
     footerRule:SetPoint("TOPLEFT")
     footerRule:SetPoint("TOPRIGHT")
-    Paint(footerRule, C.border)
+    W.Paint(footerRule, C.border)
     ui.status = footer:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
     ui.status:SetPoint("LEFT", 12, 0)
     ui.status:SetPoint("RIGHT", -120, 0)
@@ -1849,14 +1850,14 @@ EnsureWindow = function()
     ui.status:SetText("Ready.")
     local version = footer:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
     version:SetPoint("RIGHT", -12, 0)
-    TextColor(version, C.faint)
+    W.TextColor(version, C.faint)
     version:SetText("v" .. (GetAddOnMetadata("AltBots", "Version") or "?") .. "  |  /alt help")
 
     -- Alts pane
     local alts = CreateFrame("Frame", nil, body)
     alts:SetAllPoints()
     ui.altsPane = alts
-    local ah, ar = SectionHeader(alts, "Your characters")
+    local ah, ar = W.SectionHeader(alts, "Your characters")
     ah:SetPoint("TOPLEFT", 0, -2)
     ar:SetPoint("LEFT", ah, "RIGHT", 8, 0)
     ar:SetPoint("RIGHT", 0, 0)
@@ -1866,14 +1867,14 @@ EnsureWindow = function()
     hint:SetJustifyH("LEFT")
     hint:SetText("")
     ui.altsHint = hint
-    ui.altsEmpty = EmptyText(alts, "AltBotsFontBody")
+    ui.altsEmpty = W.EmptyText(alts, "AltBotsFontBody")
     ui.altsEmpty:SetPoint("CENTER", 0, 10)
-    TextColor(ui.altsEmpty, C.muted)
+    W.TextColor(ui.altsEmpty, C.muted)
     ui.altsEmpty:SetText("No other characters saved yet.\nPress Sync, or log into an alt with this addon enabled.")
-    ui.spawnAllBtn = MakeTextBtn(alts, 140, 24, "Spawn + invite all")
+    ui.spawnAllBtn = W.MakeTextBtn(alts, 140, 24, "Spawn + invite all")
     ui.spawnAllBtn:SetPoint("TOPLEFT", 0, -42)
     ui.spawnAllBtn:SetActive(true)
-    HookTip(ui.spawnAllBtn, "Spawn + invite all", "Spawn every saved alt and invite them to your group.")
+    W.HookTip(ui.spawnAllBtn, "Spawn + invite all", "Spawn every saved alt and invite them to your group.")
     ui.spawnAllBtn:SetScript("OnClick", function()
         local skipped = 0
         for _, n in ipairs(SortedAltNames()) do
@@ -1888,9 +1889,9 @@ EnsureWindow = function()
             (skipped > 0 and (" Skipped " .. skipped .. " unverified.") or ""))
         RefreshAlts()
     end)
-    ui.despawnAllBtn = MakeTextBtn(alts, 100, 24, "Despawn all")
+    ui.despawnAllBtn = W.MakeTextBtn(alts, 100, 24, "Despawn all")
     ui.despawnAllBtn:SetPoint("LEFT", ui.spawnAllBtn, "RIGHT", 6, 0)
-    HookTip(ui.despawnAllBtn, "Despawn all", "Send every saved alt away.")
+    W.HookTip(ui.despawnAllBtn, "Despawn all", "Send every saved alt away.")
     ui.despawnAllBtn:SetScript("OnClick", function()
         local names = SortedAltNames()
         local grouped = GroupedNames()
@@ -1903,9 +1904,9 @@ EnsureWindow = function()
         SetStatus("Despawning " .. #out .. " alt" .. (#out == 1 and "" or "s") .. ".")
         RefreshAlts()
     end)
-    ui.syncBtn = MakeTextBtn(alts, 70, 24, "Sync")
+    ui.syncBtn = W.MakeTextBtn(alts, 70, 24, "Sync")
     ui.syncBtn:SetPoint("TOPRIGHT", 0, -42)
-    HookTip(ui.syncBtn, "Sync with the server",
+    W.HookTip(ui.syncBtn, "Sync with the server",
         "Ask the server which characters your account has. Characters that no longer exist are removed "
         .. "and new ones are added, so a character wipe cleans itself up.")
     ui.syncBtn:SetScript("OnClick", function()
@@ -1913,9 +1914,9 @@ EnsureWindow = function()
         SetStatus("Asking the server for your character list...")
         RefreshAlts()
     end)
-    ui.pruneBtn = MakeTextBtn(alts, 130, 24, "Remove unverified")
+    ui.pruneBtn = W.MakeTextBtn(alts, 130, 24, "Remove unverified")
     ui.pruneBtn:SetPoint("RIGHT", ui.syncBtn, "LEFT", -6, 0)
-    HookTip(ui.pruneBtn, "Remove unverified",
+    W.HookTip(ui.pruneBtn, "Remove unverified",
         "Remove every saved character that could not be checked since the server looked reset.")
     ui.pruneBtn:SetScript("OnClick", function()
         local n = 0
@@ -1926,13 +1927,13 @@ EnsureWindow = function()
         SetStatus("Removed " .. n .. " unverified character" .. (n == 1 and "" or "s") .. ".")
         RefreshAlts()
     end)
-    ui.altSearch = MakeEditBox(alts, 150, 24)
+    ui.altSearch = W.MakeEditBox(alts, 150, 24)
     ui.altSearch:SetPoint("LEFT", ui.despawnAllBtn, "RIGHT", 12, 0)
     ui.altSearch.placeholder = ui.altSearch:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
     ui.altSearch.placeholder:SetPoint("LEFT", 8, 0)
     ui.altSearch.placeholder:SetText("Filter by name or class")
     ui.altSearch:SetScript("OnTextChanged", function() RefreshAlts() end)
-    local asf, ac = MakeScroll("AltBotsAltsScroll", alts, ROW_W)
+    local asf, ac = W.MakeScroll("AltBotsAltsScroll", alts, ROW_W)
     asf:SetPoint("TOPLEFT", 0, -76)
     asf:SetPoint("BOTTOMRIGHT", -18, 0)
     ui.altsChild = ac
@@ -1941,7 +1942,7 @@ EnsureWindow = function()
     local cmd = CreateFrame("Frame", nil, body)
     cmd:SetAllPoints()
     ui.cmdPane = cmd
-    local ch, cr = SectionHeader(cmd, "Orders")
+    local ch, cr = W.SectionHeader(cmd, "Orders")
     ch:SetPoint("TOPLEFT", 0, -2)
     cr:SetPoint("LEFT", ch, "RIGHT", 8, 0)
     cr:SetPoint("RIGHT", 0, 0)
@@ -1949,9 +1950,9 @@ EnsureWindow = function()
     local whoLbl = cmd:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
     whoLbl:SetPoint("TOPLEFT", 0, -28)
     whoLbl:SetText("Send to")
-    ui.whoBtn = MakeTextBtn(cmd, 200, 24, "All grouped alts")
+    ui.whoBtn = W.MakeTextBtn(cmd, 200, 24, "All grouped alts")
     ui.whoBtn:SetPoint("LEFT", whoLbl, "RIGHT", 8, 0)
-    HookTip(ui.whoBtn, "Who receives the order", "Choose one saved alt, or every known alt currently in your group. "
+    W.HookTip(ui.whoBtn, "Who receives the order", "Choose one saved alt, or every known alt currently in your group. "
         .. "Clicking a card below picks that alt too.")
     ui.whoBtn:SetScript("OnClick", function(self)
         local entries = { { text = "All grouped alts", func = function()
@@ -1961,17 +1962,17 @@ EnsureWindow = function()
         end } }
         for _, n in ipairs(SortedAltNames()) do
             local name = n
-            table.insert(entries, { text = AltName(name, Alts()[name]), func = function()
+            table.insert(entries, { text = W.AltName(name, Alts()[name]), func = function()
                 ui.orderChoice = name
                 self:SetText(name)
                 RefreshCommands()
             end })
         end
-        ShowPopup(self, entries)
+        W.ShowPopup(self, entries)
     end)
     ui.orderChoice = ALL_GROUPED
 
-    ui.radius = MakeEditBox(cmd, 48, 24)
+    ui.radius = W.MakeEditBox(cmd, 48, 24)
     ui.radius:SetPoint("TOPRIGHT", 0, -22)
     ui.radius:SetNumeric(true)
     ui.radius:SetMaxLetters(3)
@@ -1980,7 +1981,7 @@ EnsureWindow = function()
         AltBotsDB.farmRadius = ClampRadius(self:GetText())
         self:SetText(tostring(AltBotsDB.farmRadius))
     end
-    HookTip(ui.radius, "Farm radius", "How far the bot may wander while farming your current target, in yards (10-100).")
+    W.HookTip(ui.radius, "Farm radius", "How far the bot may wander while farming your current target, in yards (10-100).")
     local radiusLbl = cmd:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
     radiusLbl:SetPoint("RIGHT", ui.radius, "LEFT", -8, 0)
     radiusLbl:SetText("Farm radius (yd)")
@@ -1990,30 +1991,30 @@ EnsureWindow = function()
     ui.cmdIcons = {}
     for i, action in ipairs(ORDER_ACTIONS) do
         local verb = action.verb
-        local b = MakeActionTile(cmd, action, function() RunOrder(verb, Choice(), Radius()) end)
+        local b = W.MakeActionTile(cmd, action, function() W.RunOrder(verb, Choice(), Radius()) end)
         b:SetPoint("TOPLEFT", (i - 1) * 74, -56)
         ui.cmdIcons[i] = b
     end
 
-    local matH, matR = SectionHeader(cmd, "Materials")
+    local matH, matR = W.SectionHeader(cmd, "Materials")
     matH:SetPoint("TOPLEFT", 0, -128)
     matR:SetPoint("LEFT", matH, "RIGHT", 8, 0)
     matR:SetPoint("RIGHT", 0, 0)
 
-    ui.matBox = MakeEditBox(cmd, 170, 24)
+    ui.matBox = W.MakeEditBox(cmd, 170, 24)
     ui.matBox:SetPoint("TOPLEFT", 0, -150)
     ui.matBox.placeholder = ui.matBox:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
     ui.matBox.placeholder:SetPoint("LEFT", 8, 0)
     ui.matBox.placeholder:SetText("Item ID or shift-click a link")
-    TextColor(ui.matBox.placeholder, C.faint)
+    W.TextColor(ui.matBox.placeholder, C.faint)
     ui.matBox.onCommit = function(self)
         local id = ItemIdFrom(self:GetText())
         ui.matId = id
         if id then self:SetText(ItemLabel(id)) end
     end
     ui.matBox:SetScript("OnEnter", function(self)
-        if ui.matId then ShowItemTip(self, ui.matId, "The material for Farm, Mail now and Bank now.")
-        else Tip(self, "Material", "Type an item ID, shift-click an item link while this box has focus, or use Catalog.") end
+        if ui.matId then W.ShowItemTip(self, ui.matId, "The material for Farm, Mail now and Bank now.")
+        else W.Tip(self, "Material", "Type an item ID, shift-click an item link while this box has focus, or use Catalog.") end
     end)
     ui.matBox:SetScript("OnLeave", function() GameTooltip:Hide() end)
     ui.linkBoxes = ui.linkBoxes or {}
@@ -2038,9 +2039,9 @@ EnsureWindow = function()
     end
     ui.SetMaterial = SetMaterial
 
-    local catBtn = MakeTextBtn(cmd, 64, 24, "Catalog")
+    local catBtn = W.MakeTextBtn(cmd, 64, 24, "Catalog")
     catBtn:SetPoint("LEFT", ui.matBox, "RIGHT", 6, 0)
-    HookTip(catBtn, "Gather catalog", "Herbs, ore, cloth, leather and other materials bots can gather or hunt for.")
+    W.HookTip(catBtn, "Gather catalog", "Herbs, ore, cloth, leather and other materials bots can gather or hunt for.")
     local function ShowCategory(anchor, category, page)
         local list = gatherCatalog[category] or {}
         local per = 18
@@ -2056,7 +2057,7 @@ EnsureWindow = function()
         if page > 1 then
             table.insert(entries, { text = "|cff33ccffBack|r", func = function() ShowCategory(anchor, category, page - 1) end })
         end
-        ShowPopup(anchor, entries)
+        W.ShowPopup(anchor, entries)
     end
     catBtn:SetScript("OnClick", function(self)
         if #gatherCatalogOrder == 0 then
@@ -2069,10 +2070,10 @@ EnsureWindow = function()
             local c = category
             table.insert(entries, { text = c .. " (" .. #(gatherCatalog[c] or {}) .. ")", func = function() ShowCategory(self, c, 1) end })
         end
-        ShowPopup(self, entries)
+        W.ShowPopup(self, entries)
     end)
 
-    ui.matCount = MakeEditBox(cmd, 44, 24)
+    ui.matCount = W.MakeEditBox(cmd, 44, 24)
     ui.matCount:SetPoint("LEFT", catBtn, "RIGHT", 6, 0)
     ui.matCount:SetNumeric(true)
     ui.matCount:SetMaxLetters(4)
@@ -2082,9 +2083,9 @@ EnsureWindow = function()
         AltBotsDB.matCount = n
         self:SetText(tostring(n))
     end
-    HookTip(ui.matCount, "Count", "How many to farm (1-1000). Mail now and Bank now send every stack the alt carries.")
+    W.HookTip(ui.matCount, "Count", "How many to farm (1-1000). Mail now and Bank now send every stack the alt carries.")
 
-    local deliverBtn = MakeTextBtn(cmd, 86, 24, "")
+    local deliverBtn = W.MakeTextBtn(cmd, 86, 24, "")
     deliverBtn:SetPoint("LEFT", ui.matCount, "RIGHT", 6, 0)
     local function ShowDeliver()
         deliverBtn:SetText(MaterialDeliver() == "bank" and "Guild bank" or "Mail to me")
@@ -2094,47 +2095,47 @@ EnsureWindow = function()
         AltBotsDB.matDeliver = MaterialDeliver() == "bank" and "mail" or "bank"
         ShowDeliver()
     end)
-    HookTip(deliverBtn, "Delivery", "Where a farm order sends what it gathers: your mailbox, or the alt's guild bank. Click to switch.")
+    W.HookTip(deliverBtn, "Delivery", "Where a farm order sends what it gathers: your mailbox, or the alt's guild bank. Click to switch.")
 
-    local farmMatBtn = MakeTextBtn(cmd, 70, 24, "Farm it")
+    local farmMatBtn = W.MakeTextBtn(cmd, 70, 24, "Farm it")
     farmMatBtn:SetPoint("LEFT", deliverBtn, "RIGHT", 6, 0)
-    HookTip(farmMatBtn, "Farm material", "Send the alt picked in 'Send to' to gather or hunt this material anywhere in the world. "
+    W.HookTip(farmMatBtn, "Farm material", "Send the alt picked in 'Send to' to gather or hunt this material anywhere in the world. "
         .. "It leaves your group, delivers by the chosen way and reports progress in chat.")
     farmMatBtn:SetScript("OnClick", function()
         ui.matBox:ClearFocus(); ui.matCount:ClearFocus()
         FarmMaterial(Choice(), ui.matId, ui.matCount:GetText())
     end)
 
-    local stopMatBtn = MakeTextBtn(cmd, 46, 24, "Stop")
+    local stopMatBtn = W.MakeTextBtn(cmd, 46, 24, "Stop")
     stopMatBtn:SetPoint("LEFT", farmMatBtn, "RIGHT", 6, 0)
-    HookTip(stopMatBtn, "Stop farm order", "Cancel the material farm order. Invite the alt again from the Alts tab afterwards.")
+    W.HookTip(stopMatBtn, "Stop farm order", "Cancel the material farm order. Invite the alt again from the Alts tab afterwards.")
     stopMatBtn:SetScript("OnClick", function() StopFarmMaterial(Choice()) end)
 
-    local mailNowBtn = MakeTextBtn(cmd, 64, 24, "Mail now")
+    local mailNowBtn = W.MakeTextBtn(cmd, 64, 24, "Mail now")
     mailNowBtn:SetPoint("LEFT", stopMatBtn, "RIGHT", 6, 0)
-    HookTip(mailNowBtn, "Mail now", "Mail every stack of this material the alt carries to you.")
+    W.HookTip(mailNowBtn, "Mail now", "Mail every stack of this material the alt carries to you.")
     mailNowBtn:SetScript("OnClick", function()
         ui.matBox:ClearFocus()
         SendMaterial(Choice(), ui.matId, "mail")
     end)
 
-    local bankNowBtn = MakeTextBtn(cmd, 64, 24, "Bank now")
+    local bankNowBtn = W.MakeTextBtn(cmd, 64, 24, "Bank now")
     bankNowBtn:SetPoint("LEFT", mailNowBtn, "RIGHT", 6, 0)
-    HookTip(bankNowBtn, "Bank now", "Put every stack of this material the alt carries in its guild bank.")
+    W.HookTip(bankNowBtn, "Bank now", "Put every stack of this material the alt carries in its guild bank.")
     bankNowBtn:SetScript("OnClick", function()
         ui.matBox:ClearFocus()
         SendMaterial(Choice(), ui.matId, "bank")
     end)
 
-    local listH, listR = SectionHeader(cmd, "Grouped alts")
+    local listH, listR = W.SectionHeader(cmd, "Grouped alts")
     listH:SetPoint("TOPLEFT", 0, -186)
     listR:SetPoint("LEFT", listH, "RIGHT", 8, 0)
     listR:SetPoint("RIGHT", 0, 0)
-    ui.cmdEmpty = EmptyText(cmd, "AltBotsFontBody")
+    ui.cmdEmpty = W.EmptyText(cmd, "AltBotsFontBody")
     ui.cmdEmpty:SetPoint("CENTER", 0, -50)
-    TextColor(ui.cmdEmpty, C.muted)
+    W.TextColor(ui.cmdEmpty, C.muted)
     ui.cmdEmpty:SetText("None of your saved alts are in the group yet.\nSpawn and invite them from the Alts tab.")
-    local csf, cc = MakeScroll("AltBotsCmdScroll", cmd, ROW_W)
+    local csf, cc = W.MakeScroll("AltBotsCmdScroll", cmd, ROW_W)
     csf:SetPoint("TOPLEFT", 0, -204)
     csf:SetPoint("BOTTOMRIGHT", -18, 0)
     ui.cmdChild = cc
@@ -2145,8 +2146,8 @@ EnsureWindow = function()
     ui.partyPane = party
 
     local left
-    left, ui.partyEmpty = MakeSidebar(party, "Party", "Invite a bot to your group to inspect it here.")
-    local psf, pc = MakeScroll("AltBotsPartyListScroll", left, 168)
+    left, ui.partyEmpty = W.MakeSidebar(party, "Party", "Invite a bot to your group to inspect it here.")
+    local psf, pc = W.MakeScroll("AltBotsPartyListScroll", left, 168)
     psf:SetPoint("TOPLEFT", 6, -28)
     psf:SetPoint("BOTTOMRIGHT", -16, 6)
     ui.partyListChild = pc
@@ -2156,9 +2157,9 @@ EnsureWindow = function()
     right:SetPoint("BOTTOMRIGHT", 0, 0)
     ui.partyRight = right
 
-    ui.partyPickHint = EmptyText(right, "AltBotsFontBody")
+    ui.partyPickHint = W.EmptyText(right, "AltBotsFontBody")
     ui.partyPickHint:SetPoint("CENTER", 0, 20)
-    TextColor(ui.partyPickHint, C.muted)
+    W.TextColor(ui.partyPickHint, C.muted)
     ui.partyPickHint:SetText("Select a party member on the left.")
 
     ui.detail = CreateFrame("Frame", nil, right)
@@ -2171,9 +2172,9 @@ EnsureWindow = function()
     ui.detailSub:SetPoint("TOPLEFT", 0, -22)
     ui.detailSub:SetJustifyH("LEFT")
 
-    ui.inspectBtn = MakeTextBtn(ui.detail, 70, 24, "Inspect")
+    ui.inspectBtn = W.MakeTextBtn(ui.detail, 70, 24, "Inspect")
     ui.inspectBtn:SetPoint("TOPRIGHT", -4, -2)
-    HookTip(ui.inspectBtn, "Inspect", "Open the game's inspect window. You must be within 28 yards.")
+    W.HookTip(ui.inspectBtn, "Inspect", "Open the game's inspect window. You must be within 28 yards.")
     ui.inspectBtn:SetScript("OnClick", function()
         if not selectedPartyUnit or not UnitExists(selectedPartyUnit) then
             SetStatus("Select a party member first.")
@@ -2187,7 +2188,7 @@ EnsureWindow = function()
         InspectUnit(selectedPartyUnit)
     end)
 
-    local rh, rr = SectionHeader(ui.detail, "Role, spec and gear")
+    local rh, rr = W.SectionHeader(ui.detail, "Role, spec and gear")
     ui.prefHeader, ui.prefRule = rh, rr
     ui.roleLbl = ui.detail:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
     ui.roleLbl:SetText("Role")
@@ -2199,7 +2200,7 @@ EnsureWindow = function()
     ui.specRow = CreateFrame("Frame", nil, ui.detail)
     ui.specRow:SetWidth(400); ui.specRow:SetHeight(22)
     ui.specHint = ui.detail:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
-    TextColor(ui.specHint, C.faint)
+    W.TextColor(ui.specHint, C.faint)
     ui.specHint:SetText("This class has no addon specs to switch.")
 
     ui.armorLbl = ui.detail:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
@@ -2212,10 +2213,10 @@ EnsureWindow = function()
     ui.weaponRow = CreateFrame("Frame", nil, ui.detail)
     ui.weaponRow:SetWidth(400); ui.weaponRow:SetHeight(22)
 
-    local eh, er = SectionHeader(ui.detail, "Equipped")
+    local eh, er = W.SectionHeader(ui.detail, "Equipped")
     ui.equipHeader, ui.equipRule = eh, er
-    ui.unlockBtn = MakeTextBtn(ui.detail, 100, 20, "Auto-upgrade")
-    HookTip(ui.unlockBtn, "Auto-upgrade", "Clear locked slots so the bot can choose its own upgrades again.")
+    ui.unlockBtn = W.MakeTextBtn(ui.detail, 100, 20, "Auto-upgrade")
+    W.HookTip(ui.unlockBtn, "Auto-upgrade", "Clear locked slots so the bot can choose its own upgrades again.")
     ui.unlockBtn:SetScript("OnClick", function()
         if selectedPartyGuid then
             SendBot("UNLOCK", selectedPartyGuid)
@@ -2226,19 +2227,19 @@ EnsureWindow = function()
     ui.doll = CreateFrame("Frame", nil, ui.detail)
     ui.doll:SetWidth(400); ui.doll:SetHeight(72)
 
-    local ph, pr = SectionHeader(ui.detail, "Professions")
+    local ph, pr = W.SectionHeader(ui.detail, "Professions")
     ui.profHeader, ui.profRule = ph, pr
     ui.profRow = CreateFrame("Frame", nil, ui.detail)
     ui.profRow:SetWidth(400); ui.profRow:SetHeight(48)
     ui.profHint = ui.detail:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
-    TextColor(ui.profHint, C.faint)
+    W.TextColor(ui.profHint, C.faint)
     ui.profHint:SetText("Profession data has not arrived yet.")
 
-    local bh, br = SectionHeader(ui.detail, "Bags")
+    local bh, br = W.SectionHeader(ui.detail, "Bags")
     ui.bagHeader, ui.bagRule = bh, br
 
-    ui.refreshBtn = MakeTextBtn(ui.detail, 80, 20, "Refresh")
-    HookTip(ui.refreshBtn, "Refresh bags", "Ask this bot for a fresh bag and equipment list.")
+    ui.refreshBtn = W.MakeTextBtn(ui.detail, 80, 20, "Refresh")
+    W.HookTip(ui.refreshBtn, "Refresh bags", "Ask this bot for a fresh bag and equipment list.")
     ui.refreshBtn:SetScript("OnClick", function()
         if selectedPartyGuid then
             RequestGearAndBags(selectedPartyGuid, "Refreshing " .. (selectedPartyName or "bot") .. "...")
@@ -2247,14 +2248,14 @@ EnsureWindow = function()
         end
     end)
 
-    ui.refreshAllBtn = MakeTextBtn(ui.detail, 80, 20, "Refresh all")
-    HookTip(ui.refreshAllBtn, "Refresh all", "Ask every grouped bot for a fresh bag and equipment list.")
+    ui.refreshAllBtn = W.MakeTextBtn(ui.detail, 80, 20, "Refresh all")
+    W.HookTip(ui.refreshAllBtn, "Refresh all", "Ask every grouped bot for a fresh bag and equipment list.")
     ui.refreshAllBtn:SetScript("OnClick", RequestAllPartyBags)
 
-    local bsf, bc = MakeScroll("AltBotsBagsScroll", ui.detail, 400)
+    local bsf, bc = W.MakeScroll("AltBotsBagsScroll", ui.detail, 400)
     ui.bagsScroll = bsf
     ui.bagsChild = bc
-    ui.bagsEmpty = EmptyText(ui.detail)
+    ui.bagsEmpty = W.EmptyText(ui.detail)
     ui.bagsEmpty:SetPoint("CENTER", bsf, "CENTER", 0, 0)
     ui.bagsEmpty:SetText("Bags are empty, or still loading.")
 
@@ -2404,7 +2405,7 @@ EnsureWindow = function()
 end
 
 
-local function AgoText(stamp)
+function W.AgoText(stamp)
     local secs = time() - (stamp or 0)
     if secs < 60 then return "just now" end
     if secs < 3600 then return math.floor(secs / 60) .. " min ago" end
@@ -2412,7 +2413,7 @@ local function AgoText(stamp)
     return math.floor(secs / 86400) .. " days ago"
 end
 
-local function AltsHintText()
+function W.AltsHintText()
     local data = RealmData()
     if altSync.state == "waiting" then
         return "Checking your characters with the server..."
@@ -2423,12 +2424,12 @@ local function AltsHintText()
             " could not be checked yet: press Sync, or remove them.|r"
     end
     if data.serverList and data.syncedAt then
-        return "Synced with your account's character list " .. AgoText(data.syncedAt) .. "."
+        return "Synced with your account's character list " .. W.AgoText(data.syncedAt) .. "."
     end
     return "Characters are saved when you log into them. Press Sync to load your account's list from the server."
 end
 
-local function AltMatchesFilter(name, info, filter)
+function W.AltMatchesFilter(name, info, filter)
     if not filter or filter == "" then return true end
     if string.find(name:lower(), filter, 1, true) then return true end
     local classFile = info and info.classFile
@@ -2437,20 +2438,20 @@ end
 
 RefreshAlts = function()
     if not win or not ui.altsChild then return end
-    HidePool(ui.pools.altRows)
-    UpdateHeaderSummary()
+    W.HidePool(ui.pools.altRows)
+    W.UpdateHeaderSummary()
     local allNames = SortedAltNames()
     local grouped = GroupedNames()
     local filter = ui.altSearch and ui.altSearch:GetText():lower() or ""
     local names = {}
     for _, n in ipairs(allNames) do
-        if AltMatchesFilter(n, Alts()[n], filter) then table.insert(names, n) end
+        if W.AltMatchesFilter(n, Alts()[n], filter) then table.insert(names, n) end
     end
     if ui.spawnAllBtn then
         if #names == 0 then ui.spawnAllBtn:Disable(); ui.despawnAllBtn:Disable()
         else ui.spawnAllBtn:Enable(); ui.despawnAllBtn:Enable() end
     end
-    if ui.altsHint then ui.altsHint:SetText(AltsHintText()) end
+    if ui.altsHint then ui.altsHint:SetText(W.AltsHintText()) end
     if ui.syncBtn then
         if altSync.state == "waiting" then ui.syncBtn:Disable() else ui.syncBtn:Enable() end
     end
@@ -2470,32 +2471,32 @@ RefreshAlts = function()
     ui.altsEmpty:Hide()
     local y = 0
     for _, name in ipairs(names) do
-        local row = TakeRow(ui.pools.altRows, ui.altsChild, MakeAltRow)
+        local row = W.TakeRow(ui.pools.altRows, ui.altsChild, W.MakeAltRow)
         row:ClearAllPoints()
         row:SetPoint("TOPLEFT", 0, y)
         row:SetWidth(ROW_W)
         local info = Alts()[name]
-        row.name:SetText(AltName(name, info))
-        SetClassIcon(row.classIcon, info and info.classFile)
+        row.name:SetText(W.AltName(name, info))
+        W.SetClassIcon(row.classIcon, info and info.classFile)
         local inGroup = grouped[name]
         local isOut = spawned[name] or inGroup
-        TextColor(row.status, C.muted)
-        SetRowSelected(row, inGroup)
+        W.TextColor(row.status, C.muted)
+        W.SetRowSelected(row, inGroup)
         if inGroup then
             row.status:SetText("In your group")
-            TextColor(row.status, C.good)
-            SetDot(row.dot, "green")
+            W.TextColor(row.status, C.good)
+            W.SetDot(row.dot, "green")
         elseif info and info.stale then
             row.status:SetText("Not verified")
-            TextColor(row.status, C.warn)
-            SetDot(row.dot, "red")
+            W.TextColor(row.status, C.warn)
+            W.SetDot(row.dot, "red")
         elseif spawned[name] then
             row.status:SetText("Questing solo")
-            TextColor(row.status, C.warn)
-            SetDot(row.dot, "yellow")
+            W.TextColor(row.status, C.warn)
+            W.SetDot(row.dot, "yellow")
         else
             row.status:SetText("Not spawned")
-            SetDot(row.dot, "gray")
+            W.SetDot(row.dot, "gray")
         end
         row.dot:Show()
 
@@ -2503,7 +2504,7 @@ RefreshAlts = function()
             row.spawn:SetText("Despawn")
             row.spawn:Enable()
             row.spawn:SetScript("OnClick", function() Despawn(name); RefreshAlts() end)
-            HookTip(row.spawn, "Despawn", "Send " .. name .. " away.")
+            W.HookTip(row.spawn, "Despawn", "Send " .. name .. " away.")
         else
             row.spawn:SetText("Spawn")
             row.spawn:Enable()
@@ -2513,12 +2514,12 @@ RefreshAlts = function()
                 SetStatus("Spawned " .. name .. ".")
                 RefreshAlts()
             end)
-            HookTip(row.spawn, "Spawn", "Spawn " .. name .. " without inviting it, so you can invite it yourself if you want.")
+            W.HookTip(row.spawn, "Spawn", "Spawn " .. name .. " without inviting it, so you can invite it yourself if you want.")
         end
 
         if isOut then
             row.quest:Disable()
-            HookTip(row.quest, "Quest solo", name .. " is already spawned or in your group.")
+            W.HookTip(row.quest, "Quest solo", name .. " is already spawned or in your group.")
         else
             row.quest:Enable()
             row.quest:SetScript("OnClick", function()
@@ -2527,7 +2528,7 @@ RefreshAlts = function()
                 SetStatus(name .. " is off questing on its own.")
                 RefreshAlts()
             end)
-            HookTip(row.quest, "Quest solo", "Spawn " .. name .. " without inviting, so it quests on its own.")
+            W.HookTip(row.quest, "Quest solo", "Spawn " .. name .. " without inviting, so it quests on its own.")
         end
 
         row.remove:SetScript("OnClick", function()
@@ -2536,13 +2537,13 @@ RefreshAlts = function()
             SetStatus("Removed " .. name .. ".")
             RefreshAlts()
         end)
-        HookTip(row.remove, "Remove " .. name, (info and info.stale)
+        W.HookTip(row.remove, "Remove " .. name, (info and info.stale)
             and "This character could not be checked since the server looked reset. Remove it if it no longer exists."
             or "Forget this character. Sync or a login on it adds it back.")
 
         if inGroup then
             row.invite:Disable()
-            HookTip(row.invite, "Invite", name .. " is already in your group.")
+            W.HookTip(row.invite, "Invite", name .. " is already in your group.")
         else
             row.invite:Enable()
             row.invite:SetScript("OnClick", function()
@@ -2553,7 +2554,7 @@ RefreshAlts = function()
                 end
                 RefreshAlts()
             end)
-            HookTip(row.invite, "Invite", spawned[name] and ("Invite " .. name .. ". If it is already in another group, it will leave and join you.")
+            W.HookTip(row.invite, "Invite", spawned[name] and ("Invite " .. name .. ". If it is already in another group, it will leave and join you.")
                 or ("Spawn " .. name .. " and invite it. If it is already in another group, it will leave and join you."))
         end
         y = y - 38
@@ -2561,7 +2562,7 @@ RefreshAlts = function()
     ui.altsChild:SetHeight(math.max(1, -y + 4))
 end
 
-local function GroupUnitsByName()
+function W.GroupUnitsByName()
     local map = {}
     local raid = GetNumRaidMembers()
     if raid > 0 then
@@ -2580,7 +2581,7 @@ local function GroupUnitsByName()
     return map
 end
 
-local function ShortNumber(n)
+function W.ShortNumber(n)
     n = tonumber(n) or 0
     if n >= 1000000 then return string.format("%.1fm", n / 1000000) end
     if n >= 10000 then return string.format("%.0fk", n / 1000) end
@@ -2588,7 +2589,7 @@ local function ShortNumber(n)
     return tostring(n)
 end
 
-local function UnitRangeState(unit)
+function W.UnitRangeState(unit)
     if not UnitIsConnected(unit) then return "Offline", "gray" end
     if UnitIsDeadOrGhost(unit) then return "Dead", "red" end
     if UnitAffectingCombat(unit) then return "In combat", "red" end
@@ -2598,13 +2599,13 @@ local function UnitRangeState(unit)
     return "Out of sight", "yellow"
 end
 
-local function UpdateCmdCard(row)
+function W.UpdateCmdCard(row)
     local unit = row.unit
     if not unit or not UnitExists(unit) then
         row.hp:SetValue(0); row.mp:SetValue(0)
         row.hpText:SetText("")
         row.state:SetText("Not here")
-        SetDot(row.dot, "gray")
+        W.SetDot(row.dot, "gray")
         return
     end
     local hp, hpMax = UnitHealth(unit) or 0, UnitHealthMax(unit) or 0
@@ -2619,33 +2620,33 @@ local function UpdateCmdCard(row)
     else
         row.hp:SetStatusBarColor(C.good[1], C.good[2], C.good[3])
     end
-    row.hpText:SetText(ShortNumber(hp) .. " / " .. ShortNumber(hpMax))
+    row.hpText:SetText(W.ShortNumber(hp) .. " / " .. W.ShortNumber(hpMax))
     local mp, mpMax = UnitPower(unit) or 0, UnitPowerMax(unit) or 0
     if mpMax <= 0 then mpMax = 1; mp = 0 end
     row.mp:SetMinMaxValues(0, mpMax)
     row.mp:SetValue(mp)
     local pc = PowerBarColor and PowerBarColor[UnitPowerType(unit)]
     if pc then row.mp:SetStatusBarColor(pc.r, pc.g, pc.b) else row.mp:SetStatusBarColor(0.3, 0.5, 1) end
-    local text, dot = UnitRangeState(unit)
+    local text, dot = W.UnitRangeState(unit)
     row.state:SetText(text)
-    SetDot(row.dot, dot)
+    W.SetDot(row.dot, dot)
     local level = UnitLevel(unit) or 0
     local className = UnitClass(unit)
     row.sub:SetText((level > 0 and ("Level " .. level) or "Level ??") .. (className and ("  " .. className) or ""))
 end
 
-local function UpdateCmdCards()
+function W.UpdateCmdCards()
     for _, row in ipairs(ui.pools and ui.pools.cmdRows or {}) do
-        if row:IsShown() then UpdateCmdCard(row) end
+        if row:IsShown() then W.UpdateCmdCard(row) end
     end
 end
 
 RefreshCommands = function()
     if not win or not ui.cmdChild then return end
-    HidePool(ui.pools.cmdRows)
-    UpdateHeaderSummary()
+    W.HidePool(ui.pools.cmdRows)
+    W.UpdateHeaderSummary()
     local grouped = GroupedNames()
-    local units = GroupUnitsByName()
+    local units = W.GroupUnitsByName()
     local names = {}
     for _, n in ipairs(SortedAltNames()) do
         if grouped[n] then table.insert(names, n) end
@@ -2662,14 +2663,14 @@ RefreshCommands = function()
     ui.cmdEmpty:Hide()
     local y = 0
     for _, name in ipairs(names) do
-        local row = TakeRow(ui.pools.cmdRows, ui.cmdChild, MakeCmdRow)
+        local row = W.TakeRow(ui.pools.cmdRows, ui.cmdChild, W.MakeCmdRow)
         row:ClearAllPoints()
         row:SetPoint("TOPLEFT", 0, y)
         row.unit = units[name]
-        row.name:SetText(ClassColorText(row.unit, name))
-        SetClassIcon(row.classIcon, ClassFileOf(row.unit) or (Alts()[name] and Alts()[name].classFile))
+        row.name:SetText(W.ClassColorText(row.unit, name))
+        W.SetClassIcon(row.classIcon, W.ClassFileOf(row.unit) or (Alts()[name] and Alts()[name].classFile))
         local picked = ui.orderChoice == name
-        SetRowSelected(row, picked)
+        W.SetRowSelected(row, picked)
         local who = name
         row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
         row:SetScript("OnClick", function(_, button)
@@ -2685,17 +2686,17 @@ RefreshCommands = function()
             RefreshCommands()
         end)
         row:SetScript("OnEnter", function(self)
-            Tip(self, who, picked and "Orders go to this alt only. Click again or right-click to send to every grouped alt."
+            W.Tip(self, who, picked and "Orders go to this alt only. Click again or right-click to send to every grouped alt."
                 or "Click to send orders to this alt only.")
         end)
         row:SetScript("OnLeave", function() GameTooltip:Hide() end)
-        UpdateCmdCard(row)
+        W.UpdateCmdCard(row)
         y = y - 44
     end
     ui.cmdChild:SetHeight(math.max(1, -y + 4))
 end
 
-local function PartyMembers()
+function W.PartyMembers()
     local list = {}
     local raid = GetNumRaidMembers()
     if raid > 0 then
@@ -2716,7 +2717,7 @@ local function PartyMembers()
     return list
 end
 
-local function ConfirmRespec(name, specName, guid, specId)
+function W.ConfirmRespec(name, specName, guid, specId)
     StaticPopupDialogs["ALTBOTS_RESPEC"] = {
         text = "Switch " .. (name or "this bot") .. " to " .. (specName or "this spec") .. "?\nThis fully respecs the bot.",
         button1 = YES, button2 = NO,
@@ -2729,22 +2730,22 @@ local function ConfirmRespec(name, specName, guid, specId)
     StaticPopup_Show("ALTBOTS_RESPEC")
 end
 
-local function SizePrefBtn(b, text)
+function W.SizePrefBtn(b, text)
     b:SetText(text)
     local fs = b:GetFontString()
     local w = fs and fs:GetStringWidth() or 0
     b:SetWidth(math.max(60, math.floor(w + 18)))
 end
 
-local function FillChoiceRow(row, pool, maker, options, current, onPick, isLegal)
-    HidePool(pool)
+function W.FillChoiceRow(row, pool, maker, options, current, onPick, isLegal)
+    W.HidePool(pool)
     local x, y = 0, 0
     local rowW = row:GetWidth() or 400
     if rowW < 100 then rowW = 400 end
     for _, opt in ipairs(options) do
-        local b = TakeRow(pool, row, maker)
+        local b = W.TakeRow(pool, row, maker)
         b:ClearAllPoints()
-        SizePrefBtn(b, opt.label or opt.id)
+        W.SizePrefBtn(b, opt.label or opt.id)
         local bw = b:GetWidth() or 60
         if x > 0 and (x + bw) > rowW then
             x = 0
@@ -2768,11 +2769,11 @@ local function FillChoiceRow(row, pool, maker, options, current, onPick, isLegal
     row:SetHeight(y + 22)
 end
 
-local function MakePrefBtn(parent)
-    return MakeTextBtn(parent, 60, 20, "")
+function W.MakePrefBtn(parent)
+    return W.MakeTextBtn(parent, 60, 20, "")
 end
 
-local function AvgItemLevel(guid)
+function W.AvgItemLevel(guid)
     local sum, n = 0, 0
     for slot, info in pairs(gearCache[guid] or {}) do
         if GEAR_SLOT_NAMES[slot] and info.entry and info.entry > 0 and (info.itemLevel or 0) > 0 then
@@ -2796,18 +2797,18 @@ ui.UpdateDetailSub = function()
     end
     local role = currentRoleCache[guid]
     if role and role ~= "auto" then table.insert(parts, ROLE_LABELS[role] or role) end
-    local ilvl = AvgItemLevel(guid)
+    local ilvl = W.AvgItemLevel(guid)
     if ilvl then table.insert(parts, "Item level " .. ilvl) end
     local free, total
     if ui.BagFree then free, total = ui.BagFree(guid) end
     if free then table.insert(parts, free .. "/" .. total .. " bag slots free") end
-    ui.detailSub:SetText(table.concat(parts, "   " .. Hex(C.faint) .. "/|r   "))
+    ui.detailSub:SetText(table.concat(parts, "   " .. W.Hex(C.faint) .. "/|r   "))
 end
 
 RefreshParty = function()
     if not win or not ui.partyListChild then return end
-    HidePool(ui.pools.partyRows)
-    local members = PartyMembers()
+    W.HidePool(ui.pools.partyRows)
+    local members = W.PartyMembers()
     if #members == 0 then
         ui.partyEmpty:Show()
         ui.partyPickHint:Show()
@@ -2820,26 +2821,26 @@ RefreshParty = function()
     local stillThere = false
     local y = 0
     for _, m in ipairs(members) do
-        local row = TakeRow(ui.pools.partyRows, ui.partyListChild, MakePartyRow)
+        local row = W.TakeRow(ui.pools.partyRows, ui.partyListChild, W.MakePartyRow)
         row:ClearAllPoints()
         row:SetPoint("TOPLEFT", 0, y)
-        row.name:SetText(ClassColorText(m.unit, m.name or "?"))
-        SetClassIcon(row.classIcon, ClassFileOf(m.unit))
-        SetDot(row.dot, UnitIsConnected(m.unit) and "green" or "gray")
+        row.name:SetText(W.ClassColorText(m.unit, m.name or "?"))
+        W.SetClassIcon(row.classIcon, W.ClassFileOf(m.unit))
+        W.SetDot(row.dot, UnitIsConnected(m.unit) and "green" or "gray")
         local level = UnitLevel(m.unit) or 0
-        local ilvl = m.guid and AvgItemLevel(m.guid)
-        row.info:SetText(ilvl and (Hex(C.accent) .. ilvl .. "|r") or (level > 0 and tostring(level) or ""))
+        local ilvl = m.guid and W.AvgItemLevel(m.guid)
+        row.info:SetText(ilvl and (W.Hex(C.accent) .. ilvl .. "|r") or (level > 0 and tostring(level) or ""))
         local guid, name, unit = m.guid, m.name, m.unit
         local isSelected = selectedPartyGuid ~= nil and guid == selectedPartyGuid
         if isSelected then stillThere = true end
-        SetRowSelected(row, isSelected)
+        W.SetRowSelected(row, isSelected)
         row:SetScript("OnClick", function()
             selectedPartyGuid, selectedPartyName, selectedPartyUnit = guid, name, unit
             RequestPartyData(guid)
             RefreshParty()
         end)
         row:SetScript("OnEnter", function(self)
-            Tip(self, name or "?", "Level " .. level .. (ilvl and (", average item level " .. ilvl) or "")
+            W.Tip(self, name or "?", "Level " .. level .. (ilvl and (", average item level " .. ilvl) or "")
                 .. ". The blue number is the average item level once its gear has loaded.")
         end)
         row:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -2854,7 +2855,7 @@ RefreshParty = function()
     end
     ui.partyPickHint:Hide()
     ui.detail:Show()
-    ui.detailName:SetText(ClassColorText(selectedPartyUnit, selectedPartyName or "?"))
+    ui.detailName:SetText(W.ClassColorText(selectedPartyUnit, selectedPartyName or "?"))
     ui.UpdateDetailSub()
 
     local guid = selectedPartyGuid
@@ -2866,7 +2867,7 @@ RefreshParty = function()
             table.insert(roleOpts, { id = id, label = ROLE_LABELS[id] or id })
         end
     end
-    FillChoiceRow(ui.roleRow, ui.pools.roleBtns, MakePrefBtn, roleOpts, currentRole, function(id)
+    W.FillChoiceRow(ui.roleRow, ui.pools.roleBtns, W.MakePrefBtn, roleOpts, currentRole, function(id)
         SendBot("SETROLE", guid, id)
         currentRoleCache[guid] = id
         SetStatus((selectedPartyName or "Bot") .. " role set to " .. (ROLE_LABELS[id] or id) .. ".")
@@ -2874,7 +2875,7 @@ RefreshParty = function()
     end)
 
     local specs = specsCache[guid] or {}
-    HidePool(ui.pools.specBtns)
+    W.HidePool(ui.pools.specBtns)
     if #specs == 0 then
         ui.specHint:Show()
     else
@@ -2883,12 +2884,12 @@ RefreshParty = function()
         for _, s in ipairs(specs) do
             table.insert(specOpts, { id = tostring(s.specId), label = s.name or ("Spec " .. s.specId) })
         end
-        FillChoiceRow(ui.specRow, ui.pools.specBtns, MakePrefBtn, specOpts, nil, function(id)
+        W.FillChoiceRow(ui.specRow, ui.pools.specBtns, W.MakePrefBtn, specOpts, nil, function(id)
             local specName = id
             for _, s in ipairs(specs) do
                 if tostring(s.specId) == id then specName = s.name; break end
             end
-            ConfirmRespec(selectedPartyName, specName, guid, tonumber(id))
+            W.ConfirmRespec(selectedPartyName, specName, guid, tonumber(id))
         end)
     end
 
@@ -2907,13 +2908,13 @@ RefreshParty = function()
     for _, id in ipairs(WEAPON_TYPES) do
         if id == "auto" or legalWeapon[id] then table.insert(wepOpts, { id = id, label = id:gsub("^%l", string.upper) }) end
     end
-    FillChoiceRow(ui.armorRow, ui.pools.prefArm, MakePrefBtn, armorOpts, armorPref, function(id)
+    W.FillChoiceRow(ui.armorRow, ui.pools.prefArm, W.MakePrefBtn, armorOpts, armorPref, function(id)
         SendBot("SETGEARPREF", guid, "armor:" .. id)
         if gearPrefsCache[guid] then gearPrefsCache[guid].armorPref = id end
         SetStatus("Armor preference: " .. id .. ".")
         RefreshParty()
     end)
-    FillChoiceRow(ui.weaponRow, ui.pools.prefWep, MakePrefBtn, wepOpts, weaponPref, function(id)
+    W.FillChoiceRow(ui.weaponRow, ui.pools.prefWep, W.MakePrefBtn, wepOpts, weaponPref, function(id)
         SendBot("SETGEARPREF", guid, "weapon:" .. id)
         if gearPrefsCache[guid] then gearPrefsCache[guid].weaponPref = id end
         SetStatus("Weapon preference: " .. id .. ".")
@@ -2927,13 +2928,13 @@ RefreshParty = function()
     if LayoutPartyDetail then LayoutPartyDetail() end
 end
 
-local function PlaceDollSlot(slot, col, row)
+function W.PlaceDollSlot(slot, col, row)
     local b
     for _, existing in ipairs(ui.pools.gearSlots) do
         if existing.slot == slot then b = existing; break end
     end
     if not b then
-        b = MakeItemButton(ui.doll, 32)
+        b = W.MakeItemButton(ui.doll, 32)
         b.slot = slot
         table.insert(ui.pools.gearSlots, b)
     end
@@ -2945,25 +2946,25 @@ end
 
 RefreshPartyGear = function()
     if not win or not ui.doll or not selectedPartyGuid then
-        HidePool(ui.pools.gearSlots)
+        W.HidePool(ui.pools.gearSlots)
         return
     end
     local guid = selectedPartyGuid
     local gear = gearCache[guid] or {}
-    HidePool(ui.pools.gearSlots)
+    W.HidePool(ui.pools.gearSlots)
     for row, slots in ipairs(PAPERDOLL_ROWS) do
         for i, slot in ipairs(slots) do
-            local b = PlaceDollSlot(slot, i - 1, row - 1)
+            local b = W.PlaceDollSlot(slot, i - 1, row - 1)
             local info = gear[slot]
             local entry = info and info.entry or 0
-            SetItemIcon(b, entry)
+            W.SetItemIcon(b, entry)
             if b.count then b.count:SetText("") end
             if SlotLocked(guid, slot) then b.lock:Show() else b.lock:Hide() end
             b:SetScript("OnEnter", function(self)
                 if entry and entry > 0 then
-                    ShowItemTip(self, entry, "Shift-click or right-click to unequip. Alt-click to unlock this slot.")
+                    W.ShowItemTip(self, entry, "Shift-click or right-click to unequip. Alt-click to unlock this slot.")
                 else
-                    Tip(self, GEAR_SLOT_NAMES[slot] or ("Slot " .. slot), "Empty. Alt-click to unlock this slot.")
+                    W.Tip(self, GEAR_SLOT_NAMES[slot] or ("Slot " .. slot), "Empty. Alt-click to unlock this slot.")
                 end
             end)
             b:SetScript("OnClick", function(self, button)
@@ -2982,7 +2983,7 @@ end
 
 RefreshPartyBags = function()
     if not win or not ui.bagsChild then return end
-    HidePool(ui.pools.bagSlots)
+    W.HidePool(ui.pools.bagSlots)
     if not selectedPartyGuid then
         ui.bagsEmpty:Show()
         ui.bagsEmpty:SetText("Select a party member to see their bags.")
@@ -3026,7 +3027,7 @@ RefreshPartyBags = function()
     if cols > 12 then cols = 12 end
 
     for i, pos in ipairs(slots) do
-        local b = TakeRow(ui.pools.bagSlots, ui.bagsChild, function(p) return MakeItemButton(p, size) end)
+        local b = W.TakeRow(ui.pools.bagSlots, ui.bagsChild, function(p) return W.MakeItemButton(p, size) end)
         local col = (i - 1) % cols
         local row = math.floor((i - 1) / cols)
         b:ClearAllPoints()
@@ -3034,7 +3035,7 @@ RefreshPartyBags = function()
         local it = items[(pos.bag * 1000) + pos.slot]
         local entry = it and it.entry or 0
         local count = it and it.count or 0
-        SetItemIcon(b, entry, EMPTY_BAG_TEXTURE)
+        W.SetItemIcon(b, entry, EMPTY_BAG_TEXTURE)
         if count > 1 then b.count:SetText(count) else b.count:SetText("") end
         b.lock:Hide()
         local bag, slot = pos.bag, pos.slot
@@ -3046,9 +3047,9 @@ RefreshPartyBags = function()
                 if tooHigh then
                     extra = "Requires level " .. need .. ". The bot cannot equip this yet.\n" .. extra
                 end
-                ShowItemTip(self, entry, extra)
+                W.ShowItemTip(self, entry, extra)
             else
-                Tip(self, "Empty slot", "Open bag space.")
+                W.Tip(self, "Empty slot", "Open bag space.")
             end
         end)
         b:SetScript("OnClick", function(self, button)
@@ -3060,7 +3061,7 @@ RefreshPartyBags = function()
                 end
                 local itemId, botGuid, botName = entry, guid, selectedPartyName or "bot"
                 local label = ItemLabel(itemId)
-                ShowPopup(self, {
+                W.ShowPopup(self, {
                     { text = "Trade to me", func = function()
                         TradeItemToMe(botGuid, itemId, 0)
                         SetStatus(botName .. ": trading " .. label .. " to you...")
@@ -3106,12 +3107,12 @@ RefreshPartyBags = function()
     UpdateBagHeader()
 end
 
-local function MakeProfBtn(parent)
+function W.MakeProfBtn(parent)
     local b = CreateFrame("Button", nil, parent)
     b:SetWidth(46)
     b:SetHeight(54)
-    Skin(b, C.row, C.border)
-    AddHover(b, 0.10)
+    W.Skin(b, C.row, C.border)
+    W.AddHover(b, 0.10)
     b.icon = b:CreateTexture(nil, "ARTWORK")
     b.icon:SetPoint("TOP", 0, -4)
     b.icon:SetWidth(28)
@@ -3119,7 +3120,7 @@ local function MakeProfBtn(parent)
     b.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
     b.rank = b:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
     b.rank:SetPoint("BOTTOM", 0, 7)
-    b.bar = MakeBar(b, 2)
+    b.bar = W.MakeBar(b, 2)
     b.bar:SetPoint("BOTTOMLEFT", 3, 3)
     b.bar:SetPoint("BOTTOMRIGHT", -3, 3)
     b.bar:SetStatusBarColor(C.accent[1], C.accent[2], C.accent[3])
@@ -3127,7 +3128,7 @@ local function MakeProfBtn(parent)
     return b
 end
 
-local function ConfirmUnlearnProfession(name, profName, guid, skillId)
+function W.ConfirmUnlearnProfession(name, profName, guid, skillId)
     StaticPopupDialogs["ALTBOTS_UNLEARN_PROF"] = {
         text = "Unlearn " .. (profName or "this profession") .. " on " .. (name or "this bot") .. "?\nThis wipes the skill.",
         button1 = YES, button2 = NO,
@@ -3142,7 +3143,7 @@ end
 
 RefreshPartyProfs = function()
     if not win or not ui.profRow then return end
-    HidePool(ui.pools.profBtns)
+    W.HidePool(ui.pools.profBtns)
     if not selectedPartyGuid then
         ui.profHint:Show()
         ui.profRow:SetHeight(20)
@@ -3169,7 +3170,7 @@ RefreshPartyProfs = function()
                 x = 0
                 y = y + bh + gap
             end
-            local b = TakeRow(ui.pools.profBtns, ui.profRow, MakeProfBtn)
+            local b = W.TakeRow(ui.pools.profBtns, ui.profRow, W.MakeProfBtn)
             b:ClearAllPoints()
             b:SetPoint("TOPLEFT", x, -y)
             b.icon:SetTexture(info.icon)
@@ -3180,25 +3181,25 @@ RefreshPartyProfs = function()
                 b.icon:SetDesaturated(false)
                 b:SetBackdropBorderColor(C.accent[1], C.accent[2], C.accent[3], 1)
                 b.rank:SetText(skill.value)
-                TextColor(b.rank, C.text)
+                W.TextColor(b.rank, C.text)
                 b.bar:Show()
                 b.bar:SetMinMaxValues(0, math.max(1, skill.maxValue or 1))
                 b.bar:SetValue(skill.value or 0)
                 b:SetScript("OnEnter", function(self)
-                    Tip(self, profName, skill.value .. " / " .. skill.maxValue .. " skill.\nClick to unlearn. This wipes the skill.")
+                    W.Tip(self, profName, skill.value .. " / " .. skill.maxValue .. " skill.\nClick to unlearn. This wipes the skill.")
                 end)
                 b:SetScript("OnClick", function()
-                    ConfirmUnlearnProfession(selectedPartyName, profName, guid, skillId)
+                    W.ConfirmUnlearnProfession(selectedPartyName, profName, guid, skillId)
                 end)
             else
                 b.icon:SetVertexColor(0.55, 0.55, 0.55)
                 b.icon:SetDesaturated(true)
                 b:SetBackdropBorderColor(C.border[1], C.border[2], C.border[3], 1)
                 b.rank:SetText(info.secondary and "off" or "learn")
-                TextColor(b.rank, C.faint)
+                W.TextColor(b.rank, C.faint)
                 b.bar:Hide()
                 b:SetScript("OnEnter", function(self)
-                    Tip(self, profName, "Not learned. Click to teach this bot " .. profName .. ".")
+                    W.Tip(self, profName, "Not learned. Click to teach this bot " .. profName .. ".")
                 end)
                 b:SetScript("OnClick", function()
                     SendBot("SETPROF", guid, tostring(skillId))
@@ -3217,7 +3218,7 @@ end
 -- ---------------------------------------------------------------------------
 
 -- Same gray cutoff the server uses (Acore::XP::GetGrayLevel), from the bot's level.
-local function GrayLevel(level)
+function W.GrayLevel(level)
     if level <= 5 then return 0 end
     if level <= 39 then return level - 5 - math.floor(level / 10) end
     if level <= 59 then return level - 1 - math.floor(level / 5) end
@@ -3225,13 +3226,13 @@ local function GrayLevel(level)
 end
 
 -- Quest-log difficulty colors, judged against the bot's level rather than yours.
-local function QuestLevelColor(questLevel, botLevel)
+function W.QuestLevelColor(questLevel, botLevel)
     if not botLevel or botLevel <= 0 then return 1, 0.82, 0 end
     local diff = questLevel - botLevel
     if diff >= 5 then return 1, 0.1, 0.1 end
     if diff >= 3 then return 1, 0.5, 0.25 end
     if diff >= -2 then return 1, 1, 0 end
-    if questLevel > GrayLevel(botLevel) then return 0.25, 0.75, 0.25 end
+    if questLevel > W.GrayLevel(botLevel) then return 0.25, 0.75, 0.25 end
     return 0.5, 0.5, 0.5
 end
 
@@ -3241,7 +3242,7 @@ local QUEST_STATUS_TEXT = {
     [2] = { "Failed", 1, 0.25, 0.2 },
 }
 
-local function ObjectiveName(obj)
+function W.ObjectiveName(obj)
     if obj.kind == "i" and obj.entry > 0 then
         local name = GetItemInfo(obj.entry)
         if name and name ~= "" then return name end
@@ -3249,7 +3250,7 @@ local function ObjectiveName(obj)
     return obj.name ~= "" and obj.name or "Objective"
 end
 
-local function RequestQuests(guid, quiet)
+function W.RequestQuests(guid, quiet)
     if not guid then return end
     questPending[guid] = GetTime()
     questBuild[guid] = nil
@@ -3259,10 +3260,10 @@ local function RequestQuests(guid, quiet)
     SendBot("GETQUESTS", guid)
 end
 
-local function RequestAllQuests()
+function W.RequestAllQuests()
     local n = 0
-    for _, m in ipairs(PartyMembers()) do
-        if m.guid then RequestQuests(m.guid); n = n + 1 end
+    for _, m in ipairs(W.PartyMembers()) do
+        if m.guid then W.RequestQuests(m.guid); n = n + 1 end
     end
     SetStatus(n > 0 and ("Refreshing quest logs for " .. n .. " party member" .. (n == 1 and "" or "s") .. "...")
         or "No party members to refresh.")
@@ -3270,14 +3271,14 @@ end
 
 -- SHAREQUESTS: the server gives every quest in your log to your own grouped alts, even when
 -- they are not eligible, and says in chat what each alt took. The quest logs refresh after it.
-local function ShareQuestsWithAlts()
+function W.ShareQuestsWithAlts()
     SendBot("SHAREQUESTS", 0)
-    RequestAllQuests()
+    W.RequestAllQuests()
     SetStatus("Sharing your quests with your grouped alts...")
 end
 
-local function MakeQuestListRow(parent)
-    local row = MakePartyRow(parent)
+function W.MakeQuestListRow(parent)
+    local row = W.MakePartyRow(parent)
     row.info:Hide()
     row.count = row:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
     row.count:SetPoint("RIGHT", -7, 0)
@@ -3286,25 +3287,25 @@ local function MakeQuestListRow(parent)
     return row
 end
 
-local function MakeQuestRow(parent)
+function W.MakeQuestRow(parent)
     local row = CreateFrame("Button", nil, parent)
     row:SetHeight(24)
-    Skin(row, C.row, C.row)
-    AddHover(row, 0.05)
+    W.Skin(row, C.row, C.row)
+    W.AddHover(row, 0.05)
     row.title = row:CreateFontString(nil, "OVERLAY", "AltBotsFontBody")
     row.title:SetPoint("LEFT", 8, 1)
     row.title:SetJustifyH("LEFT")
     row.state = row:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
     row.state:SetPoint("RIGHT", -8, 1)
     row.state:SetJustifyH("RIGHT")
-    row.prog = MakeBar(row, 2)
+    row.prog = W.MakeBar(row, 2)
     row.prog:SetPoint("BOTTOMLEFT", 1, 1)
     row.prog:SetPoint("BOTTOMRIGHT", -1, 1)
     row:SetScript("OnLeave", function() GameTooltip:Hide() end)
     return row
 end
 
-local function MakeQuestObjRow(parent)
+function W.MakeQuestObjRow(parent)
     local row = CreateFrame("Frame", nil, parent)
     row:SetHeight(16)
     row.text = row:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
@@ -3317,7 +3318,7 @@ local function MakeQuestObjRow(parent)
     return row
 end
 
-local function ShowQuestTip(owner, q, botLevel, who)
+function W.ShowQuestTip(owner, q, botLevel, who)
     GameTooltip:SetOwner(owner, "ANCHOR_RIGHT")
     local ok = pcall(GameTooltip.SetHyperlink, GameTooltip, "quest:" .. q.id .. ":" .. q.level)
     if not ok or GameTooltip:NumLines() == 0 then
@@ -3328,7 +3329,7 @@ local function ShowQuestTip(owner, q, botLevel, who)
     GameTooltip:AddLine((who or selectedQuestName or "Bot") .. ": " .. st[1], st[2], st[3], st[4])
     for _, obj in ipairs(q.objectives) do
         local done = obj.have >= obj.need
-        GameTooltip:AddDoubleLine(ObjectiveName(obj), obj.have .. "/" .. obj.need,
+        GameTooltip:AddDoubleLine(W.ObjectiveName(obj), obj.have .. "/" .. obj.need,
             0.85, 0.85, 0.85, done and 0.3 or 1, done and 0.9 or 1, done and 0.3 or 1)
     end
     GameTooltip:AddLine("Quest level " .. q.level .. (botLevel and botLevel > 0 and (", bot level " .. botLevel) or "") ..
@@ -3336,16 +3337,16 @@ local function ShowQuestTip(owner, q, botLevel, who)
     GameTooltip:Show()
 end
 
-local function QuestFilter()
+function W.QuestFilter()
     return ui.questSearch and ui.questSearch:GetText():lower() or ""
 end
 
-local function QuestMatches(q, filter)
+function W.QuestMatches(q, filter)
     if filter == "" then return true end
     return string.find(q.title:lower(), filter, 1, true) ~= nil
 end
 
-local function ObjectivesDone(q)
+function W.ObjectivesDone(q)
     local done = 0
     for _, obj in ipairs(q.objectives) do
         if obj.have >= obj.need then done = done + 1 end
@@ -3353,24 +3354,24 @@ local function ObjectivesDone(q)
     return done, #q.objectives
 end
 
-local function QuestProgress(q)
+function W.QuestProgress(q)
     if q.status == 1 then return 1 end
-    local done, total = ObjectivesDone(q)
+    local done, total = W.ObjectivesDone(q)
     if total == 0 then return 0 end
     return done / total
 end
 
-local function QuestStateText(q)
+function W.QuestStateText(q)
     local st = QUEST_STATUS_TEXT[q.status] or QUEST_STATUS_TEXT[0]
     if q.status == 1 then return "Ready to turn in", st end
     if q.status == 0 and #q.objectives > 0 then
-        local done, total = ObjectivesDone(q)
+        local done, total = W.ObjectivesDone(q)
         return done .. "/" .. total .. " done", st
     end
     return st[1], st
 end
 
-local function MyRules()
+function W.MyRules()
     AltBotsDB.sendRules = AltBotsDB.sendRules or {}
     local key = Realm() .. "-" .. (UnitName("player") or "?")
     AltBotsDB.sendRules[key] = AltBotsDB.sendRules[key] or {}
@@ -3379,34 +3380,34 @@ end
 
 SyncRules = function()
     Queue({ addon = "RULECLEAR:0" })
-    for _, rule in ipairs(MyRules()) do
+    for _, rule in ipairs(W.MyRules()) do
         if rule.on then Queue({ addon = "RULE:0:" .. rule.id .. ":" .. (rule.mode == "bank" and "bank" or "mail") }) end
     end
 end
 
-local function MakeRuleRow(parent)
+function W.MakeRuleRow(parent)
     local row = CreateFrame("Frame", nil, parent)
     row:SetWidth(ROW_W); row:SetHeight(36)
-    Skin(row, C.row, C.border)
-    row.item = MakeItemButton(row, 28)
+    W.Skin(row, C.row, C.border)
+    row.item = W.MakeItemButton(row, 28)
     row.item:SetPoint("LEFT", 4, 0)
     row.name = row:CreateFontString(nil, "OVERLAY", "AltBotsFontBody")
     row.name:SetPoint("LEFT", row.item, "RIGHT", 8, 0)
     row.name:SetWidth(300)
     row.name:SetJustifyH("LEFT")
-    row.remove = MakeTextBtn(row, 64, 24, "Remove")
+    row.remove = W.MakeTextBtn(row, 64, 24, "Remove")
     row.remove:SetPoint("RIGHT", -6, 0)
-    row.toggle = MakeTextBtn(row, 64, 24, "")
+    row.toggle = W.MakeTextBtn(row, 64, 24, "")
     row.toggle:SetPoint("RIGHT", row.remove, "LEFT", -6, 0)
-    row.mode = MakeTextBtn(row, 96, 24, "")
+    row.mode = W.MakeTextBtn(row, 96, 24, "")
     row.mode:SetPoint("RIGHT", row.toggle, "LEFT", -6, 0)
     return row
 end
 
 RefreshRules = function()
     if not win or not ui.rulesChild then return end
-    HidePool(ui.pools.ruleRows)
-    local rules = MyRules()
+    W.HidePool(ui.pools.ruleRows)
+    local rules = W.MyRules()
     if #rules == 0 then
         ui.rulesEmpty:Show()
         ui.rulesChild:SetHeight(1)
@@ -3415,17 +3416,17 @@ RefreshRules = function()
     ui.rulesEmpty:Hide()
     local y = 0
     for i, rule in ipairs(rules) do
-        local row = TakeRow(ui.pools.ruleRows, ui.rulesChild, MakeRuleRow)
+        local row = W.TakeRow(ui.pools.ruleRows, ui.rulesChild, W.MakeRuleRow)
         row:ClearAllPoints()
         row:SetPoint("TOPLEFT", 0, y)
         local r, index = rule, i
-        SetItemIcon(row.item, r.id)
+        W.SetItemIcon(row.item, r.id)
         row.item.count:SetText("")
-        row.item:SetScript("OnEnter", function(self) ShowItemTip(self, r.id) end)
+        row.item:SetScript("OnEnter", function(self) W.ShowItemTip(self, r.id) end)
         row.name:SetText(ItemLabel(r.id))
-        TextColor(row.name, r.on and C.text or C.faint)
+        W.TextColor(row.name, r.on and C.text or C.faint)
         row.mode:SetText(r.mode == "bank" and "Guild bank" or "Mail to me")
-        HookTip(row.mode, "Where it goes", "Mail: every 5 minutes your alts mail what they carry of it to you. "
+        W.HookTip(row.mode, "Where it goes", "Mail: every 5 minutes your alts mail what they carry of it to you. "
             .. "Guild bank: every 30 seconds they deposit it in their guild bank (alts without a guild skip it). Click to switch.")
         row.mode:SetScript("OnClick", function()
             r.mode = r.mode == "bank" and "mail" or "bank"
@@ -3433,14 +3434,14 @@ RefreshRules = function()
         end)
         row.toggle:SetText(r.on and "On" or "Off")
         row.toggle:SetActive(r.on)
-        HookTip(row.toggle, "On or off", "Turn the rule on or off without removing it.")
+        W.HookTip(row.toggle, "On or off", "Turn the rule on or off without removing it.")
         row.toggle:SetScript("OnClick", function()
             r.on = not r.on
             SyncRules(); RefreshRules()
             SetStatus(ItemLabel(r.id) .. (r.on and ": rule on." or ": rule off."))
         end)
         row.remove:SetScript("OnClick", function()
-            table.remove(MyRules(), index)
+            table.remove(W.MyRules(), index)
             SyncRules(); RefreshRules()
         end)
         y = y - 40
@@ -3454,7 +3455,7 @@ BuildRulesPane = function(body)
     pane:Hide()
     ui.rulesPane = pane
 
-    local h, r = SectionHeader(pane, "Standing rules")
+    local h, r = W.SectionHeader(pane, "Standing rules")
     h:SetPoint("TOPLEFT", 0, -2)
     r:SetPoint("LEFT", h, "RIGHT", 8, 0)
     r:SetPoint("RIGHT", 0, 0)
@@ -3463,29 +3464,29 @@ BuildRulesPane = function(body)
     help:SetPoint("TOPLEFT", 0, -22)
     help:SetWidth(ROW_W)
     help:SetJustifyH("LEFT")
-    TextColor(help, C.muted)
+    W.TextColor(help, C.muted)
     help:SetText("While a rule is on, every alt of yours that is spawned keeps sending that item: by mail to this character "
         .. "every 5 minutes, or into its guild bank every 30 seconds. Soulbound items and profession tools are never sent.")
 
-    local box = MakeEditBox(pane, 240, 24)
+    local box = W.MakeEditBox(pane, 240, 24)
     box:SetPoint("TOPLEFT", 0, -56)
     box.placeholder = box:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
     box.placeholder:SetPoint("LEFT", 8, 0)
     box.placeholder:SetText("Shift-click an item link, or type its ID")
-    TextColor(box.placeholder, C.faint)
+    W.TextColor(box.placeholder, C.faint)
     ui.linkBoxes = ui.linkBoxes or {}
     table.insert(ui.linkBoxes, box)
 
     local mode = "mail"
-    local modeBtn = MakeTextBtn(pane, 96, 24, "Mail to me")
+    local modeBtn = W.MakeTextBtn(pane, 96, 24, "Mail to me")
     modeBtn:SetPoint("LEFT", box, "RIGHT", 6, 0)
     modeBtn:SetScript("OnClick", function(self)
         mode = mode == "bank" and "mail" or "bank"
         self:SetText(mode == "bank" and "Guild bank" or "Mail to me")
     end)
-    HookTip(modeBtn, "Where it goes", "Mail to this character, or the alt's guild bank. Click to switch.")
+    W.HookTip(modeBtn, "Where it goes", "Mail to this character, or the alt's guild bank. Click to switch.")
 
-    local addBtn = MakeTextBtn(pane, 80, 24, "Add rule")
+    local addBtn = W.MakeTextBtn(pane, 80, 24, "Add rule")
     addBtn:SetPoint("LEFT", modeBtn, "RIGHT", 6, 0)
     addBtn:SetScript("OnClick", function()
         box:ClearFocus()
@@ -3494,7 +3495,7 @@ BuildRulesPane = function(body)
             Print("Shift-click an item link into the box, or type an item ID.")
             return
         end
-        local rules = MyRules()
+        local rules = W.MyRules()
         for _, rule in ipairs(rules) do
             if rule.id == id then
                 rule.mode, rule.on = mode, true
@@ -3509,19 +3510,19 @@ BuildRulesPane = function(body)
         SetStatus(ItemLabel(id) .. ": rule added.")
     end)
 
-    local allOff = MakeTextBtn(pane, 80, 24, "All off")
+    local allOff = W.MakeTextBtn(pane, 80, 24, "All off")
     allOff:SetPoint("LEFT", addBtn, "RIGHT", 6, 0)
-    HookTip(allOff, "All off", "Turn every rule off.")
+    W.HookTip(allOff, "All off", "Turn every rule off.")
     allOff:SetScript("OnClick", function()
-        for _, rule in ipairs(MyRules()) do rule.on = false end
+        for _, rule in ipairs(W.MyRules()) do rule.on = false end
         SyncRules(); RefreshRules()
     end)
 
-    ui.rulesEmpty = EmptyText(pane, "AltBotsFontBody")
+    ui.rulesEmpty = W.EmptyText(pane, "AltBotsFontBody")
     ui.rulesEmpty:SetPoint("CENTER", 0, -40)
-    TextColor(ui.rulesEmpty, C.muted)
+    W.TextColor(ui.rulesEmpty, C.muted)
     ui.rulesEmpty:SetText("No rules yet.\nShift-click an item into the box above, pick Mail or Guild bank, and press Add rule.")
-    local sf, child = MakeScroll("AltBotsRulesScroll", pane, ROW_W)
+    local sf, child = W.MakeScroll("AltBotsRulesScroll", pane, ROW_W)
     sf:SetPoint("TOPLEFT", 0, -92)
     sf:SetPoint("BOTTOMRIGHT", -18, 0)
     ui.rulesChild = child
@@ -3534,8 +3535,8 @@ BuildQuestPane = function(body)
     ui.questPane = pane
 
     local left
-    left, ui.questListEmpty = MakeSidebar(pane, "Party", "Invite a bot to your group to see its quests here.")
-    local lsf, lc = MakeScroll("AltBotsQuestListScroll", left, 168)
+    left, ui.questListEmpty = W.MakeSidebar(pane, "Party", "Invite a bot to your group to see its quests here.")
+    local lsf, lc = W.MakeScroll("AltBotsQuestListScroll", left, 168)
     lsf:SetPoint("TOPLEFT", 6, -28)
     lsf:SetPoint("BOTTOMRIGHT", -16, 6)
     ui.questListChild = lc
@@ -3544,9 +3545,9 @@ BuildQuestPane = function(body)
     right:SetPoint("TOPLEFT", left, "TOPRIGHT", 12, 0)
     right:SetPoint("BOTTOMRIGHT", 0, 0)
 
-    ui.questPickHint = EmptyText(right, "AltBotsFontBody")
+    ui.questPickHint = W.EmptyText(right, "AltBotsFontBody")
     ui.questPickHint:SetPoint("CENTER", 0, 20)
-    TextColor(ui.questPickHint, C.muted)
+    W.TextColor(ui.questPickHint, C.muted)
     ui.questPickHint:SetText("Select a party member on the left.")
 
     local detail = CreateFrame("Frame", nil, right)
@@ -3557,23 +3558,23 @@ BuildQuestPane = function(body)
     ui.questName = detail:CreateFontString(nil, "OVERLAY", "AltBotsFontTitle")
     ui.questName:SetPoint("TOPLEFT", 0, -4)
 
-    ui.questRefreshAllBtn = MakeTextBtn(detail, 80, 24, "Refresh all")
+    ui.questRefreshAllBtn = W.MakeTextBtn(detail, 80, 24, "Refresh all")
     ui.questRefreshAllBtn:SetPoint("TOPRIGHT", -4, 0)
-    HookTip(ui.questRefreshAllBtn, "Refresh all", "Ask every grouped bot for a fresh quest log.")
+    W.HookTip(ui.questRefreshAllBtn, "Refresh all", "Ask every grouped bot for a fresh quest log.")
     ui.questRefreshAllBtn:SetScript("OnClick", function()
-        RequestAllQuests()
+        W.RequestAllQuests()
         RefreshQuests()
     end)
 
-    ui.questRefreshBtn = MakeTextBtn(detail, 70, 24, "Refresh")
+    ui.questRefreshBtn = W.MakeTextBtn(detail, 70, 24, "Refresh")
     ui.questRefreshBtn:SetPoint("RIGHT", ui.questRefreshAllBtn, "LEFT", -4, 0)
-    HookTip(ui.questRefreshBtn, "Refresh", "Ask this bot for its current quest log. The open log also refreshes itself every " .. QUEST_AUTO_REFRESH .. " seconds.")
+    W.HookTip(ui.questRefreshBtn, "Refresh", "Ask this bot for its current quest log. The open log also refreshes itself every " .. QUEST_AUTO_REFRESH .. " seconds.")
     ui.questRefreshBtn:SetScript("OnClick", function()
         if ui.questOverview then
-            RequestAllQuests()
+            W.RequestAllQuests()
             RefreshQuests()
         elseif selectedQuestGuid then
-            RequestQuests(selectedQuestGuid)
+            W.RequestQuests(selectedQuestGuid)
             SetStatus("Refreshing quests for " .. (selectedQuestName or "bot") .. "...")
             RefreshQuests()
         else
@@ -3581,41 +3582,41 @@ BuildQuestPane = function(body)
         end
     end)
 
-    ui.questShareBtn = MakeTextBtn(detail, 100, 24, "Share quests")
+    ui.questShareBtn = W.MakeTextBtn(detail, 100, 24, "Share quests")
     ui.questShareBtn:SetPoint("RIGHT", ui.questRefreshBtn, "LEFT", -4, 0)
     ui.questShareBtn:SetActive(true)
-    HookTip(ui.questShareBtn, "Share quests", "Give every quest in your log to your own alts in your group, even ones "
+    W.HookTip(ui.questShareBtn, "Share quests", "Give every quest in your log to your own alts in your group, even ones "
         .. "they are not eligible for (level, class, race or prerequisites). Quests you accept are shared the same way "
         .. "automatically. Also /alt share.")
-    ui.questShareBtn:SetScript("OnClick", ShareQuestsWithAlts)
+    ui.questShareBtn:SetScript("OnClick", W.ShareQuestsWithAlts)
 
-    ui.questSearch = MakeEditBox(detail, 170, 22)
+    ui.questSearch = W.MakeEditBox(detail, 170, 22)
     ui.questSearch:SetPoint("TOPRIGHT", -4, -34)
     ui.questSearch.placeholder = ui.questSearch:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
     ui.questSearch.placeholder:SetPoint("LEFT", 8, 0)
     ui.questSearch.placeholder:SetText("Filter quests")
     ui.questSearch:SetScript("OnTextChanged", function() RefreshQuests() end)
 
-    local qh, qr = SectionHeader(detail, "Quest log")
+    local qh, qr = W.SectionHeader(detail, "Quest log")
     qh:SetPoint("TOPLEFT", 0, -38)
     qr:SetPoint("LEFT", qh, "RIGHT", 8, 0)
     qr:SetPoint("RIGHT", ui.questSearch, "LEFT", -8, 0)
     ui.questHeader = qh
 
-    local qsf, qc = MakeScroll("AltBotsQuestScroll", detail, 440)
+    local qsf, qc = W.MakeScroll("AltBotsQuestScroll", detail, 440)
     qsf:SetPoint("TOPLEFT", 0, -64)
     qsf:SetPoint("BOTTOMRIGHT", -18, 2)
     ui.questScroll = qsf
     ui.questChild = qc
 
-    ui.questEmpty = EmptyText(detail, "AltBotsFontBody")
+    ui.questEmpty = W.EmptyText(detail, "AltBotsFontBody")
     ui.questEmpty:SetPoint("CENTER", qsf, "CENTER", 0, 0)
     ui.questEmpty:SetWidth(380)
-    TextColor(ui.questEmpty, C.muted)
+    W.TextColor(ui.questEmpty, C.muted)
     ui.questEmpty:SetText("")
 end
 
-local function QuestSummary(log)
+function W.QuestSummary(log)
     local total, ready, failed = #log.list, 0, 0
     for _, q in ipairs(log.list) do
         if q.status == 1 then ready = ready + 1 elseif q.status == 2 then failed = failed + 1 end
@@ -3626,17 +3627,17 @@ local function QuestSummary(log)
     return table.concat(parts, "  |  "), total, ready
 end
 
-local function UpdateQuestBadge()
+function W.UpdateQuestBadge()
     if not ui.tabs or not ui.tabs.quests then return end
     local ready = 0
-    for _, m in ipairs(PartyMembers()) do
+    for _, m in ipairs(W.PartyMembers()) do
         local log = m.guid and questLog[m.guid]
         if log then
-            local _, _, r = QuestSummary(log)
+            local _, _, r = W.QuestSummary(log)
             ready = ready + r
         end
     end
-    ui.tabs.quests.badge:SetText(ready > 0 and (Hex(C.good) .. ready .. "|r") or "")
+    ui.tabs.quests.badge:SetText(ready > 0 and (W.Hex(C.good) .. ready .. "|r") or "")
 end
 
 -- Called by HandleIncoming (which sits above `ui`) once a full QUESTEND log is in.
@@ -3648,12 +3649,12 @@ OnQuestLogArrived = function(guid, log)
         end
         ui.questQuiet = nil
     end
-    UpdateQuestBadge()
+    W.UpdateQuestBadge()
     RefreshQuests()
 end
 
-local function PlaceQuestRow(y, width, text, stateText, r, g, b, st, progress, onEnter)
-    local row = TakeRow(ui.pools.questRows, ui.questChild, MakeQuestRow)
+function W.PlaceQuestRow(y, width, text, stateText, r, g, b, st, progress, onEnter)
+    local row = W.TakeRow(ui.pools.questRows, ui.questChild, W.MakeQuestRow)
     row:ClearAllPoints()
     row:SetPoint("TOPLEFT", 0, y)
     row:SetWidth(width)
@@ -3672,39 +3673,39 @@ local function PlaceQuestRow(y, width, text, stateText, r, g, b, st, progress, o
     return y - 25
 end
 
-local function PlaceObjRow(y, width, text, countText, color, countColor)
-    local orow = TakeRow(ui.pools.questObjRows, ui.questChild, MakeQuestObjRow)
+function W.PlaceObjRow(y, width, text, countText, color, countColor)
+    local orow = W.TakeRow(ui.pools.questObjRows, ui.questChild, W.MakeQuestObjRow)
     orow:ClearAllPoints()
     orow:SetPoint("TOPLEFT", 0, y)
     orow:SetWidth(width)
     orow.text:SetText(text)
-    TextColor(orow.text, color)
+    W.TextColor(orow.text, color)
     orow.count:SetText(countText or "")
-    TextColor(orow.count, countColor or color)
+    W.TextColor(orow.count, countColor or color)
     return y - 16
 end
 
-local function DrawBotQuestLog(log, childW, filter)
+function W.DrawBotQuestLog(log, childW, filter)
     local botLevel = log.botLevel
     if (not botLevel or botLevel <= 0) and selectedQuestUnit then botLevel = UnitLevel(selectedQuestUnit) end
     local qy, shown = 0, 0
     for _, q in ipairs(log.list) do
-        if QuestMatches(q, filter) then
+        if W.QuestMatches(q, filter) then
             shown = shown + 1
-            local r, g, b = QuestLevelColor(q.level, botLevel)
-            local stateText, st = QuestStateText(q)
+            local r, g, b = W.QuestLevelColor(q.level, botLevel)
+            local stateText, st = W.QuestStateText(q)
             local quest = q
-            qy = PlaceQuestRow(qy, childW, "[" .. q.level .. "] " .. q.title, stateText, r, g, b,
-                { st[2], st[3], st[4] }, QuestProgress(q), function(self) ShowQuestTip(self, quest, botLevel) end)
+            qy = W.PlaceQuestRow(qy, childW, "[" .. q.level .. "] " .. q.title, stateText, r, g, b,
+                { st[2], st[3], st[4] }, W.QuestProgress(q), function(self) W.ShowQuestTip(self, quest, botLevel) end)
             if #q.objectives == 0 then
-                qy = PlaceObjRow(qy, childW, q.status == 1 and "Complete - ready to turn in"
+                qy = W.PlaceObjRow(qy, childW, q.status == 1 and "Complete - ready to turn in"
                     or (q.status == 2 and "Quest failed" or "No tracked objectives (talk to an NPC or deliver)"),
                     "", C.faint)
             end
             for _, obj in ipairs(q.objectives) do
                 local done = obj.have >= obj.need
                 local countText = obj.kind == "e" and (done and "Done" or "Not yet") or (obj.have .. "/" .. obj.need)
-                qy = PlaceObjRow(qy, childW, ObjectiveName(obj), countText,
+                qy = W.PlaceObjRow(qy, childW, W.ObjectiveName(obj), countText,
                     done and C.good or { 0.85, 0.86, 0.9 }, done and C.good or C.text)
             end
             qy = qy - 8
@@ -3713,7 +3714,7 @@ local function DrawBotQuestLog(log, childW, filter)
     return qy, shown
 end
 
-local function DrawQuestOverview(members, childW, filter)
+function W.DrawQuestOverview(members, childW, filter)
     local withLog, waiting, silent = {}, {}, {}
     for _, m in ipairs(members) do
         local log = m.guid and questLog[m.guid]
@@ -3758,16 +3759,16 @@ local function DrawQuestOverview(members, childW, filter)
         local note = {}
         if #waiting > 0 then table.insert(note, "Loading: " .. table.concat(waiting, ", ")) end
         if #silent > 0 then table.insert(note, "No answer: " .. table.concat(silent, ", ")) end
-        qy = PlaceObjRow(qy, childW, table.concat(note, "    "), "", C.faint) - 4
+        qy = W.PlaceObjRow(qy, childW, table.concat(note, "    "), "", C.faint) - 4
     end
     for _, agg in ipairs(order) do
         local q0 = agg.holders[1].quest
-        if QuestMatches(q0, filter) then
+        if W.QuestMatches(q0, filter) then
             shown = shown + 1
             local ready, sumProgress = 0, 0
             for _, h in ipairs(agg.holders) do
                 if h.quest.status == 1 then ready = ready + 1 end
-                sumProgress = sumProgress + QuestProgress(h.quest)
+                sumProgress = sumProgress + W.QuestProgress(h.quest)
             end
             local everyone = #agg.holders >= #withLog
             local stateText = #agg.holders .. "/" .. #withLog .. " bots"
@@ -3775,15 +3776,15 @@ local function DrawQuestOverview(members, childW, filter)
                 stateText = stateText .. ", " .. ready .. " ready"
             end
             local level0 = agg.holders[1].botLevel
-            local r, g, b = QuestLevelColor(agg.level, level0)
+            local r, g, b = W.QuestLevelColor(agg.level, level0)
             local first = agg.holders[1]
-            qy = PlaceQuestRow(qy, childW, "[" .. agg.level .. "] " .. agg.title, stateText, r, g, b,
+            qy = W.PlaceQuestRow(qy, childW, "[" .. agg.level .. "] " .. agg.title, stateText, r, g, b,
                 everyone and C.good or C.warn, sumProgress / math.max(1, #agg.holders), function(self)
-                    ShowQuestTip(self, first.quest, first.botLevel, first.member.name)
+                    W.ShowQuestTip(self, first.quest, first.botLevel, first.member.name)
                 end)
             for _, h in ipairs(agg.holders) do
-                local text, st = QuestStateText(h.quest)
-                qy = PlaceObjRow(qy, childW, ClassColorText(h.member.unit, h.member.name or "?"), text,
+                local text, st = W.QuestStateText(h.quest)
+                qy = W.PlaceObjRow(qy, childW, W.ClassColorText(h.member.unit, h.member.name or "?"), text,
                     C.text, { st[2], st[3], st[4] })
             end
             if not everyone then
@@ -3791,7 +3792,7 @@ local function DrawQuestOverview(members, childW, filter)
                 for _, entry in ipairs(withLog) do
                     if not agg.has[entry.member.guid] then table.insert(missing, entry.member.name or "?") end
                 end
-                qy = PlaceObjRow(qy, childW, "Missing: " .. table.concat(missing, ", "), "", C.warn)
+                qy = W.PlaceObjRow(qy, childW, "Missing: " .. table.concat(missing, ", "), "", C.warn)
             end
             qy = qy - 8
         end
@@ -3809,8 +3810,8 @@ local function DrawQuestOverview(members, childW, filter)
     return qy
 end
 
-local function MakeOverviewRow(parent)
-    local row = MakeQuestListRow(parent)
+function W.MakeOverviewRow(parent)
+    local row = W.MakeQuestListRow(parent)
     row.classIcon:SetTexture("Interface\\Icons\\INV_Misc_Book_09")
     row.classIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
     row.dot:Hide()
@@ -3821,9 +3822,9 @@ end
 -- pick someone if nobody is selected, and ask for their log if we have none yet.
 RefreshQuests = function(opening)
     if not win or not ui.questListChild then return end
-    HidePool(ui.pools.questListRows)
+    W.HidePool(ui.pools.questListRows)
     if ui.questOverviewRow then ui.questOverviewRow:Hide() end
-    local members = PartyMembers()
+    local members = W.PartyMembers()
     if #members == 0 then
         ui.questListEmpty:Show()
         ui.questPickHint:Show()
@@ -3855,65 +3856,65 @@ RefreshQuests = function(opening)
     if opening then
         if ui.questOverview then
             for _, m in ipairs(members) do
-                if m.guid and not questLog[m.guid] and not questPending[m.guid] then RequestQuests(m.guid, true) end
+                if m.guid and not questLog[m.guid] and not questPending[m.guid] then W.RequestQuests(m.guid, true) end
             end
         elseif selectedQuestGuid and not questLog[selectedQuestGuid] and not questPending[selectedQuestGuid] then
-            RequestQuests(selectedQuestGuid)
+            W.RequestQuests(selectedQuestGuid)
         end
     end
 
     if not ui.questOverviewRow then
-        ui.questOverviewRow = MakeOverviewRow(ui.questListChild)
+        ui.questOverviewRow = W.MakeOverviewRow(ui.questListChild)
     end
     local ov = ui.questOverviewRow
     ov:ClearAllPoints()
     ov:SetPoint("TOPLEFT", 0, 0)
     ov:Show()
     ov.name:SetText("All bots")
-    TextColor(ov.name, C.text)
-    SetRowSelected(ov, ui.questOverview)
+    W.TextColor(ov.name, C.text)
+    W.SetRowSelected(ov, ui.questOverview)
     local totalReady = 0
     for _, m in ipairs(members) do
         local log = m.guid and questLog[m.guid]
         if log then
-            local _, _, ready = QuestSummary(log)
+            local _, _, ready = W.QuestSummary(log)
             totalReady = totalReady + ready
         end
     end
-    ov.count:SetText(totalReady > 0 and (Hex(C.good) .. totalReady .. "|r ready") or "")
+    ov.count:SetText(totalReady > 0 and (W.Hex(C.good) .. totalReady .. "|r ready") or "")
     ov:SetScript("OnClick", function()
         ui.questOverview = true
         selectedQuestGuid, selectedQuestName, selectedQuestUnit = nil, nil, nil
-        RequestAllQuests()
+        W.RequestAllQuests()
         RefreshQuests()
     end)
     ov:SetScript("OnEnter", function(self)
-        Tip(self, "All bots", "Every grouped bot's quests side by side, with who is missing each one. "
+        W.Tip(self, "All bots", "Every grouped bot's quests side by side, with who is missing each one. "
             .. "Handy after Share quests.")
     end)
     ov:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     local y = -40
     for _, m in ipairs(members) do
-        local row = TakeRow(ui.pools.questListRows, ui.questListChild, MakeQuestListRow)
+        local row = W.TakeRow(ui.pools.questListRows, ui.questListChild, W.MakeQuestListRow)
         row:ClearAllPoints()
         row:SetPoint("TOPLEFT", 0, y)
-        row.name:SetText(ClassColorText(m.unit, m.name or "?"))
-        SetClassIcon(row.classIcon, ClassFileOf(m.unit))
-        SetDot(row.dot, UnitIsConnected(m.unit) and "green" or "gray")
+        row.name:SetText(W.ClassColorText(m.unit, m.name or "?"))
+        W.SetClassIcon(row.classIcon, W.ClassFileOf(m.unit))
+        W.SetDot(row.dot, UnitIsConnected(m.unit) and "green" or "gray")
         local log = m.guid and questLog[m.guid]
         if log then
-            local _, total, ready = QuestSummary(log)
-            row.count:SetText(ready > 0 and (Hex(C.good) .. ready .. "|r/" .. total) or tostring(total))
+            local _, total, ready = W.QuestSummary(log)
+            row.count:SetText(ready > 0 and (W.Hex(C.good) .. ready .. "|r/" .. total) or tostring(total))
         else
             row.count:SetText("")
         end
-        SetRowSelected(row, not ui.questOverview and selectedQuestGuid ~= nil and m.guid == selectedQuestGuid)
+        W.SetRowSelected(row, not ui.questOverview and selectedQuestGuid ~= nil and m.guid == selectedQuestGuid)
         local guid, name, unit = m.guid, m.name, m.unit
         row:SetScript("OnClick", function()
             ui.questOverview = nil
             selectedQuestGuid, selectedQuestName, selectedQuestUnit = guid, name, unit
-            RequestQuests(guid)
+            W.RequestQuests(guid)
             SetStatus("Loading quests for " .. (name or "bot") .. "...")
             RefreshQuests()
         end)
@@ -3922,18 +3923,18 @@ RefreshQuests = function(opening)
     end
     ui.questListChild:SetHeight(math.max(1, -y + 4))
 
-    HidePool(ui.pools.questRows)
-    HidePool(ui.pools.questObjRows)
+    W.HidePool(ui.pools.questRows)
+    W.HidePool(ui.pools.questObjRows)
     local childW = (ui.questScroll:GetWidth() or 0)
     if childW < 200 then childW = 440 end
     ui.questChild:SetWidth(childW)
-    local filter = QuestFilter()
+    local filter = W.QuestFilter()
 
     if ui.questOverview then
         ui.questPickHint:Hide()
         ui.questDetail:Show()
         ui.questName:SetText("All bots")
-        local qy = DrawQuestOverview(members, childW, filter)
+        local qy = W.DrawQuestOverview(members, childW, filter)
         ui.questChild:SetHeight(math.max(1, -qy + 4))
         return
     end
@@ -3945,7 +3946,7 @@ RefreshQuests = function(opening)
     end
     ui.questPickHint:Hide()
     ui.questDetail:Show()
-    ui.questName:SetText(ClassColorText(selectedQuestUnit, selectedQuestName or "?"))
+    ui.questName:SetText(W.ClassColorText(selectedQuestUnit, selectedQuestName or "?"))
 
     local guid = selectedQuestGuid
     local log = questLog[guid]
@@ -3964,7 +3965,7 @@ RefreshQuests = function(opening)
         return
     end
 
-    local summary = QuestSummary(log)
+    local summary = W.QuestSummary(log)
     if pending and not timedOut then summary = summary .. "  |  Refreshing..." end
     ui.questHeader:SetText("Quest log  |  " .. summary)
 
@@ -3975,7 +3976,7 @@ RefreshQuests = function(opening)
         return
     end
 
-    local qy, shown = DrawBotQuestLog(log, childW, filter)
+    local qy, shown = W.DrawBotQuestLog(log, childW, filter)
     if shown == 0 then
         ui.questEmpty:Show()
         ui.questEmpty:SetText("No quest matches that filter.")
@@ -3987,17 +3988,17 @@ end
 
 ShowTab = function(id)
     EnsureWindow()
-    HidePopup()
+    W.HidePopup()
     ui.activeTab = id
     AltBotsDB.tab = id
     ui.altsPane:Hide(); ui.cmdPane:Hide(); ui.partyPane:Hide(); ui.questPane:Hide(); ui.rulesPane:Hide()
-    SetTabState(ui.tabs.alts, id == "alts")
-    SetTabState(ui.tabs.commands, id == "commands")
-    SetTabState(ui.tabs.party, id == "party")
-    SetTabState(ui.tabs.quests, id == "quests")
-    SetTabState(ui.tabs.rules, id == "rules")
-    UpdateHeaderSummary()
-    UpdateQuestBadge()
+    W.SetTabState(ui.tabs.alts, id == "alts")
+    W.SetTabState(ui.tabs.commands, id == "commands")
+    W.SetTabState(ui.tabs.party, id == "party")
+    W.SetTabState(ui.tabs.quests, id == "quests")
+    W.SetTabState(ui.tabs.rules, id == "rules")
+    W.UpdateHeaderSummary()
+    W.UpdateQuestBadge()
     if id == "alts" then
         local data = RealmData()
         if data.serverList and altSync.state ~= "waiting" and time() - (data.syncedAt or 0) > SYNC_REFRESH then
@@ -4057,7 +4058,7 @@ frame:SetScript("OnUpdate", function()
             RefreshQuests()
         end
         if ui.questOverview and not ui.questTimedOut then
-            for _, m in ipairs(PartyMembers()) do
+            for _, m in ipairs(W.PartyMembers()) do
                 local sent = m.guid and questPending[m.guid]
                 if sent and now - sent > QUEST_TIMEOUT and now - sent < QUEST_TIMEOUT + 1 then
                     ui.questTimedOut = true
@@ -4067,17 +4068,17 @@ frame:SetScript("OnUpdate", function()
             end
         end
         if ui.questOverview and now >= questAutoAt then
-            for _, m in ipairs(PartyMembers()) do
-                if m.guid and not questPending[m.guid] then RequestQuests(m.guid, true) end
+            for _, m in ipairs(W.PartyMembers()) do
+                if m.guid and not questPending[m.guid] then W.RequestQuests(m.guid, true) end
             end
             questAutoAt = now + QUEST_AUTO_REFRESH
         elseif guid and questLog[guid] and not questPending[guid] and now >= questAutoAt then
-            RequestQuests(guid, true)
+            W.RequestQuests(guid, true)
         end
     end
     if win and win:IsShown() and ui.activeTab == "commands" and now >= (ui.cardsAt or 0) then
         ui.cardsAt = now + 0.25
-        UpdateCmdCards()
+        W.UpdateCmdCards()
     end
     if delayedRefreshAt and now >= delayedRefreshAt then
         delayedRefreshAt = nil
@@ -4094,7 +4095,7 @@ end)
 
 OnAltsChanged = function()
     if win and win:IsShown() then
-        UpdateHeaderSummary()
+        W.UpdateHeaderSummary()
         if ui.activeTab == "alts" then RefreshAlts()
         elseif ui.activeTab == "commands" then RefreshCommands()
         end
@@ -4128,8 +4129,8 @@ frame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3, arg4)
         MigrateDB()
     elseif event == "PLAYER_ENTERING_WORLD" then
         RegisterSelf()
-        CreateMinimapButton()
-        if GetQuickBarShown() then SetQuickBarShown(true) end
+        W.CreateMinimapButton()
+        if W.GetQuickBarShown() then SetQuickBarShown(true) end
         if not syncScheduled then
             syncScheduled = true
             syncAt = GetTime() + SYNC_DELAY
@@ -4145,7 +4146,7 @@ frame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3, arg4)
         HandleIncoming(string.sub(arg1, 8))
     elseif event == "PARTY_MEMBERS_CHANGED" or event == "RAID_ROSTER_UPDATE" then
         if win and win:IsShown() then
-            UpdateHeaderSummary()
+            W.UpdateHeaderSummary()
             if ui.activeTab == "party" then RefreshParty()
             elseif ui.activeTab == "quests" then RefreshQuests()
             elseif ui.activeTab == "alts" then RefreshAlts()
@@ -4161,7 +4162,7 @@ local function ToggleWindow()
         ui.radius:SetText(tostring(AltBotsDB.farmRadius or 40))
     end
     if win:IsShown() then
-        HidePopup()
+        W.HidePopup()
         win:Hide()
     else
         win:Show()
@@ -4188,10 +4189,10 @@ BINDING_NAME_ALTBOTS_COLLECT = "Grouped alts: collect the nearest pickup"
 BINDING_NAME_ALTBOTS_SHARE = "Share your quests with grouped alts"
 
 function AltBots_Toggle() ToggleWindow() end
-function AltBots_ToggleQuickBar() SetQuickBarShown(not GetQuickBarShown()) end
-function AltBots_Order(verb) RunOrder(verb, ALL_GROUPED) end
+function AltBots_ToggleQuickBar() SetQuickBarShown(not W.GetQuickBarShown()) end
+function AltBots_Order(verb) W.RunOrder(verb, ALL_GROUPED) end
 function AltBots_Share()
-    ShareQuestsWithAlts()
+    W.ShareQuestsWithAlts()
     Print("Sharing your quests with your grouped alts...")
 end
 
@@ -4215,7 +4216,7 @@ SlashCmdList["ALTBOTS"] = function(msg)
         if #names == 0 then Print("No saved characters on " .. Realm() .. ".") end
         for _, n in ipairs(names) do
             local info = Alts()[n]
-            Print(AltName(n, info) .. " = " .. tostring(info.guid) .. " (" .. (info.source or "login") .. ")"
+            Print(W.AltName(n, info) .. " = " .. tostring(info.guid) .. " (" .. (info.source or "login") .. ")"
                 .. (info.stale and " |cffff9933not verified|r" or ""))
         end
     elseif cmd == "sync" then
@@ -4272,11 +4273,11 @@ SlashCmdList["ALTBOTS"] = function(msg)
         if not n then Print("Usage: /alt " .. cmd .. " <name|all>") return end
         Order(cmd, OrderArg(n))
     elseif cmd == "share" or cmd == "sharequests" then
-        ShareQuestsWithAlts()
+        W.ShareQuestsWithAlts()
         Print("Sharing your quests with your grouped alts...")
     elseif cmd == "bar" or cmd == "quickbar" then
-        SetQuickBarShown(not GetQuickBarShown())
-        Print(GetQuickBarShown() and "Quick bar shown. Drag its blue edge to move it, right-click it to hide."
+        SetQuickBarShown(not W.GetQuickBarShown())
+        Print(W.GetQuickBarShown() and "Quick bar shown. Drag its blue edge to move it, right-click it to hide."
             or "Quick bar hidden.")
     elseif cmd == "scale" then
         local v = tonumber(arg)
@@ -4286,17 +4287,17 @@ SlashCmdList["ALTBOTS"] = function(msg)
         end
         if v < 0.6 then v = 0.6 elseif v > 1.5 then v = 1.5 end
         AltBotsDB.scale = v
-        ApplyScale()
+        W.ApplyScale()
         Print("Window scale set to " .. v .. ".")
     elseif cmd == "reset" then
         AltBotsDB.winPos, AltBotsDB.quickBarPos, AltBotsDB.scale = nil, nil, nil
-        if win then RestorePosition(win, "winPos", { "CENTER", "CENTER", 0, 0 }) end
-        if quickBar then RestorePosition(quickBar, "quickBarPos", { "BOTTOM", "BOTTOM", 0, 160 }) end
-        ApplyScale()
+        if win then W.RestorePosition(win, "winPos", { "CENTER", "CENTER", 0, 0 }) end
+        if quickBar then W.RestorePosition(quickBar, "quickBarPos", { "BOTTOM", "BOTTOM", 0, 160 }) end
+        W.ApplyScale()
         Print("Window position, quick bar position and scale reset.")
     elseif cmd == "minimap" then
-        SetMinimapShown(not GetMinimapShown())
-        Print(GetMinimapShown() and "Minimap button shown." or "Minimap button hidden.")
+        W.SetMinimapShown(not W.GetMinimapShown())
+        Print(W.GetMinimapShown() and "Minimap button shown." or "Minimap button hidden.")
     elseif cmd == "help" then
         Print(USAGE)
     else
