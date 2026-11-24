@@ -3,8 +3,9 @@ import re
 import struct
 import unittest
 
-from package_custom_races_client import (OVERLAY_SOURCE, RACES, extend_cameras, extend_char_base_info,
-                                         extend_character_create_xml, extend_start_outfits, patch_chr_races)
+from package_custom_races_client import (FRAME_OVERLAY_SOURCE, OVERLAY_SOURCE, RACES, extend_cameras,
+                                         extend_char_base_info, extend_character_create_xml, extend_frame_toc,
+                                         extend_start_outfits, patch_chr_races)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,6 +113,26 @@ class CharacterCreateXmlTest(unittest.TestCase):
     def test_overlay_supports_sixteen_races(self):
         text = OVERLAY_SOURCE.read_text(encoding='utf-8')
         self.assertIn(f'MAX_RACES = {10 + len(RACES)}', text)
+
+
+TOC = '..\\SharedXML\\AtlasInfo.lua\nDressUpFrame.xml\n\n## add new modules above here\nData\\SpellRanks.lua\n'
+
+
+class FrameTocTest(unittest.TestCase):
+    def test_overlay_loads_before_the_module_marker(self):
+        lines = extend_frame_toc(TOC.encode()).decode().split('\n')
+        self.assertEqual(lines[lines.index('## add new modules above here') - 1], 'CoACustomRaces.lua')
+        self.assertLess(lines.index('DressUpFrame.xml'), lines.index('CoACustomRaces.lua'))
+
+    def test_patched_or_unknown_toc_fails(self):
+        for source in (extend_frame_toc(TOC.encode()), TOC.replace('## add new modules above here', '').encode()):
+            with self.assertRaises(ValueError):
+                extend_frame_toc(source)
+
+    def test_frame_overlay_covers_every_custom_race(self):
+        text = FRAME_OVERLAY_SOURCE.read_text(encoding='utf-8')
+        ids = sorted(int(value) for value in re.findall(r'id = (\d+)', text))
+        self.assertEqual(ids, sorted(RACES))
 
 
 def outfit(record_id, race, cls, sex, item):

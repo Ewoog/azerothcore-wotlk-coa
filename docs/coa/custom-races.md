@@ -40,7 +40,12 @@ The client reads its own race list, so every player needs three updated archives
 - `patch-B.MPQ`: `Interface\GlueXML\CoACustomRaces.lua` and a `CharacterCreate.xml` that loads it and adds race
   buttons 12 to 16. The overlay raises `MAX_RACES` to 16, lays the buttons out in an Alliance and a Horde column,
   uses the races' `Interface\Icons` portraits, shows the base race's background model, and tolerates races without
-  flavor text.
+  flavor text. It also gives the new races their base race's glue music, fog and lights.
+- `patch-B.MPQ` also gets `Interface\FrameXML\CoACustomRaces.lua`, loaded from `FrameXML.toc`, which gives the new
+  races their base race's character and transmog backgrounds and adds them to `Enum.Race`.
+
+Most helm models have no variant for the new races' client prefixes and would render as a placeholder cube, so the
+server keeps Show Helm off for every race listed in `coa_custom_race`.
 
 Build them from the installed client with the archive tool, then install the three files over the client's copies
 (keep the originals for rollback):

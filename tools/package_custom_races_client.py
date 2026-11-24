@@ -27,13 +27,17 @@ START_OUTFITS = 'DBFilesClient/CharStartOutfit.dbc'
 CHARACTER_CREATE_XML = 'Interface/GlueXML/CharacterCreate.xml'
 OVERLAY = 'Interface/GlueXML/CoACustomRaces.lua'
 OVERLAY_SOURCE = Path(__file__).resolve().parents[1] / 'client' / OVERLAY
+FRAME_TOC = 'Interface/FrameXML/FrameXML.toc'
+FRAME_OVERLAY = 'Interface/FrameXML/CoACustomRaces.lua'
+FRAME_OVERLAY_SOURCE = Path(__file__).resolve().parents[1] / 'client' / FRAME_OVERLAY
+FRAME_TOC_MARKER = '## add new modules above here'
 ARCHIVE_MEMBERS = {
     'patch-M.MPQ': [CHR_RACES, CAMERAS, START_OUTFITS],
     'patch-T.MPQ': [CHAR_BASE_INFO],
-    'patch-B.MPQ': [CHARACTER_CREATE_XML],
+    'patch-B.MPQ': [CHARACTER_CREATE_XML, FRAME_TOC],
 }
 ARCHIVE_ADDITIONS = {
-    'patch-B.MPQ': {OVERLAY: OVERLAY_SOURCE},
+    'patch-B.MPQ': {OVERLAY: OVERLAY_SOURCE, FRAME_OVERLAY: FRAME_OVERLAY_SOURCE},
 }
 STOCK_RACE_BUTTONS = 11
 SERVER_MEMBERS = {START_OUTFITS}
@@ -160,8 +164,23 @@ def extend_character_create_xml(data):
     return prefix + text.encode('utf-8')
 
 
+def extend_frame_toc(data):
+    text = data.decode('utf-8-sig')
+    newline = '\r\n' if '\r\n' in text else '\n'
+    lines = text.split(newline)
+    if any(line.strip().lower() == 'coacustomraces.lua' for line in lines):
+        raise ValueError('FrameXML.toc already loads CoACustomRaces.lua')
+    markers = [index for index, line in enumerate(lines) if line.strip() == FRAME_TOC_MARKER]
+    if len(markers) != 1:
+        raise ValueError(f'Expected exactly one "{FRAME_TOC_MARKER}" line in FrameXML.toc')
+    lines.insert(markers[0], 'CoACustomRaces.lua')
+    prefix = b'\xef\xbb\xbf' if data.startswith(b'\xef\xbb\xbf') else b''
+    return prefix + newline.join(lines).encode('utf-8')
+
+
 PATCHERS = {CHR_RACES: patch_chr_races, CHAR_BASE_INFO: extend_char_base_info, CAMERAS: extend_cameras,
-            START_OUTFITS: extend_start_outfits, CHARACTER_CREATE_XML: extend_character_create_xml}
+            START_OUTFITS: extend_start_outfits, CHARACTER_CREATE_XML: extend_character_create_xml,
+            FRAME_TOC: extend_frame_toc}
 
 
 def sha(path):

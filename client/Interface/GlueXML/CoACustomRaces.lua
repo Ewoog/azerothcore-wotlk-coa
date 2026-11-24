@@ -20,6 +20,15 @@ local BACKGROUND_RACES = {
 }
 local COMPACT_ROW_SPACING = 66
 
+for raceEnglishName, baseRace in pairs(BACKGROUND_RACES) do
+    local baseKey = strupper(baseRace)
+    for _, raceTable in ipairs({ GlueAmbienceTracks, CharModelFogInfo, CharModelGlowInfo, RaceLights }) do
+        if raceTable[raceEnglishName] == nil then
+            raceTable[raceEnglishName] = raceTable[baseKey]
+        end
+    end
+end
+
 for raceEnglishName in pairs(CUSTOM_RACE_ICONS) do
     RACE_ICON_TCOORDS[raceEnglishName .. "_MALE"] = CUSTOM_RACE_ICON_COORDS
     RACE_ICON_TCOORDS[raceEnglishName .. "_FEMALE"] = CUSTOM_RACE_ICON_COORDS
