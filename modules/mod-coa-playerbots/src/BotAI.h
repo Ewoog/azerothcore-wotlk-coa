@@ -13,11 +13,14 @@
 #include "Define.h"
 #include "ObjectGuid.h"
 
+#include <cstdint>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 class ChatHandler;
 class Creature;
+class Item;
 class Player;
 struct ItemTemplate;
 struct Loot;
@@ -158,6 +161,16 @@ namespace BotAI
     // and it beats the weaker of its candidate slots by the same 5% margin the bag upgrade pass uses (an empty slot
     // always counts). Profession tools and slots the commander locked never count.
     bool IsLootUpgrade(Player* bot, ItemTemplate const* proto);
+
+    // Bag items the bot keeps as saved upgrades: per equipment slot only the best-scoring loot upgrade, two for the
+    // paired ring and trinket slots. Every other held upgrade is surplus and is sold like superseded gear.
+    using KeptUpgradeSet = std::unordered_set<std::uint64_t>;
+    KeptUpgradeSet KeptUpgrades(Player* bot);
+    bool IsKeptUpgrade(KeptUpgradeSet const& kept, Item const* item);
+
+    // A loot upgrade that would also outrank the upgrades already saved for its slot, so winning it does not just
+    // add a surplus piece to the bags.
+    bool IsWantedUpgrade(Player* bot, ItemTemplate const* proto);
 
     // The weapon part of ScoreItemForBot on its own: points for weapons (and an off-hand weapon where a
     // learned spell needs one) that the bot's learned Ascension kit can use, minus points for weapons that

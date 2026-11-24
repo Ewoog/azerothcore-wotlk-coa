@@ -1104,6 +1104,11 @@ static uint8 PairedEquipSlot(uint8 slot)
     }
 }
 
+static float UpgradeScore(Player* bot, ItemTemplate const* proto, BotRole role)
+{
+    return ScoreItemForBot(bot, proto, role) + BotGear::PowerScore(bot, proto);
+}
+
 static bool CanWearSoon(Player* bot, ItemTemplate const* proto)
 {
     if (!sBotMgr->MatchesGearPreference(bot, proto->ItemId))
@@ -1129,7 +1134,7 @@ bool IsLootUpgrade(Player* bot, ItemTemplate const* proto)
     BotRole const role = BotAI::GetRole(bot->GetGUID());
     auto const state = states.find(bot->GetGUID());
     uint32 const lockMask = state != states.end() ? state->second.manualEquipLockMask : 0;
-    float const newScore = ScoreItemForBot(bot, proto, role) + BotGear::PowerScore(bot, proto);
+    float const newScore = UpgradeScore(bot, proto, role);
     if (!BotGearPolicy::BeatsWorn(newScore, 0.0f))
         return false;
 
@@ -1140,12 +1145,67 @@ bool IsLootUpgrade(Player* bot, ItemTemplate const* proto)
         Item* current = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
         if (!current || !BotGear::Allowed(bot, current->GetTemplate()))
             return CanWearSoon(bot, proto);
-        ItemTemplate const* worn = current->GetTemplate();
-        float const currentScore = ScoreItemForBot(bot, worn, role) + BotGear::PowerScore(bot, worn);
-        if (BotGearPolicy::BeatsWorn(newScore, currentScore))
+        if (BotGearPolicy::BeatsWorn(newScore, UpgradeScore(bot, current->GetTemplate(), role)))
             return CanWearSoon(bot, proto);
     }
     return false;
+}
+
+static uint8 UpgradeGroup(uint8 slot)
+{
+    uint8 const pair = PairedEquipSlot(slot);
+    return pair != NULL_SLOT && pair < slot ? pair : slot;
+}
+
+static unsigned UpgradeCapacity(uint8 slot)
+{
+    return BotGearPolicy::HeldUpgradeCapacity(PairedEquipSlot(slot) != NULL_SLOT);
+}
+
+static std::vector<BotGearPolicy::HeldUpgrade> HeldUpgrades(Player* bot)
+{
+    std::vector<BotGearPolicy::HeldUpgrade> held;
+    BotRole const role = BotAI::GetRole(bot->GetGUID());
+    auto consider = [&](Item* item)
+    {
+        if (!item || BotGear::Archived(item))
+            return;
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!IsLootUpgrade(bot, proto))
+            return;
+        uint8 const slot = bot->FindEquipSlot(proto, NULL_SLOT, true);
+        held.push_back({ UpgradeGroup(slot), UpgradeCapacity(slot), UpgradeScore(bot, proto, role),
+            item->GetGUID().GetCounter() });
+    };
+    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        consider(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+        if (Bag* pBag = bot->GetBagByPos(bag))
+            for (uint32 j = 0; j < pBag->GetBagSize(); ++j)
+                consider(pBag->GetItemByPos(j));
+    return held;
+}
+
+KeptUpgradeSet KeptUpgrades(Player* bot)
+{
+    if (!bot)
+        return {};
+    std::vector<std::uint64_t> const kept = BotGearPolicy::KeptUpgrades(HeldUpgrades(bot));
+    return KeptUpgradeSet(kept.begin(), kept.end());
+}
+
+bool IsKeptUpgrade(KeptUpgradeSet const& kept, Item const* item)
+{
+    return item && kept.count(item->GetGUID().GetCounter());
+}
+
+bool IsWantedUpgrade(Player* bot, ItemTemplate const* proto)
+{
+    if (!IsLootUpgrade(bot, proto))
+        return false;
+    uint8 const slot = bot->FindEquipSlot(proto, NULL_SLOT, true);
+    return BotGearPolicy::OutranksHeld(HeldUpgrades(bot), UpgradeGroup(slot), UpgradeCapacity(slot),
+        UpgradeScore(bot, proto, BotAI::GetRole(bot->GetGUID())));
 }
 } // namespace BotAI
 
@@ -1184,7 +1244,21 @@ void TryUpgradeGearOnce(Player* bot, BotRole role)
             return false;
 
         // A commander-chosen piece (or an emptied slot) stays put until UNLOCK or relog.
-        if (eslot < 32 && (states[bot->GetGUID()].manualEquipLockMask & (1u << eslot)))
+        uint32 const lockMask = states[bot->GetGUID()].manualEquipLockMask;
+        auto locked = [lockMask](uint8 slot) { return slot < 32 && (lockMask & (1u << slot)); };
+        auto wornScore = [&](uint8 slot) -> float
+        {
+            Item* worn = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (!worn || !BotGear::Allowed(bot, worn->GetTemplate()))
+                return 0.0f;
+            return ScoreItemForBot(bot, worn->GetTemplate(), role) + BotGear::PowerScore(bot, worn->GetTemplate());
+        };
+        // With both rings (or trinkets) worn FindEquipSlot always names the first slot. Replace the weaker one, as
+        // IsLootUpgrade judges it, or a saved ring that only beats the second one stays in the bags for good.
+        uint8 const pair = BotAI::PairedEquipSlot(eslot);
+        if (pair != NULL_SLOT && !locked(pair) && (locked(eslot) || wornScore(pair) < wornScore(eslot)))
+            eslot = pair;
+        if (locked(eslot))
             return false;
 
         Item* current = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, eslot);
@@ -1193,8 +1267,7 @@ void TryUpgradeGearOnce(Player* bot, BotRole role)
         {
             // Small margin, not a strict ">" -- avoids swapping back and forth every scan
             // between two items that score within noise of each other.
-            float currentScore = ScoreItemForBot(bot, current->GetTemplate(), role) + BotGear::PowerScore(bot, current->GetTemplate());
-            if (BotGear::Allowed(bot, current->GetTemplate()) && newScore <= currentScore * 1.05f)
+            if (BotGear::Allowed(bot, current->GetTemplate()) && newScore <= wornScore(eslot) * 1.05f)
                 return false;
         }
 
@@ -1321,7 +1394,7 @@ bool CanSweepInventory(Player const* bot)
 // Never touches quest items, trade goods, profession tools, bags, consumables, or archived gear.
 // Blue (or whatever CoaBots.Inventory.KeepQuality is set to) and better superseded gear is kept
 // unless the bags are down to BAG_CLEANUP_FREE_SLOT_THRESHOLD free slots or fewer.
-bool IsClutterItem(Player* bot, Item const* item, BotRole role)
+bool IsClutterItem(Player* bot, Item const* item, BotRole role, BotAI::KeptUpgradeSet const& kept)
 {
     if (!item || BotGear::Archived(item))
         return false;
@@ -1347,20 +1420,25 @@ bool IsClutterItem(Player* bot, Item const* item, BotRole role)
     if (proto->Class != ITEM_CLASS_ARMOR && proto->Class != ITEM_CLASS_WEAPON)
         return false;
     if (BotAI::IsLootUpgrade(bot, proto))
-        return false; // an upgrade it is holding until it reaches the level
+    {
+        if (BotAI::IsKeptUpgrade(kept, item))
+            return false; // the best upgrade saved for its slot, held until the bot can wear it
+    }
+    else
+    {
+        uint8 eslot = bot->FindEquipSlot(proto, NULL_SLOT, true);
+        if (eslot == NULL_SLOT)
+            return false; // not something this bot could even wear -- not "old gear", just irrelevant
 
-    uint8 eslot = bot->FindEquipSlot(proto, NULL_SLOT, true);
-    if (eslot == NULL_SLOT)
-        return false; // not something this bot could even wear -- not "old gear", just irrelevant
+        Item* current = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, eslot);
+        if (!current)
+            return false; // would fill a currently-empty slot -- not obsolete
 
-    Item* current = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, eslot);
-    if (!current)
-        return false; // would fill a currently-empty slot -- not obsolete
-
-    // Same 5% margin as TryUpgradeGearOnce, inverted: anything that wouldn't even count as an
-    // upgrade there is dead weight here.
-    if (ScoreItemForBot(bot, proto, role) > ScoreItemForBot(bot, current->GetTemplate(), role) * 1.05f)
-        return false;
+        // Same 5% margin as TryUpgradeGearOnce, inverted: anything that wouldn't even count as an
+        // upgrade there is dead weight here.
+        if (ScoreItemForBot(bot, proto, role) > ScoreItemForBot(bot, current->GetTemplate(), role) * 1.05f)
+            return false;
+    }
 
     uint32 const keepQuality = sBotMgr->InventoryKeepQuality();
     if (proto->Quality >= keepQuality && bot->GetFreeInventorySpace() > BAG_CLEANUP_FREE_SLOT_THRESHOLD)
@@ -1373,8 +1451,9 @@ bool IsClutterItem(Player* bot, Item const* item, BotRole role)
 // a vendor forever.
 bool HasSellableJunk(Player* bot, BotRole role)
 {
+    BotAI::KeptUpgradeSet const kept = BotAI::KeptUpgrades(bot);
     for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
-        if (IsClutterItem(bot, bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot), role))
+        if (IsClutterItem(bot, bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot), role, kept))
             return true;
 
     for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
@@ -1383,7 +1462,7 @@ bool HasSellableJunk(Player* bot, BotRole role)
         if (!pBag)
             continue;
         for (uint32 j = 0; j < pBag->GetBagSize(); ++j)
-            if (IsClutterItem(bot, pBag->GetItemByPos(j), role))
+            if (IsClutterItem(bot, pBag->GetItemByPos(j), role, kept))
                 return true;
     }
     return false;
@@ -1448,9 +1527,10 @@ BotAI::InventorySweepResult TryMaintainEquipment(Player* bot, BotRole role, bool
     if (!vendorNpc && (!allowDestroy || bot->GetFreeInventorySpace() > 0))
         return result;
 
+    BotAI::KeptUpgradeSet const kept = BotAI::KeptUpgrades(bot);
     auto clearIfJunk = [&](Item* item) -> bool
     {
-        if (!IsClutterItem(bot, item, role))
+        if (!IsClutterItem(bot, item, role, kept))
             return false;
         ItemTemplate const* proto = item->GetTemplate();
         if (item->IsNotEmptyBag() || item->IsRefundable() || bot->GetLootGUID() == item->GetGUID())
@@ -6825,6 +6905,7 @@ uint32 FreeBagSlots(Player* bot, uint32 wanted)
     TryMaintainEquipment(bot, GetRole(bot->GetGUID()), true);
     uint32 orderItem = 0;
     bool const onOrder = sBotMgr->GetGatherOrderItem(bot->GetGUID(), &orderItem);
+    KeptUpgradeSet const kept = KeptUpgrades(bot);
 
     struct Candidate
     {
@@ -6845,7 +6926,7 @@ uint32 FreeBagSlots(Player* bot, uint32 wanted)
         // (BotMgr banks or mails those to make room instead of destroying them).
         if (onOrder && (proto->ItemId == orderItem || proto->Class == ITEM_CLASS_TRADE_GOODS))
             return;
-        if (BotEconomy::IsReservedItem(bot, item) || BotAI::IsLootUpgrade(bot, proto))
+        if (BotEconomy::IsReservedItem(bot, item) || IsKeptUpgrade(kept, item))
             return;
         stacks.push_back({ item, uint64(proto->SellPrice) * item->GetCount() });
     };

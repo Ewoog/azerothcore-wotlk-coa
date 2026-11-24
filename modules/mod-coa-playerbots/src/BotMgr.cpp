@@ -5439,7 +5439,8 @@ void BotMgr::Update(uint32 diff)
         TryReturnGhostToCorpseMap(session);
 
     // Loot rolls: also checked every tick. Needs on armor and weapons that would replace what the
-    // bot wears (BotAI::IsLootUpgrade, CoaBots.Loot.NeedOnUpgrades) when the roll offers Need.
+    // bot wears and beat the upgrade it already saved for that slot (BotAI::IsWantedUpgrade,
+    // CoaBots.Loot.NeedOnUpgrades) when the roll offers Need.
     // Otherwise greeds on anything except the 4 basic armor types /
     // 6 basic melee weapon types this bot's class can't wear or doesn't prefer
     // (MatchesGearPreference, see docs/addon-protocol.md's GETGEAR/SETGEARPREF verbs) --
@@ -5462,7 +5463,7 @@ void BotMgr::Update(uint32 diff)
             {
                 ItemTemplate const* proto = sObjectMgr->GetItemTemplate(roll->itemid);
                 bool const needOffered = roll->rollVoteMask & ROLL_FLAG_TYPE_NEED;
-                bool const upgrade = _lootNeedOnUpgrades && needOffered && BotAI::IsLootUpgrade(bot, proto);
+                bool const upgrade = _lootNeedOnUpgrades && needOffered && BotAI::IsWantedUpgrade(bot, proto);
                 BotGearPolicy::LootRoll const choice = BotGearPolicy::ChooseLootRoll(
                     _lootNeedOnUpgrades, needOffered, upgrade, MatchesGearPreference(bot, roll->itemid));
                 char const* const label = choice == BotGearPolicy::LootRoll::Need ? "Need (upgrade)" :
