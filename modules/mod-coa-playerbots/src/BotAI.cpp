@@ -454,6 +454,8 @@ uint32 GrindMaxLevelAbove() { return sConfigMgr->GetOption<uint32>("CoaBots.Grin
 // exactly what a real player's right-click on it does.
 constexpr uint32 SPELL_HERB_GATHERING = 2366;
 constexpr uint32 SPELL_MINING = 2575;
+// CoA's Woodcutting (mod-woodworking): the spell the Apprentice Woodcutter row teaches.
+constexpr uint32 SPELL_WOODCUTTING_GATHER = 13977859;
 constexpr float GATHER_SEARCH_RADIUS = 30.0f;
 constexpr uint32 GATHER_SCAN_INTERVAL_MS = 4000;
 
@@ -2942,6 +2944,8 @@ uint32 GatheringSpellFor(SkillType skillId)
         return SPELL_HERB_GATHERING;
     if (skillId == SKILL_MINING)
         return SPELL_MINING;
+    if (skillId == SKILL_WOODCUTTING)
+        return SPELL_WOODCUTTING_GATHER;
     return 0;
 }
 
@@ -5034,7 +5038,8 @@ bool HasProfessionOrKeyLock(GameObjectTemplate const* info)
         if (lock->Type[i] == LOCK_KEY_ITEM && lock->Index[i])
             return true;
         if (lock->Type[i] == LOCK_KEY_SKILL && (lock->Index[i] == LOCKTYPE_HERBALISM || lock->Index[i] == LOCKTYPE_MINING ||
-                lock->Index[i] == LOCKTYPE_PICKLOCK || lock->Index[i] == LOCKTYPE_FISHING))
+                lock->Index[i] == LOCKTYPE_WOODCUTTING || lock->Index[i] == LOCKTYPE_PICKLOCK ||
+                lock->Index[i] == LOCKTYPE_FISHING))
             return true;
     }
     return false;
