@@ -3499,7 +3499,8 @@ bool Player::_addSpell(uint32 spellId, uint8 addSpecMask, bool temporary, bool l
     {
         return !IsAscensionClass(getClass()) ||
             ((!ability->ClassMask || (ability->ClassMask & getClassMask())) &&
-             (!ability->RaceMask || (ability->RaceMask & getRaceMask())));
+             (!ability->RaceMask ||
+                 (ability->RaceMask & sRaceMgr->GetSkillRaceMask(getRace(true), ability->SkillLine))));
     };
     bool learnSkillMatchesPlayer = true;
     if (spellLearnSkill)
@@ -12953,7 +12954,7 @@ void Player::learnQuestRewardedSpells()
 
 void Player::learnSkillRewardedSpells(uint32 skill_id, uint32 skill_value)
 {
-    uint32 raceMask  = getRaceMask();
+    uint32 raceMask  = sRaceMgr->GetSkillRaceMask(getRace(true), skill_id);
     uint32 classMask = getClassMask();
 
     // Get all abilities for this skill and sort by MinSkillLineRank (lowest to highest)
@@ -13337,7 +13338,6 @@ float Player::GetReputationPriceDiscount(FactionTemplateEntry const* factionTemp
 
 bool Player::IsSpellFitByClassAndRace(uint32 spell_id) const
 {
-    uint32 racemask  = getRaceMask();
     uint32 classmask = getClassMask();
 
     SkillLineAbilityMapBounds bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spell_id);
@@ -13347,7 +13347,8 @@ bool Player::IsSpellFitByClassAndRace(uint32 spell_id) const
     for (SkillLineAbilityMap::const_iterator _spell_idx = bounds.first; _spell_idx != bounds.second; ++_spell_idx)
     {
         // skip wrong race skills
-        if (_spell_idx->second->RaceMask && (_spell_idx->second->RaceMask & racemask) == 0)
+        uint32 skillRaceMask = sRaceMgr->GetSkillRaceMask(getRace(true), _spell_idx->second->SkillLine);
+        if (_spell_idx->second->RaceMask && (_spell_idx->second->RaceMask & skillRaceMask) == 0)
             continue;
 
         // skip wrong class skills

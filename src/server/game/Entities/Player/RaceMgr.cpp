@@ -31,6 +31,8 @@ uint32 RaceMgr::_allianceRaceMask = 0;
 uint32 RaceMgr::_hordeRaceMask = 0;
 
 std::array<uint8, 33> RaceMgr::_baseRace = {};
+std::array<uint8, 33> RaceMgr::_racialRace = {};
+std::unordered_set<uint32> RaceMgr::_racialSkillLines;
 
 RaceMgr::RaceMgr()
 {
@@ -54,6 +56,7 @@ void RaceMgr::LoadRaces()
     _allianceRaceMask = 0;
 
     LoadBaseRaces();
+    LoadRacialSkillLines();
 
     for (auto const& raceEntry : sChrRacesStore)
     {
@@ -83,8 +86,9 @@ void RaceMgr::LoadRaces()
 void RaceMgr::LoadBaseRaces()
 {
     _baseRace.fill(0);
+    _racialRace.fill(0);
 
-    QueryResult result = WorldDatabase.Query("SELECT Race, BaseRace FROM coa_custom_race");
+    QueryResult result = WorldDatabase.Query("SELECT Race, BaseRace, RacialRace FROM coa_custom_race");
     if (!result)
         return;
 
@@ -101,6 +105,37 @@ void RaceMgr::LoadBaseRaces()
         }
 
         _baseRace[race] = baseRace;
+
+        uint8 racialRace = fields[2].Get<uint8>();
+        if (racialRace && (racialRace >= _racialRace.size() || !sChrRacesStore.LookupEntry(racialRace)))
+        {
+            LOG_ERROR("sql.sql", "coa_custom_race: invalid racial race {} for race {}, using base race {}.", racialRace,
+                race, baseRace);
+            racialRace = 0;
+        }
+
+        _racialRace[race] = racialRace ? racialRace : baseRace;
+    } while (result->NextRow());
+}
+
+void RaceMgr::LoadRacialSkillLines()
+{
+    _racialSkillLines.clear();
+
+    QueryResult result = WorldDatabase.Query("SELECT SkillId FROM coa_racial_skill_line");
+    if (!result)
+        return;
+
+    do
+    {
+        uint32 skillId = result->Fetch()[0].Get<uint16>();
+        if (!sSkillLineStore.LookupEntry(skillId))
+        {
+            LOG_ERROR("sql.sql", "coa_racial_skill_line: skill {} does not exist, ignoring.", skillId);
+            continue;
+        }
+
+        _racialSkillLines.insert(skillId);
     } while (result->NextRow());
 }
 
@@ -119,4 +154,12 @@ uint32 RaceMgr::GetRuleRaceMask(uint8 race)
 bool RaceMgr::IsCustomRace(uint8 race)
 {
     return race && race < _baseRace.size() && _baseRace[race];
+}
+
+uint32 RaceMgr::GetSkillRaceMask(uint8 race, uint32 skillId)
+{
+    if (!IsCustomRace(race) || !_racialSkillLines.contains(skillId))
+        return GetRuleRaceMask(race);
+
+    return (uint32(1) << (race - 1)) | (uint32(1) << (_racialRace[race] - 1));
 }

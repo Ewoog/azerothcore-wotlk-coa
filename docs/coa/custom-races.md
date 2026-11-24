@@ -25,6 +25,12 @@ records the base race in `coa_custom_race`.
 reputations and account reputation), so a custom race takes the quests, items, skills, racials and starting
 reputations of its base race. Race masks are 32 bits; `coa_custom_race` accepts races 1 to 32.
 
+Racials are the exception: `coa_custom_race.RacialRace` names the stock race whose racial kit the race gets, and
+`coa_racial_skill_line` lists the racial skill lines. For those lines `RaceMgr::GetSkillRaceMask` uses the race's own
+bit plus its racial race's bit instead of its base race's. Goblin has the Gnome kit, Zandalari Troll the Troll kit,
+Worgen the Undead kit, Kul Tiran the Tauren kit, Vulpera the Night Elf kit and Pandaren the Draenei kit. Existing
+characters lose their base race's racial skill and learn the new one at their next login.
+
 Companion bots of these races need `CoACustomRaces.Enable = 1` (bots of these races may log in) and
 `CoACustomRaces.BotsEnable = 1` (spawners may create them) in `mod_coa_playerbots.conf`. Only races the effective
 `ChrRaces` marks playable are offered.

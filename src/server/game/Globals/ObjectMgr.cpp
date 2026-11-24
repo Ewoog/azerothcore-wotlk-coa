@@ -4734,7 +4734,7 @@ void ObjectMgr::LoadPlayerInfo()
 
                 for (uint32 raceIndex = RACE_HUMAN; raceIndex < sRaceMgr->GetMaxRaces(); ++raceIndex)
                 {
-                    if (raceMask == 0 || (sRaceMgr->GetRuleRaceMask(raceIndex) & raceMask))
+                    if (raceMask == 0 || (sRaceMgr->GetSkillRaceMask(raceIndex, skill.SkillId) & raceMask))
                     {
                         for (uint32 classIndex = CLASS_WARRIOR; classIndex < MAX_CLASSES; ++classIndex)
                         {
