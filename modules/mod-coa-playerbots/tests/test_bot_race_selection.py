@@ -29,7 +29,16 @@ struct Config {
     }
 } config;
 Config* sConfigMgr = &config;
-struct Dbc { bool LookupEntry(uint8 race) { return race >= 12 && race <= 128; } } sChrRacesStore;
+constexpr uint32_t CHRRACES_FLAGS_NOT_PLAYABLE = 0x01;
+struct ChrRacesEntry { uint32_t Flags; };
+ChrRacesEntry const playable{ 0x04 };
+ChrRacesEntry const hidden{ 0x05 };
+struct Dbc {
+    ChrRacesEntry const* LookupEntry(uint8 race) {
+        if (race == 40) return &hidden;
+        return (race == 9 || (race >= 12 && race <= 128)) ? &playable : nullptr;
+    }
+} sChrRacesStore;
 ''' + selector + r'''
 bool contains(std::vector<uint8> const& races, uint8 race) {
     return std::find(races.begin(), races.end(), race) != races.end();
@@ -42,6 +51,10 @@ int main() {
     assert(!contains(GetValidBotRaces(), 12));
     config.flags["CoACustomRaces.BotsEnable"] = true;
     assert(contains(GetValidBotRaces(), 12));
+    assert(contains(GetValidBotRaces(), 9));
+    assert(contains(GetValidBotRaces(), 16) && contains(GetValidBotRaces(), 19));
+    assert(!contains(GetValidBotRaces(), 40));
+    assert(!contains(GetValidBotRaces(), 32));
     config.flags["CoaBots.CustomRaces.Enable"] = false;
     assert(!contains(GetValidBotRaces(), 12));
     config.flags["CoaBots.CustomRaces.Enable"] = true;

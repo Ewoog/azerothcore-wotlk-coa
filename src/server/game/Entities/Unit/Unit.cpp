@@ -60,6 +60,7 @@
 #include "PetAI.h"
 #include "PetPackets.h"
 #include "Player.h"
+#include "RaceMgr.h"
 #include "ReputationMgr.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
@@ -18752,6 +18753,11 @@ uint8 Unit::getRace(bool original) const
     }
 
     return GetByteValue(UNIT_FIELD_BYTES_0, 0);
+}
+
+uint32 Unit::getRaceMask() const
+{
+    return sRaceMgr->GetRuleRaceMask(getRace(true));
 }
 
 void Unit::setRace(uint8 race)

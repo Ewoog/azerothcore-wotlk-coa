@@ -21,7 +21,9 @@
 #include "DatabaseEnv.h"
 #include "ObjectGuid.h"
 #include "SharedDefines.h"
+#include <array>
 #include <map>
+#include <unordered_set>
 
 class Player;
 class WorldPacket;
@@ -41,7 +43,16 @@ public:
     static uint32 GetPlayableRaceMask() { return _playableRaceMask; }
     static uint32 GetAllianceRaceMask() { return _allianceRaceMask; }
     static uint32 GetHordeRaceMask() { return _hordeRaceMask; }
+    static uint32 GetRuleRaceMask(uint8 race);
+    static bool IsCustomRace(uint8 race);
+    static uint32 GetSkillRaceMask(uint8 race, uint32 skillId);
 private:
+    static void LoadBaseRaces();
+    static void LoadRacialSkillLines();
+
+    static std::array<uint8, 33> _baseRace;
+    static std::array<uint8, 33> _racialRace;
+    static std::unordered_set<uint32> _racialSkillLines;
     static uint8 _maxRaces; // Max playable race + 1
 
     static uint32 _playableRaceMask;
