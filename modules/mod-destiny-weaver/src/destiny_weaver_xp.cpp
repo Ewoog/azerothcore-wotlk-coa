@@ -29,6 +29,7 @@
 // A character whose flag is off is not touched at all: the hook returns before reading anything.
 #include "destiny_weaver.h"
 
+#include "ExperienceBuffPolicy.h"
 #include "Player.h"
 #include "ScriptMgr.h"
 #include "SpellAuraDefines.h"
@@ -38,20 +39,18 @@
 
 namespace
 {
-    /// CoA's party Aura of Experience (818059) explicitly excludes the recruit-a-friend bonus, so
-    /// the multiplier has to be read with the very filter its callers use - otherwise the wrong
-    /// number would be taken out and the payout would drift.
-    constexpr uint32 SPELL_AURA_OF_EXPERIENCE = 818059;
-
+    /// The Aura and Potion of Experience follow ExperienceBuffPolicy (no recruit-a-friend stacking,
+    /// only below the account's highest level), so the multiplier has to be read with the very
+    /// filter its callers use - otherwise the wrong number would be taken out and the payout would drift.
     /// Everything the two callers' multipliers are built from, minus the effects that are not
     /// bonuses: GetTotalAuraMultiplier multiplies by (1 + amount/100) per effect, so reading only
     /// the positive ones yields exactly the bonus factor to divide back out, and the penalties that
     /// were in the award stay in it.
-    bool IsBonusEffect(AuraEffect const* effect, bool recruitAFriend)
+    bool IsBonusEffect(Player const* player, AuraEffect const* effect, bool recruitAFriend)
     {
         if (effect->GetAmount() <= 0)
             return false;
-        return effect->GetId() != SPELL_AURA_OF_EXPERIENCE || !recruitAFriend;
+        return ExperienceBuffPolicy::Applies(player, effect, recruitAFriend);
     }
 
     uint32 StripBonus(uint32 amount, float bonusFactor)
@@ -82,9 +81,9 @@ public:
 
         bool const recruitAFriend = player->GetsRecruitAFriendBonus(true);
         std::function<bool(AuraEffect const*)> const include =
-            [recruitAFriend](AuraEffect const* effect)
+            [player, recruitAFriend](AuraEffect const* effect)
             {
-                return IsBonusEffect(effect, recruitAFriend);
+                return IsBonusEffect(player, effect, recruitAFriend);
             };
 
         switch (xpSource)

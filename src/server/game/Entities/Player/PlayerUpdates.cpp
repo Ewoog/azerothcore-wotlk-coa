@@ -21,6 +21,7 @@
 #include "CellImpl.h"
 #include "Channel.h"
 #include "ChannelMgr.h"
+#include "ExperienceBuffPolicy.h"
 #include "Formulas.h"
 #include "GameTime.h"
 #include "GridNotifiers.h"
@@ -847,10 +848,12 @@ void Player::RewardProfessionXP(uint32 skillId, uint32 current, uint32 gray, uin
         * sWorld->getRate(RATE_XP_PROFESSION_BASE_FRACTION) * sWorld->getRate(RATE_XP_PROFESSION)
         * sWorld->getRate(profession) * sWorld->getRate(difficulty);
     bool const noBonusExperience = sScriptMgr->OnPlayerHasNoBonusExperience(this);
-    double const auraMultiplier = GetTotalAuraMultiplier(SPELL_AURA_MOD_XP_PCT, [noBonusExperience](AuraEffect const* effect)
+    double const auraMultiplier = GetTotalAuraMultiplier(SPELL_AURA_MOD_XP_PCT, [this, noBonusExperience](AuraEffect const* effect)
     {
         // CoA's MOD_XP_PCT MiscValue is a mask of XP sources: 1 kills, 2 quests, 4 professions.
         if ((effect->GetMiscValue() & XP_SOURCE_MASK_PROFESSION) == 0)
+            return false;
+        if (!ExperienceBuffPolicy::Applies(this, effect, false))
             return false;
         // A NO_BONUS_EXPERIENCE challenge keeps penalties but drops the bonuses.
         return !noBonusExperience || effect->GetAmount() <= 0;

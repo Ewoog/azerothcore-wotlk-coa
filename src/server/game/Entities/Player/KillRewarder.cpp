@@ -17,6 +17,7 @@
 
 #include "KillRewarder.h"
 #include "Creature.h"
+#include "ExperienceBuffPolicy.h"
 #include "Formulas.h"
 #include "Group.h"
 #include "Pet.h"
@@ -194,12 +195,12 @@ void KillRewarder::_RewardXP(Player* player, float rate)
         bool const recruitAFriend = player->GetsRecruitAFriendBonus(true);
         bool const noBonusExperience = sScriptMgr->OnPlayerHasNoBonusExperience(player);
         int32 const sourceMask = _victim->IsPlayer() ? XP_SOURCE_MASK_KILL | XP_SOURCE_MASK_BATTLEGROUND : XP_SOURCE_MASK_KILL;
-        xp *= player->GetTotalAuraMultiplier(SPELL_AURA_MOD_XP_PCT, [recruitAFriend, noBonusExperience, sourceMask](AuraEffect const* effect)
+        xp *= player->GetTotalAuraMultiplier(SPELL_AURA_MOD_XP_PCT, [player, recruitAFriend, noBonusExperience, sourceMask](AuraEffect const* effect)
         {
             if ((effect->GetMiscValue() & sourceMask) == 0)
                 return false;
-            // CoA's party Aura of Experience explicitly excludes the recruit-a-friend bonus.
-            if (effect->GetId() == 818059 && recruitAFriend)
+            // CoA's Aura/Potion of Experience: no recruit-a-friend stacking, and only below the account's highest level.
+            if (!ExperienceBuffPolicy::Applies(player, effect, recruitAFriend))
                 return false;
             return !noBonusExperience || effect->GetAmount() <= 0;
         });
