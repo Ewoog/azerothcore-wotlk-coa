@@ -2343,7 +2343,7 @@ end
 -- Order Picker (icon-menu Gather/Craft orders -- replaces typing a raw item id)
 -------------------------------------------------------------------------------
 
--- The first 6 are gather-order categories (BotMgr::GetGatherCatalog / GATHERORDER, any online
+-- The first 7 are gather-order categories (BotMgr::GetGatherCatalog / GATHERORDER, any online
 -- guild-mate bot can pick these up since every bot already has every gathering profession
 -- maxed -- see GrantAllProfessions). "recipe" is the craft-order catalog (BotMgr::
 -- GetRecipeCatalog / CRAFTORDER) -- only items a guild-mate bot can *actually* craft right now.
@@ -2354,6 +2354,7 @@ local ORDER_CATEGORIES = {
     { id = "leather", label = "Leather", verb = "GATHERORDER" },
     { id = "meat",    label = "Meat",    verb = "GATHERORDER" },
     { id = "fish",    label = "Fish",    verb = "GATHERORDER" },
+    { id = "wood",    label = "Wood",    verb = "GATHERORDER" },
     { id = "recipe",  label = "Recipes", verb = "CRAFTORDER" },
     { id = "stock",   label = "Stock",   verb = "SETSTOCK" },
 }

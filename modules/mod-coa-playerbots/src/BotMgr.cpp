@@ -168,6 +168,54 @@ struct GatherCategoryItem
 // filter alone would have wrongly included. Built once and cached -- confirmed via EXPLAIN this
 // runs in ~0.1s as a JOIN (a correlated-EXISTS version of the same query took ~9.5s against this
 // realm's live creature_loot_template, unacceptable for anything running on the map thread).
+// Woodcutting is CoA's own trade: its logs are not Trade Goods in the class/subclass sense the query
+// above relies on, so they are taken straight from the loot of every Woodcutting-locked node and moved
+// out of any category the query may have put them in.
+void AddWoodcuttingCategory(std::unordered_map<std::string, std::vector<GatherCategoryItem>>& map)
+{
+    GameObjectTemplateContainer const* goTemplates = sObjectMgr->GetGameObjectTemplates();
+    if (!goTemplates)
+        return;
+    std::string lootIds;
+    for (auto const& [goEntry, goTemplate] : *goTemplates)
+    {
+        LockEntry const* lock = sLockStore.LookupEntry(goTemplate.GetLockId());
+        if (!lock || !goTemplate.GetLootId())
+            continue;
+        for (uint8 j = 0; j < MAX_LOCK_CASE; ++j)
+        {
+            if (lock->Type[j] == LOCK_KEY_SKILL && lock->Index[j] == LOCKTYPE_WOODCUTTING)
+            {
+                lootIds += (lootIds.empty() ? "" : ",") + std::to_string(goTemplate.GetLootId());
+                break;
+            }
+        }
+    }
+    if (lootIds.empty())
+        return;
+    QueryResult result = WorldDatabase.Query(
+        "SELECT DISTINCT Item FROM gameobject_loot_template WHERE Reference = 0 AND Entry IN ({}) ORDER BY Item",
+        lootIds);
+    if (!result)
+        return;
+    std::vector<GatherCategoryItem> wood;
+    std::unordered_set<uint32> woodEntries;
+    do
+    {
+        uint32 const entry = result->Fetch()[0].Get<uint32>();
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(entry);
+        if (!proto || !woodEntries.insert(entry).second)
+            continue;
+        wood.push_back({ entry, proto->Name1 });
+    } while (result->NextRow());
+    if (wood.empty())
+        return;
+    auto const isWood = [&woodEntries](GatherCategoryItem const& item) { return woodEntries.count(item.entry) != 0; };
+    for (auto& [category, items] : map)
+        items.erase(std::remove_if(items.begin(), items.end(), isWood), items.end());
+    map["wood"] = std::move(wood);
+}
+
 std::unordered_map<std::string, std::vector<GatherCategoryItem>> const& GatherableCatalog()
 {
     static std::unordered_map<std::string, std::vector<GatherCategoryItem>> catalog = []
@@ -205,6 +253,7 @@ std::unordered_map<std::string, std::vector<GatherCategoryItem>> const& Gatherab
                 map[category].push_back({ entry, std::move(name) });
             } while (result->NextRow());
         }
+        AddWoodcuttingCategory(map);
         return map;
     }();
     return catalog;
@@ -455,7 +504,7 @@ BotMgr::GatherSourceInfo BuildGatherSourceInfo(uint32 itemEntry)
                     if (lock->Type[j] != LOCK_KEY_SKILL)
                         continue;
                     SkillType const skill = SkillByLockType(LockType(lock->Index[j]));
-                    if (skill != SKILL_HERBALISM && skill != SKILL_MINING)
+                    if (skill != SKILL_HERBALISM && skill != SKILL_MINING && skill != SKILL_WOODCUTTING)
                         continue;
                     info.nodeSourced = true;
                     if (info.nodeGoEntries.empty() || info.nodeGoEntries.back() != goEntry)
