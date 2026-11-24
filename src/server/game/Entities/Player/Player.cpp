@@ -11490,6 +11490,10 @@ void Player::InitDisplayIds()
             LOG_ERROR("entities.player", "Invalid gender {} for player", gender);
             return;
     }
+
+    // Most helm models have no variant for the custom races and render as a placeholder cube.
+    if (sRaceMgr->IsCustomRace(getRace(true)))
+        SetPlayerFlag(PLAYER_FLAGS_HIDE_HELM);
 }
 
 inline bool Player::_StoreOrEquipNewItem(uint32 vendorslot, uint32 item, uint8 count, uint8 bag, uint8 slot, int32 price, ItemTemplate const* pProto, Creature* pVendor, VendorItem const* crItem, bool bStore)

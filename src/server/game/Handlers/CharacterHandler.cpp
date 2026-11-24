@@ -1411,7 +1411,7 @@ void WorldSession::HandleSetFactionInactiveOpcode(WorldPacket& recvData)
 
 void WorldSession::HandleShowingHelmOpcode(WorldPackets::Character::ShowingHelm& packet)
 {
-    if (packet.ShowHelm)
+    if (packet.ShowHelm && !sRaceMgr->IsCustomRace(_player->getRace(true)))
         _player->RemovePlayerFlag(PLAYER_FLAGS_HIDE_HELM);
     else
         _player->SetPlayerFlag(PLAYER_FLAGS_HIDE_HELM);

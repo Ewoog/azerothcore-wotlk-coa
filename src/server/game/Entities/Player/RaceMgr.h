@@ -43,6 +43,7 @@ public:
     static uint32 GetAllianceRaceMask() { return _allianceRaceMask; }
     static uint32 GetHordeRaceMask() { return _hordeRaceMask; }
     static uint32 GetRuleRaceMask(uint8 race);
+    static bool IsCustomRace(uint8 race);
 private:
     static void LoadBaseRaces();
 

@@ -115,3 +115,8 @@ uint32 RaceMgr::GetRuleRaceMask(uint8 race)
 
     return mask;
 }
+
+bool RaceMgr::IsCustomRace(uint8 race)
+{
+    return race && race < _baseRace.size() && _baseRace[race];
+}
