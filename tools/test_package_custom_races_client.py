@@ -3,10 +3,11 @@ import re
 import struct
 import unittest
 
-from package_custom_races_client import (COPIED_RACES, FRAME_OVERLAY_SOURCE, OVERLAY_SOURCE, RACES, extend_cameras,
-                                         extend_char_base_info, extend_character_create_xml, extend_facial_hair,
-                                         extend_frame_toc, extend_hair_geosets, extend_sections,
-                                         extend_start_outfits, patch_chr_races)
+from package_custom_races_client import (COPIED_RACES, FRAME_OVERLAY_SOURCE, OVERLAY_SOURCE, RACES,
+                                         extend_barber_styles, extend_cameras, extend_char_base_info,
+                                         extend_character_create_xml, extend_facial_hair, extend_frame_toc,
+                                         extend_hair_geosets, extend_hair_textures, extend_sections,
+                                         extend_start_outfits, extend_variations, patch_chr_races)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +57,8 @@ class ChrRacesTest(unittest.TestCase):
         self.assertEqual(COPIED_RACES, {21: 19})
         self.assertEqual(patched[21][4:6], patched[19][4:6])
         self.assertEqual((patched[19][13], patched[21][13]), (1, 0))
+        ids = [struct.unpack_from('<I', row)[0] for row in rows]
+        self.assertEqual(ids, sorted(ids))
 
     def test_existing_copy_fails(self):
         with self.assertRaises(ValueError):
@@ -192,18 +195,20 @@ def race_rows(race_field, fields, extra=()):
 
 class CopiedRaceTablesTest(unittest.TestCase):
     def test_copied_race_gets_the_source_race_rows_with_new_ids(self):
-        for extend, fields, race_field in ((extend_sections, 10, 1), (extend_hair_geosets, 6, 1)):
+        for extend, fields, race_field in ((extend_sections, 10, 1), (extend_hair_geosets, 6, 1),
+                                           (extend_hair_textures, 8, 1), (extend_barber_styles, 40, 37)):
             rows = [struct.unpack(f'<{fields}I', row) for row in records(extend(race_rows(race_field, fields)),
                                                                           fields * 4)]
-            copies = [row for row in rows if row[race_field] == 21]
-            sources = [row for row in rows if row[race_field] == 19]
+            copies = [row[1:race_field] + row[race_field + 1:] for row in rows if row[race_field] == 21]
+            sources = [row[1:race_field] + row[race_field + 1:] for row in rows if row[race_field] == 19]
             self.assertEqual(len(rows), 6)
-            self.assertEqual([row[2:] for row in copies], [row[2:] for row in sources])
+            self.assertEqual(copies, sources)
             self.assertEqual(len({row[0] for row in rows}), 6)
 
-    def test_facial_hair_rows_are_copied_by_race(self):
-        rows = [struct.unpack('<8I', row) for row in records(extend_facial_hair(race_rows(0, 8)), 32)]
-        self.assertEqual([row[1:] for row in rows if row[0] == 21], [row[1:] for row in rows if row[0] == 19])
+    def test_tables_without_ids_copy_rows_by_race(self):
+        for extend, fields in ((extend_facial_hair, 8), (extend_variations, 6)):
+            rows = [struct.unpack(f'<{fields}I', row) for row in records(extend(race_rows(0, fields)), fields * 4)]
+            self.assertEqual([row[1:] for row in rows if row[0] == 21], [row[1:] for row in rows if row[0] == 19])
 
     def test_tables_that_already_have_the_copy_fail(self):
         with self.assertRaises(ValueError):

@@ -16,7 +16,8 @@ on the server and on the character create screen.
 
 A race belongs to one side, so Alliance Vulpera are race 21, a copy of Vulpera (19). The installed `ChrRaces.dbc`
 has no row 21: `rev_20261125_01_alliance_vulpera.sql` adds it with Vulpera's models and text, and the client archive
-tool copies Vulpera's `ChrRaces`, `CharSections`, `CharHairGeosets` and `CharacterFacialHairStyles` rows to race 21.
+tool copies Vulpera's `ChrRaces`, `CharSections`, `CharHairGeosets`, `CharacterFacialHairStyles`,
+`CharHairTextures`, `CharVariations` and `BarberShopStyle` rows to race 21 and keeps `ChrRaces` in ID order.
 Race 21 has the Night Elf racials like Horde Vulpera, and its create screen and character backgrounds are the
 Dwarf ones.
 

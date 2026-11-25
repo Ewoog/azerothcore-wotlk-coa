@@ -29,6 +29,9 @@ START_OUTFITS = 'DBFilesClient/CharStartOutfit.dbc'
 SECTIONS = 'DBFilesClient/CharSections.dbc'
 HAIR_GEOSETS = 'DBFilesClient/CharHairGeosets.dbc'
 FACIAL_HAIR = 'DBFilesClient/CharacterFacialHairStyles.dbc'
+HAIR_TEXTURES = 'DBFilesClient/CharHairTextures.dbc'
+VARIATIONS = 'DBFilesClient/CharVariations.dbc'
+BARBER_STYLES = 'DBFilesClient/BarberShopStyle.dbc'
 CHARACTER_CREATE_XML = 'Interface/GlueXML/CharacterCreate.xml'
 OVERLAY = 'Interface/GlueXML/CoACustomRaces.lua'
 OVERLAY_SOURCE = Path(__file__).resolve().parents[1] / 'client' / OVERLAY
@@ -37,7 +40,8 @@ FRAME_OVERLAY = 'Interface/FrameXML/CoACustomRaces.lua'
 FRAME_OVERLAY_SOURCE = Path(__file__).resolve().parents[1] / 'client' / FRAME_OVERLAY
 FRAME_TOC_MARKER = '## add new modules above here'
 ARCHIVE_MEMBERS = {
-    'patch-M.MPQ': [CHR_RACES, CAMERAS, START_OUTFITS, SECTIONS, HAIR_GEOSETS, FACIAL_HAIR],
+    'patch-M.MPQ': [CHR_RACES, CAMERAS, START_OUTFITS, SECTIONS, HAIR_GEOSETS, FACIAL_HAIR, HAIR_TEXTURES, VARIATIONS,
+                    BARBER_STYLES],
     'patch-T.MPQ': [CHAR_BASE_INFO],
     'patch-B.MPQ': [CHARACTER_CREATE_XML, FRAME_TOC],
 }
@@ -95,6 +99,7 @@ def patch_chr_races(data):
         struct.pack_into('<II', record, 4, (flags & ~NOT_PLAYABLE) | CAN_MOUNT, settings['faction'])
         struct.pack_into('<I', record, 7 * 4, settings['language'])
         struct.pack_into('<I', record, 13 * 4, settings['alliance'])
+    dbc.records.sort(key=lambda record: struct.unpack_from('<I', record)[0])
     return dbc.pack()
 
 
@@ -130,6 +135,18 @@ def extend_hair_geosets(data):
 
 def extend_facial_hair(data):
     return copy_race_rows(data, fields=8, race_field=0)
+
+
+def extend_hair_textures(data):
+    return copy_race_rows(data, fields=8, race_field=1, id_field=0)
+
+
+def extend_variations(data):
+    return copy_race_rows(data, fields=6, race_field=0)
+
+
+def extend_barber_styles(data):
+    return copy_race_rows(data, fields=40, race_field=37, id_field=0)
 
 
 def extend_char_base_info(data):
@@ -229,7 +246,8 @@ def extend_frame_toc(data):
 
 PATCHERS = {CHR_RACES: patch_chr_races, CHAR_BASE_INFO: extend_char_base_info, CAMERAS: extend_cameras,
             START_OUTFITS: extend_start_outfits, SECTIONS: extend_sections, HAIR_GEOSETS: extend_hair_geosets,
-            FACIAL_HAIR: extend_facial_hair, CHARACTER_CREATE_XML: extend_character_create_xml,
+            FACIAL_HAIR: extend_facial_hair, HAIR_TEXTURES: extend_hair_textures, VARIATIONS: extend_variations,
+            BARBER_STYLES: extend_barber_styles, CHARACTER_CREATE_XML: extend_character_create_xml,
             FRAME_TOC: extend_frame_toc}
 
 
