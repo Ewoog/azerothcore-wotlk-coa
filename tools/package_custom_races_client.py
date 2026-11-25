@@ -16,7 +16,9 @@ RACES = {
     16: dict(base=1, faction=1, language=7, alliance=0),
     19: dict(base=2, faction=2, language=1, alliance=1),
     20: dict(base=3, faction=3, language=7, alliance=0),
+    21: dict(base=3, faction=3, language=7, alliance=0, source=19),
 }
+COPIED_RACES = {race: settings['source'] for race, settings in RACES.items() if 'source' in settings}
 NOT_PLAYABLE = 0x01
 CAN_MOUNT = 0x04
 
@@ -24,6 +26,9 @@ CHR_RACES = 'DBFilesClient/ChrRaces.dbc'
 CHAR_BASE_INFO = 'DBFilesClient/CharBaseInfo.dbc'
 CAMERAS = 'DBFilesClient/UICameraAppearanceChrRaces.dbc'
 START_OUTFITS = 'DBFilesClient/CharStartOutfit.dbc'
+SECTIONS = 'DBFilesClient/CharSections.dbc'
+HAIR_GEOSETS = 'DBFilesClient/CharHairGeosets.dbc'
+FACIAL_HAIR = 'DBFilesClient/CharacterFacialHairStyles.dbc'
 CHARACTER_CREATE_XML = 'Interface/GlueXML/CharacterCreate.xml'
 OVERLAY = 'Interface/GlueXML/CoACustomRaces.lua'
 OVERLAY_SOURCE = Path(__file__).resolve().parents[1] / 'client' / OVERLAY
@@ -32,7 +37,7 @@ FRAME_OVERLAY = 'Interface/FrameXML/CoACustomRaces.lua'
 FRAME_OVERLAY_SOURCE = Path(__file__).resolve().parents[1] / 'client' / FRAME_OVERLAY
 FRAME_TOC_MARKER = '## add new modules above here'
 ARCHIVE_MEMBERS = {
-    'patch-M.MPQ': [CHR_RACES, CAMERAS, START_OUTFITS],
+    'patch-M.MPQ': [CHR_RACES, CAMERAS, START_OUTFITS, SECTIONS, HAIR_GEOSETS, FACIAL_HAIR],
     'patch-T.MPQ': [CHAR_BASE_INFO],
     'patch-B.MPQ': [CHARACTER_CREATE_XML, FRAME_TOC],
 }
@@ -40,7 +45,7 @@ ARCHIVE_ADDITIONS = {
     'patch-B.MPQ': {OVERLAY: OVERLAY_SOURCE, FRAME_OVERLAY: FRAME_OVERLAY_SOURCE},
 }
 STOCK_RACE_BUTTONS = 11
-SERVER_MEMBERS = {START_OUTFITS}
+SERVER_MEMBERS = {START_OUTFITS, SECTIONS}
 RACE_BUTTONS = 10 + len(RACES)
 
 
@@ -65,22 +70,66 @@ class Dbc:
 
 def patch_chr_races(data):
     dbc = Dbc(data, fields=69, record_size=276)
-    found = set()
+    rows = {}
     for record in dbc.records:
         race = struct.unpack_from('<I', record)[0]
-        if race not in RACES:
-            continue
-        if race in found:
+        if race in rows:
             raise ValueError(f'Duplicate ChrRaces row {race}')
-        found.add(race)
-        settings = RACES[race]
+        rows[race] = record
+    existing = set(COPIED_RACES) & set(rows)
+    if existing:
+        raise ValueError(f'ChrRaces already has rows {sorted(existing)}')
+    for race, source in COPIED_RACES.items():
+        if source not in rows:
+            raise ValueError(f'ChrRaces lacks row {source} to copy for race {race}')
+        copy = bytearray(rows[source])
+        struct.pack_into('<I', copy, 0, race)
+        dbc.records.append(copy)
+        rows[race] = copy
+    missing = set(RACES) - set(rows)
+    if missing:
+        raise ValueError(f'ChrRaces lacks rows {sorted(missing)}')
+    for race, settings in RACES.items():
+        record = rows[race]
         flags = struct.unpack_from('<I', record, 4)[0]
         struct.pack_into('<II', record, 4, (flags & ~NOT_PLAYABLE) | CAN_MOUNT, settings['faction'])
         struct.pack_into('<I', record, 7 * 4, settings['language'])
         struct.pack_into('<I', record, 13 * 4, settings['alliance'])
-    if found != set(RACES):
-        raise ValueError(f'ChrRaces lacks rows {sorted(set(RACES) - found)}')
     return dbc.pack()
+
+
+def copy_race_rows(data, fields, race_field, id_field=None):
+    dbc = Dbc(data, fields=fields, record_size=fields * 4)
+    races = [struct.unpack_from('<I', record, race_field * 4)[0] for record in dbc.records]
+    if set(COPIED_RACES) & set(races):
+        raise ValueError(f'Rows already exist for race {sorted(set(COPIED_RACES) & set(races))}')
+    next_id = None
+    if id_field is not None:
+        next_id = max(struct.unpack_from('<I', record, id_field * 4)[0] for record in dbc.records) + 1
+    for race, source in COPIED_RACES.items():
+        sources = [record for record, owner in zip(list(dbc.records), races) if owner == source]
+        if not sources:
+            raise ValueError(f'No rows for race {source} to copy for race {race}')
+        for record in sources:
+            copy = bytearray(record)
+            struct.pack_into('<I', copy, race_field * 4, race)
+            if next_id is not None:
+                struct.pack_into('<I', copy, id_field * 4, next_id)
+                next_id += 1
+            dbc.records.append(copy)
+    return dbc.pack()
+
+
+def extend_sections(data):
+    return copy_race_rows(data, fields=10, race_field=1, id_field=0)
+
+
+def extend_hair_geosets(data):
+    return copy_race_rows(data, fields=6, race_field=1, id_field=0)
+
+
+def extend_facial_hair(data):
+    return copy_race_rows(data, fields=8, race_field=0)
 
 
 def extend_char_base_info(data):
@@ -179,7 +228,8 @@ def extend_frame_toc(data):
 
 
 PATCHERS = {CHR_RACES: patch_chr_races, CHAR_BASE_INFO: extend_char_base_info, CAMERAS: extend_cameras,
-            START_OUTFITS: extend_start_outfits, CHARACTER_CREATE_XML: extend_character_create_xml,
+            START_OUTFITS: extend_start_outfits, SECTIONS: extend_sections, HAIR_GEOSETS: extend_hair_geosets,
+            FACIAL_HAIR: extend_facial_hair, CHARACTER_CREATE_XML: extend_character_create_xml,
             FRAME_TOC: extend_frame_toc}
 
 

@@ -3,22 +3,25 @@ import re
 import struct
 import unittest
 
-from package_custom_races_client import (FRAME_OVERLAY_SOURCE, OVERLAY_SOURCE, RACES, extend_cameras,
-                                         extend_char_base_info, extend_character_create_xml, extend_frame_toc,
+from package_custom_races_client import (COPIED_RACES, FRAME_OVERLAY_SOURCE, OVERLAY_SOURCE, RACES, extend_cameras,
+                                         extend_char_base_info, extend_character_create_xml, extend_facial_hair,
+                                         extend_frame_toc, extend_hair_geosets, extend_sections,
                                          extend_start_outfits, patch_chr_races)
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SQL = ROOT / 'data/sql/updates/pending_db_world/rev_20261123_01_custom_playable_races.sql'
+MIGRATIONS = ROOT / 'data/sql/updates/pending_db_world'
+SQL = [MIGRATIONS / 'rev_20261123_01_custom_playable_races.sql', MIGRATIONS / 'rev_20261125_01_alliance_vulpera.sql']
 
 
 def dbc(records, fields, size, strings=b'\0'):
     return struct.pack('<4sIIII', b'WDBC', len(records), fields, size, len(strings)) + b''.join(records) + strings
 
 
-def chr_race(race, flags, faction=1, language=7, alliance=2):
+def chr_race(race, flags, faction=1, language=7, alliance=2, display=0):
     values = [0] * 69
     values[0], values[1], values[2], values[7], values[13] = race, flags, faction, language, alliance
+    values[4], values[5] = display, display + 1
     return struct.pack('<69I', *values)
 
 
@@ -30,7 +33,8 @@ def records(data, size):
 class ChrRacesTest(unittest.TestCase):
     def source(self):
         rows = [chr_race(1, 12), chr_race(2, 12, 2, 1, 1), chr_race(40, 15)]
-        rows += [chr_race(race, 1 if race == 9 else 5) for race in RACES]
+        rows += [chr_race(race, 1 if race == 9 else 5, display=1000 + race) for race in RACES
+                 if race not in COPIED_RACES]
         return dbc(rows, 69, 276)
 
     def test_custom_races_become_playable_on_their_side(self):
@@ -44,6 +48,18 @@ class ChrRacesTest(unittest.TestCase):
                              (settings['faction'], settings['language'], settings['alliance']))
         self.assertEqual(patched[40][1], 15)
         self.assertEqual(patched[1][1:3], (12, 1))
+
+    def test_copied_races_keep_their_source_models_on_their_own_side(self):
+        rows = records(patch_chr_races(self.source()), 276)
+        patched = {struct.unpack_from('<I', row)[0]: struct.unpack('<69I', row) for row in rows}
+        self.assertEqual(len(rows), len(patched))
+        self.assertEqual(COPIED_RACES, {21: 19})
+        self.assertEqual(patched[21][4:6], patched[19][4:6])
+        self.assertEqual((patched[19][13], patched[21][13]), (1, 0))
+
+    def test_existing_copy_fails(self):
+        with self.assertRaises(ValueError):
+            patch_chr_races(dbc(records(self.source(), 276) + [chr_race(21, 1)], 69, 276))
 
     def test_missing_or_duplicate_rows_fail(self):
         with self.assertRaises(ValueError):
@@ -97,10 +113,10 @@ class CharacterCreateXmlTest(unittest.TestCase):
     def test_overlay_loads_after_stock_script_and_buttons_follow_the_last_stock_button(self):
         text = extend_character_create_xml(XML.encode()).decode()
         self.assertIn('<Script file="CharacterCreate.lua"/>\r\n\t<Script file="CoACustomRaces.lua"/>', text)
-        positions = [text.index(f'name="CharCreateRaceButton{index}"') for index in range(10, 17)]
+        positions = [text.index(f'name="CharCreateRaceButton{index}"') for index in range(10, 18)]
         self.assertEqual(positions, sorted(positions))
-        self.assertIn('id="16"', text)
-        self.assertNotIn('id="17"', text)
+        self.assertIn('id="17"', text)
+        self.assertNotIn('id="18"', text)
         self.assertNotIn('\n\n', text.replace('\r', ''))
 
     def test_unknown_or_already_patched_sources_fail(self):
@@ -110,7 +126,7 @@ class CharacterCreateXmlTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 extend_character_create_xml(source)
 
-    def test_overlay_supports_sixteen_races(self):
+    def test_overlay_supports_every_race_button(self):
         text = OVERLAY_SOURCE.read_text(encoding='utf-8')
         self.assertIn(f'MAX_RACES = {10 + len(RACES)}', text)
 
@@ -165,15 +181,46 @@ class StartOutfitTest(unittest.TestCase):
             extend_start_outfits(dbc([outfit(1, 5, 1, 0, 1)], 77, 296, b''))
 
 
+def race_rows(race_field, fields, extra=()):
+    values = []
+    for index, race in enumerate([2, 19, 19, 3, *extra]):
+        row = [100 + index] * fields
+        row[race_field] = race
+        values.append(struct.pack(f'<{fields}I', *row))
+    return dbc(values, fields, fields * 4, b'')
+
+
+class CopiedRaceTablesTest(unittest.TestCase):
+    def test_copied_race_gets_the_source_race_rows_with_new_ids(self):
+        for extend, fields, race_field in ((extend_sections, 10, 1), (extend_hair_geosets, 6, 1)):
+            rows = [struct.unpack(f'<{fields}I', row) for row in records(extend(race_rows(race_field, fields)),
+                                                                          fields * 4)]
+            copies = [row for row in rows if row[race_field] == 21]
+            sources = [row for row in rows if row[race_field] == 19]
+            self.assertEqual(len(rows), 6)
+            self.assertEqual([row[2:] for row in copies], [row[2:] for row in sources])
+            self.assertEqual(len({row[0] for row in rows}), 6)
+
+    def test_facial_hair_rows_are_copied_by_race(self):
+        rows = [struct.unpack('<8I', row) for row in records(extend_facial_hair(race_rows(0, 8)), 32)]
+        self.assertEqual([row[1:] for row in rows if row[0] == 21], [row[1:] for row in rows if row[0] == 19])
+
+    def test_tables_that_already_have_the_copy_fail(self):
+        with self.assertRaises(ValueError):
+            extend_sections(race_rows(1, 10, extra=(21,)))
+        with self.assertRaises(ValueError):
+            extend_facial_hair(race_rows(0, 8, extra=(21,)))
+
+
 class ServerDataTest(unittest.TestCase):
-    def test_client_settings_match_the_server_migration(self):
-        text = SQL.read_text(encoding='utf-8')
-        mapping = dict(map(int, pair) for pair in re.findall(r'^\((\d+), (\d+)\)[,;]$', text, re.M))
+    def test_client_settings_match_the_server_migrations(self):
+        text = ''.join(path.read_text(encoding='utf-8') for path in SQL)
+        mapping = {int(pair[0]): int(pair[1]) for pair in re.findall(r'^\((\d+), (\d+)(?:, \d+)?\)[,;]$', text, re.M)}
         self.assertEqual(mapping, {race: settings['base'] for race, settings in RACES.items()})
-        rows = re.findall(r'^\((\d+), (\d+), (\d+), \d+, \d+, \d+, \'\', (\d+), \d+, \d+, \d+, \'\', \d+, (\d+),',
+        rows = re.findall(r"^\((\d+), (\d+), (\d+), \d+, \d+, \d+, '[^']*', (\d+), \d+, \d+, \d+, '[^']*', \d+, (\d+),",
                           text, re.M)
         server = {int(r[0]): dict(faction=int(r[2]), language=int(r[3]), alliance=int(r[4])) for r in rows}
-        self.assertEqual(server, {race: {k: v for k, v in settings.items() if k != 'base'}
+        self.assertEqual(server, {race: {k: v for k, v in settings.items() if k in ('faction', 'language', 'alliance')}
                                   for race, settings in RACES.items()})
 
 

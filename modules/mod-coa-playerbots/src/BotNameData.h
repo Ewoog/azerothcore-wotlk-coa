@@ -1768,8 +1768,8 @@ inline unsigned char ResolveNamingRace(unsigned char race)
         // Pandaren: Pandaren (20, 29)
         case 20: case 29:
             return 20;
-        // Naga: Naga (21, 35)
-        case 21: case 35:
+        // Naga: Naga (35)
+        case 35:
             return 21;
         // Tuskarr: Tuskarr (15, 39)
         case 15: case 39:
@@ -1777,8 +1777,8 @@ inline unsigned char ResolveNamingRace(unsigned char race)
         // Vrykul: Vrykul (18, 38)
         case 18: case 38:
             return 18;
-        // Vulpera: Vulpera (19, 74)
-        case 19: case 74:
+        // Vulpera: Vulpera (19), Alliance Vulpera (21), Vulpera (74)
+        case 19: case 21: case 74:
             return 19;
         // Dracthyr: Dracthyr (54, 58)
         case 54: case 58:

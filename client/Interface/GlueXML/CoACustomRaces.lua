@@ -1,4 +1,4 @@
-MAX_RACES = 16
+MAX_RACES = 17
 
 local STOCK_RACE_ICONS = "Interface\\Glues\\CharacterCreate\\UI-CHARACTERCREATE-RACES_Round"
 local CUSTOM_RACE_ICON_COORDS = { 0.07, 0.93, 0.07, 0.93 }
@@ -18,7 +18,11 @@ local BACKGROUND_RACES = {
     ["VULPERA"] = "Orc",
     ["PANDAREN"] = "Dwarf",
 }
+local ALLIANCE_BACKGROUND_RACES = {
+    ["VULPERA"] = "Dwarf",
+}
 local COMPACT_ROW_SPACING = 66
+local COMPACT_COLUMN_SPAN = 7 * COMPACT_ROW_SPACING
 
 for raceEnglishName, baseRace in pairs(BACKGROUND_RACES) do
     local baseKey = strupper(baseRace)
@@ -43,9 +47,26 @@ local function RaceIcon(raceEnglishName, gender)
     return "Interface\\Icons\\" .. icon
 end
 
+local function RaceFaction(index)
+    local _, faction = GetFactionForRace(index)
+    if faction == "Horde" then
+        return "Horde"
+    end
+    return "Alliance"
+end
+
+local function BackgroundRace(name)
+    local key = strupper(name)
+    local allianceRace = ALLIANCE_BACKGROUND_RACES[key]
+    if allianceRace and CharacterCreate.selectedRace and RaceFaction(CharacterCreate.selectedRace) == "Alliance" then
+        return allianceRace
+    end
+    return BACKGROUND_RACES[key] or name
+end
+
 local stockSetBackgroundModel = SetBackgroundModel
 function SetBackgroundModel(model, name)
-    return stockSetBackgroundModel(model, BACKGROUND_RACES[strupper(name)] or name)
+    return stockSetBackgroundModel(model, BackgroundRace(name))
 end
 
 local stockGetFlavorText = GetFlavorText
@@ -61,14 +82,6 @@ function CharCreateRaceButtonMixin:SetRace(raceName, raceEnglishName, gender, en
     stockSetRace(self, raceName, raceEnglishName, gender, enabled)
 end
 
-local function RaceFaction(index)
-    local _, faction = GetFactionForRace(index)
-    if faction == "Horde" then
-        return "Horde"
-    end
-    return "Alliance"
-end
-
 local stockEnumerateRaces = CharacterCreateEnumerateRaces
 function CharacterCreateEnumerateRaces(...)
     stockEnumerateRaces(...)
@@ -77,11 +90,19 @@ function CharacterCreateEnumerateRaces(...)
         return
     end
 
+    local columns = { Alliance = 0, Horde = 0 }
+    for index = 1, count do
+        local faction = RaceFaction(index)
+        columns[faction] = columns[faction] + 1
+    end
+    local spacing = math.min(COMPACT_ROW_SPACING,
+        math.floor(COMPACT_COLUMN_SPAN / math.max(math.max(columns.Alliance, columns.Horde) - 1, 1)))
+
     local rows = { Alliance = 0, Horde = 0 }
     for index = 1, count do
         local button = _G["CharCreateRaceButton" .. index]
         local faction = RaceFaction(index)
-        local offset = -75 - rows[faction] * COMPACT_ROW_SPACING
+        local offset = -75 - rows[faction] * spacing
         rows[faction] = rows[faction] + 1
         button:SetFaction(faction)
         button:ClearAllPoints()

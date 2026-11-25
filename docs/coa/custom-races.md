@@ -1,8 +1,8 @@
 # Playable custom races
 
-Goblin, Zandalari Troll, Worgen, Kul Tiran, Vulpera and Pandaren are playable. The client already carries their
-models, customization options and starting outfits (`patch-CHA.MPQ`); this change opens them on the server and
-on the character create screen.
+Goblin, Zandalari Troll, Worgen, Kul Tiran, Vulpera and Pandaren are playable, Vulpera on both sides. The client
+already carries their models, customization options and starting outfits (`patch-CHA.MPQ`); this change opens them
+on the server and on the character create screen.
 
 | Race | ID | Side | Base race | Faction template | Language |
 |---|---|---|---|---|---|
@@ -12,6 +12,13 @@ on the character create screen.
 | Worgen | 13 | Alliance | Human (1) | 1, Stormwind | Common |
 | Kul Tiran | 16 | Alliance | Human (1) | 1, Stormwind | Common |
 | Pandaren | 20 | Alliance | Dwarf (3) | 3, Ironforge | Common |
+| Vulpera (Alliance) | 21 | Alliance | Dwarf (3) | 3, Ironforge | Common |
+
+A race belongs to one side, so Alliance Vulpera are race 21, a copy of Vulpera (19). The installed `ChrRaces.dbc`
+has no row 21: `rev_20261125_01_alliance_vulpera.sql` adds it with Vulpera's models and text, and the client archive
+tool copies Vulpera's `ChrRaces`, `CharSections`, `CharHairGeosets` and `CharacterFacialHairStyles` rows to race 21.
+Race 21 has the Night Elf racials like Horde Vulpera, and its create screen and character backgrounds are the
+Dwarf ones.
 
 ## Server
 
@@ -39,12 +46,13 @@ Companion bots of these races need `CoACustomRaces.Enable = 1` (bots of these ra
 
 The client reads its own race list, so every player needs three updated archives:
 
-- `patch-M.MPQ`: `ChrRaces.dbc` with the same playable flag, side, faction and language as the server rows, and
-  `UICameraAppearanceChrRaces.dbc` rows that reuse the base race's create-screen cameras.
+- `patch-M.MPQ`: `ChrRaces.dbc` with the same playable flag, side, faction and language as the server rows,
+  `UICameraAppearanceChrRaces.dbc` rows that reuse the base race's create-screen cameras, base race starting outfits
+  in `CharStartOutfit.dbc`, and the race 21 copies of Vulpera's customization rows.
 - `patch-T.MPQ`: `CharBaseInfo.dbc` with the base race's classes appended for each custom race, so the native
   `IsRaceClassValid` accepts the pairs that `playercreateinfo` allows.
 - `patch-B.MPQ`: `Interface\GlueXML\CoACustomRaces.lua` and a `CharacterCreate.xml` that loads it and adds race
-  buttons 12 to 16. The overlay raises `MAX_RACES` to 16, lays the buttons out in an Alliance and a Horde column,
+  buttons 12 to 17. The overlay raises `MAX_RACES` to 17, lays the buttons out in an Alliance and a Horde column,
   uses the races' `Interface\Icons` portraits, shows the base race's background model, and tolerates races without
   flavor text. It also gives the new races their base race's glue music, fog and lights.
 - `patch-B.MPQ` also gets `Interface\FrameXML\CoACustomRaces.lua`, loaded from `FrameXML.toc`, which gives the new
@@ -63,5 +71,8 @@ python tools/package_custom_races_client.py `
   --mpqcli "F:/CoA/tools/mpqcli-windows-x86_64.exe"
 ```
 
-The tool refuses a client that already has these edits, reads every member back and writes
-`custom-races-client.json` with the hashes. A client without the archives does not list the races.
+The tool refuses a client that already has these edits, so build from the original archives (on the live PC,
+`F:\CoA\patches\client-backup-20261123`). It reads every member back and writes `custom-races-client.json` with the
+hashes. `server-dbc/` holds the `CharStartOutfit.dbc` and `CharSections.dbc` the server needs in its `DataDir/dbc`;
+the server checks a new character's appearance against `CharSections`. A client without the archives does not list
+the races.
