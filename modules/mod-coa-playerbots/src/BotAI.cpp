@@ -298,6 +298,10 @@ struct BotAIState
     // it started; the 1 s target-scan throttle and whether the last scan found a target.
     ObjectGuid huntSkinGuid;
     uint32 huntSkinStartMs = 0;
+    // The corpse the last Skinning attempts failed on (interrupted, or refused by CheckCast) and how
+    // many in a row: a corpse is given up only after HUNT_SKIN_MAX_ATTEMPTS, not on the first miss.
+    ObjectGuid huntSkinFailGuid;
+    uint32 huntSkinFailCount = 0;
     uint32 nextHuntScanMs = 0;
     bool huntLastScanFound = false;
 
@@ -4431,6 +4435,7 @@ constexpr uint32 HUNT_MAX_LEVEL_ABOVE = 3;      // never pick a fight further ab
 constexpr uint32 HUNT_SCAN_INTERVAL_MS = 1000;
 constexpr uint32 HUNT_SKIN_CAST_TIMEOUT_MS = 10000;
 constexpr uint32 HUNT_SKIN_IGNORE_MS = 120000;
+constexpr uint32 HUNT_SKIN_MAX_ATTEMPTS = 3;
 
 // Same formula as Spell::EffectSkinning's reqValue.
 uint32 HuntSkinSkillNeeded(uint32 creatureLevel)
@@ -4462,15 +4467,23 @@ uint32 FindSkinningSpell(Player* bot)
 class HuntTargetCheck
 {
 public:
-    HuntTargetCheck(Player const* bot, BotMgr::GatherSourceInfo const& info, bool canSkin, float range, uint32 maxLevel)
-        : _bot(bot), _info(info), _canSkin(canSkin), _range(range), _maxLevel(maxLevel) { }
+    // skinSkill: the bot's Skinning value, or -1 when it cannot skin. skinOnly: accept only creatures
+    // whose hide this bot can open (the preferred pass; corpse-drop sources are the fallback).
+    HuntTargetCheck(Player const* bot, BotMgr::GatherSourceInfo const& info, int32 skinSkill, bool skinOnly,
+        float range, uint32 maxLevel)
+        : _bot(bot), _info(info), _skinSkill(skinSkill), _skinOnly(skinOnly), _range(range), _maxLevel(maxLevel) { }
 
     bool operator()(Creature* c)
     {
         if (!c || !c->IsAlive() || c->IsInEvadeMode())
             return false;
         uint32 const entry = c->GetEntry();
-        if (!_info.huntCorpseEntries.count(entry) && !(_canSkin && _info.huntSkinEntries.count(entry)))
+        // A hide source counts only when the bot's Skinning can open it once it is dead: killing
+        // beasts above the skill never yielded a single hide and kept the order "hunting" forever.
+        bool const skinSource = _skinSkill >= 0 && _info.huntSkinEntries.count(entry) &&
+            int32(HuntSkinSkillNeeded(c->GetLevel())) <= _skinSkill;
+        bool const corpseSource = !_skinOnly && _info.huntCorpseEntries.count(entry);
+        if (!skinSource && !corpseSource)
             return false;
         if (c->GetLevel() > _maxLevel)
             return false;
@@ -4489,7 +4502,8 @@ public:
 private:
     Player const* _bot;
     BotMgr::GatherSourceInfo const& _info;
-    bool _canSkin;
+    int32 _skinSkill;
+    bool _skinOnly;
     float _range;
     uint32 _maxLevel;
 };
@@ -4527,6 +4541,92 @@ private:
     float _range;
 };
 
+// Our own kill of a hide source that never became skinnable because loot is still on it (a drop
+// that did not fit in the bags, a unique item already carried): AllLootRemovedFromCorpse only runs
+// once the corpse loot is empty, so such a corpse could never be skinned.
+class HuntBlockedCorpseCheck
+{
+public:
+    HuntBlockedCorpseCheck(Player const* bot, BotAIState const& state, BotMgr::GatherSourceInfo const& info,
+        uint32 skill, float range)
+        : _bot(bot), _state(state), _info(info), _skill(skill), _range(range) { }
+
+    bool operator()(Creature* c)
+    {
+        if (!c || c->IsAlive() || c->HasUnitFlag(UNIT_FLAG_SKINNABLE) || c->loot.isLooted())
+            return false;
+        if (c->loot.loot_type == LOOT_SKINNING || !c->GetCreatureTemplate()->SkinLootId)
+            return false;
+        if (!_info.huntSkinEntries.count(c->GetEntry()))
+            return false;
+        if (c->GetLootRecipientGUID() != _bot->GetGUID())
+            return false;
+        if (HuntSkinSkillNeeded(c->GetLootSkillLevelFor(_bot)) > _skill)
+            return false;
+        auto const& pending = _state.pendingLootGuids;
+        if (std::find(pending.begin(), pending.end(), c->GetGUID()) != pending.end())
+            return false; // TryProcessPendingLoot has not had its turn yet
+        if (!_bot->IsWithinDistInMap(c, _range))
+            return false;
+        if (IsIgnoredTarget(_bot->GetGUID(), c->GetGUID()))
+            return false;
+        _range = _bot->GetDistance(c);
+        return true;
+    }
+
+private:
+    Player const* _bot;
+    BotAIState const& _state;
+    BotMgr::GatherSourceInfo const& _info;
+    uint32 _skill;
+    float _range;
+};
+
+// Loots what still fits, then leaves the rest so the corpse turns skinnable the same way
+// WorldSession::DoLootRelease does for an emptied corpse.
+void ClearBlockedHuntCorpse(Player* bot, Creature* corpse)
+{
+    WorldPacket openPacket;
+    openPacket << corpse->GetGUID();
+    bot->GetSession()->HandleLootOpcode(openPacket);
+    if (bot->GetLootGUID() == corpse->GetGUID())
+    {
+        BotAI::TakeAllLoot(bot, corpse->loot);
+        if (corpse->loot.gold)
+        {
+            WorldPacket moneyPacket;
+            bot->GetSession()->HandleLootMoneyOpcode(moneyPacket);
+        }
+        WorldPacket releasePacket;
+        releasePacket << corpse->GetGUID();
+        bot->GetSession()->HandleLootReleaseOpcode(releasePacket);
+    }
+    if (corpse->HasUnitFlag(UNIT_FLAG_SKINNABLE))
+        return;
+    LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()),
+        "BotAI: bot '{}' left {} unlootable item(s) on '{}' to skin it.", bot->GetName(), corpse->loot.unlootedCount,
+        corpse->GetName());
+    corpse->AllLootRemovedFromCorpse();
+    corpse->RemoveDynamicFlag(UNIT_DYNFLAG_LOOTABLE);
+    corpse->loot.clear();
+}
+
+// A Skinning attempt on `corpse` that did not open it: retried up to HUNT_SKIN_MAX_ATTEMPTS, then
+// the corpse is given up for HUNT_SKIN_IGNORE_MS.
+void NoteHuntSkinFailure(Player* bot, BotAIState& state, ObjectGuid corpse)
+{
+    if (state.huntSkinFailGuid != corpse)
+    {
+        state.huntSkinFailGuid = corpse;
+        state.huntSkinFailCount = 0;
+    }
+    if (++state.huntSkinFailCount < HUNT_SKIN_MAX_ATTEMPTS)
+        return;
+    IgnoreTargetFor(bot->GetGUID(), corpse, HUNT_SKIN_IGNORE_MS);
+    state.huntSkinFailGuid = ObjectGuid::Empty;
+    state.huntSkinFailCount = 0;
+}
+
 // Returns true when the hunt did something this tick (skinning, walking to a corpse, a fight
 // started, or a scan that found something within the last second), false when nothing matching
 // is around -- the caller counts that toward GUILD_GATHER_RETELEPORT_MS. Corpse looting itself is
@@ -4549,9 +4649,13 @@ bool TryHuntForOrder(Player* bot, uint32 diff, BotAIState& state, BotMgr::Gather
             WorldPacket releasePacket;
             releasePacket << corpseGuid;
             bot->GetSession()->HandleLootReleaseOpcode(releasePacket);
+            state.huntSkinFailGuid = ObjectGuid::Empty;
+            state.huntSkinFailCount = 0;
             LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotAI: bot '{}' skinned '{}' for a guild order.",
                 bot->GetName(), corpse->GetName());
         }
+        else if (corpse && corpse->HasUnitFlag(UNIT_FLAG_SKINNABLE))
+            NoteHuntSkinFailure(bot, state, corpseGuid); // interrupted (a mob, a knock-back): try again
         else
             IgnoreTargetFor(bot->GetGUID(), corpseGuid, HUNT_SKIN_IGNORE_MS);
         return true;
@@ -4562,9 +4666,30 @@ bool TryHuntForOrder(Player* bot, uint32 diff, BotAIState& state, BotMgr::Gather
 
     uint32 const skinSpell = info.huntSkinEntries.empty() ? 0 : FindSkinningSpell(bot);
 
-    // 2. Skin our own looted corpses before looking for the next fight.
+    // 2. Skin our own looted corpses before looking for the next fight; first free the ones whose
+    //    leftover loot keeps them from becoming skinnable.
     if (skinSpell)
     {
+        Creature* blocked = nullptr;
+        HuntBlockedCorpseCheck blockedCheck(bot, state, info, bot->GetSkillValue(SKILL_SKINNING),
+            HUNT_SKIN_SEARCH_RADIUS);
+        Acore::CreatureLastSearcher<HuntBlockedCorpseCheck> blockedSearcher(bot, blocked, blockedCheck);
+        Cell::VisitObjects(bot, blockedSearcher, HUNT_SKIN_SEARCH_RADIUS);
+        if (blocked)
+        {
+            if (!bot->IsWithinLootDistance(blocked))
+            {
+                MoveBotToPoint(bot, MoveOwner::Gather, blocked->GetPositionX(), blocked->GetPositionY(),
+                    blocked->GetPositionZ());
+                return true;
+            }
+            BotMovement::ForceReleaseOwner(bot, MoveOwner::Gather);
+            ClearBlockedHuntCorpse(bot, blocked);
+            if (!blocked->HasUnitFlag(UNIT_FLAG_SKINNABLE))
+                IgnoreTargetFor(bot->GetGUID(), blocked->GetGUID(), HUNT_SKIN_IGNORE_MS);
+            return true;
+        }
+
         Creature* corpse = nullptr;
         HuntSkinCheck check(bot, info, bot->GetSkillValue(SKILL_SKINNING), HUNT_SKIN_SEARCH_RADIUS);
         Acore::CreatureLastSearcher<HuntSkinCheck> searcher(bot, corpse, check);
@@ -4584,7 +4709,11 @@ bool TryHuntForOrder(Player* bot, uint32 diff, BotAIState& state, BotMgr::Gather
                 return true;
             }
             if (bot->IsMounted())
+            {
                 BotMovement::RequestDismount(bot, MoveOwner::Gather, DismountReason::ActionForbidden);
+                return true; // CheckCast refuses Skinning while mounted
+            }
+            bot->SetFacingToObject(corpse);
             SpellCastResult const result = bot->CastSpell(corpse, skinSpell, false);
             if (result == SPELL_CAST_OK)
             {
@@ -4593,7 +4722,7 @@ bool TryHuntForOrder(Player* bot, uint32 diff, BotAIState& state, BotMgr::Gather
             }
             else
             {
-                IgnoreTargetFor(bot->GetGUID(), corpse->GetGUID(), HUNT_SKIN_IGNORE_MS);
+                NoteHuntSkinFailure(bot, state, corpse->GetGUID());
                 LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotAI: bot '{}' failed Skinning ({}) on '{}' (result {}).",
                     bot->GetName(), skinSpell, corpse->GetName(), uint32(result));
             }
@@ -4609,10 +4738,22 @@ bool TryHuntForOrder(Player* bot, uint32 diff, BotAIState& state, BotMgr::Gather
     }
     state.nextHuntScanMs = HUNT_SCAN_INTERVAL_MS;
 
+    // Hides the bot can skin come first (a guaranteed skin roll per kill); corpse drops after.
     Creature* target = nullptr;
-    HuntTargetCheck check(bot, info, skinSpell != 0, HUNT_SEARCH_RADIUS, bot->GetLevel() + HUNT_MAX_LEVEL_ABOVE);
-    Acore::CreatureLastSearcher<HuntTargetCheck> searcher(bot, target, check);
-    Cell::VisitObjects(bot, searcher, HUNT_SEARCH_RADIUS);
+    int32 const skinSkill = skinSpell ? int32(bot->GetSkillValue(SKILL_SKINNING)) : -1;
+    uint32 const maxLevel = bot->GetLevel() + HUNT_MAX_LEVEL_ABOVE;
+    if (skinSkill >= 0)
+    {
+        HuntTargetCheck skinCheck(bot, info, skinSkill, true, HUNT_SEARCH_RADIUS, maxLevel);
+        Acore::CreatureLastSearcher<HuntTargetCheck> skinSearcher(bot, target, skinCheck);
+        Cell::VisitObjects(bot, skinSearcher, HUNT_SEARCH_RADIUS);
+    }
+    if (!target && !info.huntCorpseEntries.empty())
+    {
+        HuntTargetCheck check(bot, info, skinSkill, false, HUNT_SEARCH_RADIUS, maxLevel);
+        Acore::CreatureLastSearcher<HuntTargetCheck> searcher(bot, target, check);
+        Cell::VisitObjects(bot, searcher, HUNT_SEARCH_RADIUS);
+    }
     state.huntLastScanFound = target != nullptr;
     if (!target)
         return false;

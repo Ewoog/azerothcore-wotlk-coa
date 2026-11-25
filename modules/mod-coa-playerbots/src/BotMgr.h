@@ -232,6 +232,7 @@ public:
         uint16 mapId = 0;
         float x = 0.0f, y = 0.0f, z = 0.0f;
         uint8 minLevel = 1, maxLevel = 1;
+        bool skinOnly = false;     // only its skinning loot carries the item: needs the Skinning skill
     };
     struct GatherSourceInfo
     {
