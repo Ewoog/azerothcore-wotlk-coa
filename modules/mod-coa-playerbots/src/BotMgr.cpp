@@ -5103,29 +5103,35 @@ namespace
     constexpr uint32 STANDING_MAIL_INTERVAL_MS = 5 * MINUTE * IN_MILLISECONDS;
 }
 
-void BotMgr::SetStandingRule(Player* owner, uint32 itemEntry, bool toGuildBank, bool enabled)
+void BotMgr::SetStandingRule(Player* owner, uint32 itemEntry, bool toGuildBank, bool enabled,
+    ObjectGuid::LowType recipientLow)
 {
     if (!owner || !owner->GetSession() || !itemEntry || !sObjectMgr->GetItemTemplate(itemEntry))
         return;
-    StandingRules& rules = _standingRules[owner->GetGUID().GetCounter()];
-    rules.accountId = owner->GetSession()->GetAccountId();
+    uint32 const accountId = owner->GetSession()->GetAccountId();
+    auto& rules = _standingRulesByAccount[accountId];
     if (enabled)
-        rules.toGuildBankByItem[itemEntry] = toGuildBank;
+    {
+        ObjectGuid const recipientGuid = ObjectGuid::Create<HighGuid::Player>(recipientLow);
+        if (!recipientLow || sCharacterCache->GetCharacterAccountIdByGuid(recipientGuid) != accountId)
+            recipientLow = owner->GetGUID().GetCounter();
+        rules[itemEntry] = { toGuildBank, recipientLow };
+    }
     else
-        rules.toGuildBankByItem.erase(itemEntry);
-    if (rules.toGuildBankByItem.empty())
-        _standingRules.erase(owner->GetGUID().GetCounter());
+        rules.erase(itemEntry);
+    if (rules.empty())
+        _standingRulesByAccount.erase(accountId);
 }
 
 void BotMgr::ClearStandingRules(Player* owner)
 {
-    if (owner)
-        _standingRules.erase(owner->GetGUID().GetCounter());
+    if (owner && owner->GetSession())
+        _standingRulesByAccount.erase(owner->GetSession()->GetAccountId());
 }
 
 void BotMgr::UpdateStandingRules(uint32 diff)
 {
-    if (_standingRules.empty())
+    if (_standingRulesByAccount.empty())
         return;
     _standingTimerMs += diff;
     if (_standingTimerMs < STANDING_BANK_INTERVAL_MS)
@@ -5138,41 +5144,34 @@ void BotMgr::UpdateStandingRules(uint32 diff)
         Player* bot = session ? session->GetPlayer() : nullptr;
         if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->GetTradeData())
             continue;
+        auto const rules = _standingRulesByAccount.find(session->GetAccountId());
+        if (rules == _standingRulesByAccount.end())
+            continue;
 
         uint32 orderItem = 0;
         GetGatherOrderItem(bot->GetGUID(), &orderItem);
-        for (auto const& [ownerLow, rules] : _standingRules)
+        auto mailAt = _standingMailAtMs.find(bot->GetGUID());
+        bool const mailDue = mailAt == _standingMailAtMs.end() || getMSTimeDiff(mailAt->second, now) >= STANDING_MAIL_INTERVAL_MS;
+        for (auto const& [itemEntry, rule] : rules->second)
         {
-            if (rules.accountId != session->GetAccountId() || ownerLow == bot->GetGUID().GetCounter())
+            if (itemEntry == orderItem || !bot->GetItemCount(itemEntry, false))
                 continue;
-
-            auto mailAt = _standingMailAtMs.find(bot->GetGUID());
-            bool const mailDue = mailAt == _standingMailAtMs.end() || getMSTimeDiff(mailAt->second, now) >= STANDING_MAIL_INTERVAL_MS;
-            bool mailed = false;
-            for (auto const& [itemEntry, toGuildBank] : rules.toGuildBankByItem)
-            {
-                if (itemEntry == orderItem || !bot->GetItemCount(itemEntry, false))
-                    continue;
-                if (toGuildBank && !bot->GetGuild())
-                    continue;
-                if (!toGuildBank && !mailDue)
-                    continue;
-                uint32 moved = 0;
-                if (toGuildBank)
-                    SendItemToCommander(bot, bot, itemEntry, 0, true, moved);
-                else if (!BotAI::IsProfessionTool(sObjectMgr->GetItemTemplate(itemEntry)))
-                {
-                    moved = MailGatherItems(bot, ownerLow, itemEntry, bot->GetItemCount(itemEntry, false),
-                        bot->GetName() + " sent this on your standing mail rule.");
-                    mailed = mailed || moved > 0;
-                }
-                if (moved)
-                    LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotMgr: standing rule -- bot '{}' {} {}x item {} for owner {}.",
-                        bot->GetName(), toGuildBank ? "banked" : "mailed", moved, itemEntry, ownerLow);
-            }
-            if (mailed || mailDue)
-                _standingMailAtMs[bot->GetGUID()] = now;
+            if (rule.toGuildBank && !bot->GetGuild())
+                continue;
+            if (!rule.toGuildBank && (!mailDue || rule.recipientLow == bot->GetGUID().GetCounter()))
+                continue;
+            uint32 moved = 0;
+            if (rule.toGuildBank)
+                SendItemToCommander(bot, bot, itemEntry, 0, true, moved);
+            else if (!BotAI::IsProfessionTool(sObjectMgr->GetItemTemplate(itemEntry)))
+                moved = MailGatherItems(bot, rule.recipientLow, itemEntry, bot->GetItemCount(itemEntry, false),
+                    bot->GetName() + " sent this on your standing mail rule.");
+            if (moved)
+                LOG_DEBUG(BotAI::BotDebugLog::LoggerName(bot->GetGUID()), "BotMgr: standing rule -- bot '{}' {} {}x item {} for {}.",
+                    bot->GetName(), rule.toGuildBank ? "banked" : "mailed", moved, itemEntry, rule.recipientLow);
         }
+        if (mailDue)
+            _standingMailAtMs[bot->GetGUID()] = now;
     }
 }
 

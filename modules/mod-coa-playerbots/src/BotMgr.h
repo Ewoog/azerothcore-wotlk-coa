@@ -132,11 +132,13 @@ public:
     std::string OfferTrade(Player* bot, Player* commander, uint32 itemEntry, uint32 count);
 
     // Standing send rules (AltBots Rules tab, COABOT RULE / RULECLEAR): while a rule is on, every
-    // online bot on the owner's account keeps sending that item to the owner -- by mail every
-    // STANDING_MAIL_INTERVAL, or into the bot's guild bank every STANDING_BANK_INTERVAL. Rules live
-    // in memory; the addon sends them again at login. Unbound stacks only, never profession tools,
-    // and not the item of the bot's own running gather order.
-    void SetStandingRule(Player* owner, uint32 itemEntry, bool toGuildBank, bool enabled);
+    // online bot on the owner's account keeps sending that item -- by mail to the rule's recipient
+    // (a character on the same account) every STANDING_MAIL_INTERVAL, or into the bot's guild bank
+    // every STANDING_BANK_INTERVAL. Rules are per account and live in memory; the addon sends them
+    // again at login. Unbound stacks only, never profession tools, and not the item of the bot's own
+    // running gather order.
+    void SetStandingRule(Player* owner, uint32 itemEntry, bool toGuildBank, bool enabled,
+        ObjectGuid::LowType recipientLow = 0);
     void ClearStandingRules(Player* owner);
 
     struct GuildGatherOrder
@@ -794,12 +796,12 @@ private:
     std::unordered_map<ObjectGuid, TradeOffer> _tradeOffers;
     void UpdateTradeOffers(uint32 diff);
 
-    struct StandingRules
+    struct StandingRule
     {
-        uint32 accountId = 0;
-        std::unordered_map<uint32, bool> toGuildBankByItem;
+        bool toGuildBank = false;
+        ObjectGuid::LowType recipientLow = 0;
     };
-    std::unordered_map<ObjectGuid::LowType, StandingRules> _standingRules;
+    std::unordered_map<uint32, std::unordered_map<uint32, StandingRule>> _standingRulesByAccount;
     std::unordered_map<ObjectGuid, uint32> _standingMailAtMs;
     uint32 _standingTimerMs = 0;
     void UpdateStandingRules(uint32 diff);

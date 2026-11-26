@@ -1022,7 +1022,8 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
     }
 
     // AltBots standing rules (Rules tab), for every bot on the sender's account:
-    //   RULE:0:<itemEntry>:<mail|bank|off>   RULECLEAR:0
+    //   RULE:0:<itemEntry>:<mail|bank|off>[:<recipientGuidLow>]   RULECLEAR:0
+    // A mail rule goes to the recipient when it is a character on the sender's account, else to the sender.
     if (verb == "RULECLEAR")
     {
         sBotMgr->ClearStandingRules(commander);
@@ -1032,8 +1033,10 @@ void HandleCoaBotMessage(Player* commander, std::string const& body)
     {
         uint32 const itemEntry = std::strtoul(parts[2].c_str(), nullptr, 10);
         bool const off = parts[3] == "off";
-        sBotMgr->SetStandingRule(commander, itemEntry, parts[3] == "bank", !off);
-        LOG_INFO("module.coa-playerbots", "BotAddonChat: '{}' -> RULE item {} {}.", commander->GetName(), itemEntry, parts[3]);
+        ObjectGuid::LowType const recipientLow = parts.size() >= 5 ? std::strtoul(parts[4].c_str(), nullptr, 10) : 0;
+        sBotMgr->SetStandingRule(commander, itemEntry, parts[3] == "bank", !off, recipientLow);
+        LOG_INFO("module.coa-playerbots", "BotAddonChat: '{}' -> RULE item {} {} to {}.", commander->GetName(), itemEntry,
+            parts[3], recipientLow);
         return;
     }
 

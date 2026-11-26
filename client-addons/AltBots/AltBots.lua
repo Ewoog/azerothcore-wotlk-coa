@@ -8,8 +8,8 @@
 -- your group, and live health, power and range cards. Materials: farm a material (a gather
 -- order delivered by mail or to the guild bank), or mail/bank it now.
 -- Party tab bags: left-click an item to trade it to you, mail it, bank it or farm more of it.
--- Rules tab: standing rules ("keep mailing/banking this item") for every alt on your account;
--- sent to the server at login and on every change (RULECLEAR / RULE).
+-- Rules tab: standing rules ("keep mailing/banking this item") shared by every character on the realm,
+-- each mail rule with its own receiver; sent to the server at login and on every change (RULECLEAR / RULE).
 -- Quick bar and key bindings (Bindings.xml): the same orders for every grouped alt.
 -- Quests tab: each bot's quest log, an All bots view that shows who is missing which
 -- quest, a filter, and Share quests (SHAREQUESTS) for your own alts.
@@ -105,7 +105,7 @@ local DB_VERSION = 2
 local SETTING_KEYS = {
     version = true, realms = true, farmRadius = true, minimapAngle = true, minimapHidden = true, tab = true,
     winPos = true, quickBarPos = true, quickBar = true, scale = true, matDeliver = true, matCount = true, sendRules = true,
-    winHeight = true,
+    winHeight = true, standingRules = true,
 }
 local SYNC_DELAY, SYNC_TIMEOUT, SYNC_REFRESH = 3, 8, 60
 
@@ -449,6 +449,7 @@ local function HandleIncoming(body)
         altSync.state = "done"
         ApplyAltSync(altSync.list)
         altSync.list = nil
+        SyncRules()
         if OnAltsChanged then OnAltsChanged() end
         return
 
@@ -1817,7 +1818,7 @@ EnsureWindow = function()
         { id = "commands", label = "Commands", tip = "Orders, plus live health, mana and range of grouped alts." },
         { id = "party", label = "Party", tip = "Role, spec, gear, professions and bags of grouped bots." },
         { id = "quests", label = "Quests", tip = "Each grouped bot's quest log, or all of them side by side." },
-        { id = "rules", label = "Rules", tip = "Standing rules: your alts keep mailing or banking the items you list while a rule is on." },
+        { id = "rules", label = "Rules", tip = "Standing rules, the same on every character: your alts keep mailing the items you list to the receiver you pick, or banking them." },
     }) do
         local t = W.MakeTab(nav, info.label)
         if prevTab then t:SetPoint("LEFT", prevTab, "RIGHT", 2, 0) else t:SetPoint("BOTTOMLEFT", 8, 0) end
@@ -3395,18 +3396,100 @@ function W.QuestStateText(q)
     return st[1], st
 end
 
-function W.MyRules()
-    AltBotsDB.sendRules = AltBotsDB.sendRules or {}
-    local key = Realm() .. "-" .. (UnitName("player") or "?")
-    AltBotsDB.sendRules[key] = AltBotsDB.sendRules[key] or {}
-    return AltBotsDB.sendRules[key]
+local RULE_TO_BANK_TEXT = "Alt's guild bank"
+
+function W.FindRule(rules, id)
+    for _, rule in ipairs(rules) do
+        if rule.id == id then return rule end
+    end
+    return nil
+end
+
+function W.AdoptCharacterRules(rules, realm)
+    local prefix = realm .. "-"
+    for key, list in pairs(AltBotsDB.sendRules) do
+        if type(key) == "string" and string.sub(key, 1, #prefix) == prefix then
+            local owner = string.sub(key, #prefix + 1)
+            if type(list) == "table" then
+                for _, rule in ipairs(list) do
+                    if tonumber(rule.id) and not W.FindRule(rules, rule.id) then
+                        table.insert(rules, { id = rule.id, mode = rule.mode, on = rule.on, to = owner })
+                    end
+                end
+            end
+            AltBotsDB.sendRules[key] = nil
+        end
+    end
+    if not next(AltBotsDB.sendRules) then AltBotsDB.sendRules = nil end
+end
+
+function W.StandingRules()
+    AltBotsDB.standingRules = AltBotsDB.standingRules or {}
+    local realm = Realm()
+    local rules = AltBotsDB.standingRules[realm]
+    if not rules then
+        rules = {}
+        AltBotsDB.standingRules[realm] = rules
+    end
+    if type(AltBotsDB.sendRules) == "table" then W.AdoptCharacterRules(rules, realm) end
+    return rules
+end
+
+function W.RuleRecipient(rule)
+    return rule.to or UnitName("player")
+end
+
+function W.RecipientNames()
+    local names = {}
+    for n in pairs(Alts()) do table.insert(names, n) end
+    table.sort(names)
+    return names
+end
+
+function W.ShowRecipientPicker(anchor, onPick)
+    local entries = {}
+    for _, n in ipairs(W.RecipientNames()) do
+        local name = n
+        table.insert(entries, { text = W.AltName(name, Alts()[name]), func = function() onPick(name) end })
+    end
+    if #entries == 0 then
+        table.insert(entries, { text = "No saved alts yet", disabled = true })
+    end
+    W.ShowPopup(anchor, entries)
 end
 
 SyncRules = function()
     Queue({ addon = "RULECLEAR:0" })
-    for _, rule in ipairs(W.MyRules()) do
-        if rule.on then Queue({ addon = "RULE:0:" .. rule.id .. ":" .. (rule.mode == "bank" and "bank" or "mail") }) end
+    for _, rule in ipairs(W.StandingRules()) do
+        if rule.on then
+            local bank = rule.mode == "bank"
+            local to = bank and 0 or AltGuid(W.RuleRecipient(rule))
+            if to then
+                Queue({ addon = "RULE:0:" .. rule.id .. ":" .. (bank and "bank" or "mail") .. ":" .. to })
+            end
+        end
     end
+end
+
+function W.MakeRecipientBox(parent, onPick)
+    local box = W.MakeEditBox(parent, 120, 24)
+    box.placeholder = box:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
+    box.placeholder:SetPoint("LEFT", 8, 0)
+    box.placeholder:SetText("Receiver")
+    W.TextColor(box.placeholder, C.faint)
+    box.pick = W.MakeIconBtn(parent, 24, "Interface\\ChatFrame\\UI-ChatIcon-ScrollDown-Up", "Pick the receiver",
+        "Choose which of your characters gets the mail.", function(self) W.ShowRecipientPicker(self, onPick) end)
+    box.pick:SetPoint("LEFT", box, "RIGHT", 2, 0)
+    box:SetScript("OnEnter", function(self)
+        W.Tip(self, "Receiver", "The character this item is mailed to. Type one of your characters' names, "
+            .. "or pick one with the arrow.")
+    end)
+    box:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    return box
+end
+
+function W.SetRecipientShown(box, shown)
+    if shown then box:Show(); box.pick:Show() else box:ClearFocus(); box:Hide(); box.pick:Hide() end
 end
 
 function W.MakeRuleRow(parent)
@@ -3417,21 +3500,48 @@ function W.MakeRuleRow(parent)
     row.item:SetPoint("LEFT", 4, 0)
     row.name = row:CreateFontString(nil, "OVERLAY", "AltBotsFontBody")
     row.name:SetPoint("LEFT", row.item, "RIGHT", 8, 0)
-    row.name:SetWidth(300)
+    row.name:SetWidth(216)
     row.name:SetJustifyH("LEFT")
     row.remove = W.MakeTextBtn(row, 64, 24, "Remove")
     row.remove:SetPoint("RIGHT", -6, 0)
     row.toggle = W.MakeTextBtn(row, 64, 24, "")
     row.toggle:SetPoint("RIGHT", row.remove, "LEFT", -6, 0)
-    row.mode = W.MakeTextBtn(row, 96, 24, "")
-    row.mode:SetPoint("RIGHT", row.toggle, "LEFT", -6, 0)
+    row.to = W.MakeRecipientBox(row, function(name) if row.onPick then row.onPick(name) end end)
+    row.to.pick:SetPoint("RIGHT", row.toggle, "LEFT", -6, 0)
+    row.to:ClearAllPoints()
+    row.to:SetPoint("RIGHT", row.to.pick, "LEFT", -2, 0)
+    row.bankText = row:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
+    row.bankText:SetPoint("LEFT", row.to, "LEFT", 8, 0)
+    row.bankText:SetText(RULE_TO_BANK_TEXT)
+    W.TextColor(row.bankText, C.muted)
+    row.mode = W.MakeTextBtn(row, 88, 24, "")
+    row.mode:SetPoint("RIGHT", row.to, "LEFT", -6, 0)
     return row
 end
 
+function W.SetRuleRecipient(rule, text)
+    local name = ResolveAlt(text)
+    if not name then
+        Print("'" .. tostring(text) .. "' is not one of your saved characters. Log into it once, or pick one from the list.")
+        RefreshRules()
+        return
+    end
+    if rule.to == name or (not rule.to and name == UnitName("player")) then return end
+    rule.to = name
+    SyncRules(); RefreshRules()
+    SetStatus(ItemLabel(rule.id) .. ": mailed to " .. name .. ".")
+end
+
 RefreshRules = function()
-    if not win or not ui.rulesChild then return end
+    if not win or not ui.rulesChild or ui.refreshingRules then return end
+    ui.refreshingRules = true
+    W.FillRuleRows()
+    ui.refreshingRules = nil
+end
+
+function W.FillRuleRows()
     W.HidePool(ui.pools.ruleRows)
-    local rules = W.MyRules()
+    local rules = W.StandingRules()
     if #rules == 0 then
         ui.rulesEmpty:Show()
         ui.rulesChild:SetHeight(1)
@@ -3444,18 +3554,29 @@ RefreshRules = function()
         row:ClearAllPoints()
         row:SetPoint("TOPLEFT", 0, y)
         local r, index = rule, i
+        local bank = r.mode == "bank"
+        local to = W.RuleRecipient(r)
+        local known = AltGuid(to) ~= nil
         W.SetItemIcon(row.item, r.id)
         row.item.count:SetText("")
         row.item:SetScript("OnEnter", function(self) W.ShowItemTip(self, r.id) end)
         row.name:SetText(ItemLabel(r.id))
         W.TextColor(row.name, r.on and C.text or C.faint)
-        row.mode:SetText(r.mode == "bank" and "Guild bank" or "Mail to me")
-        W.HookTip(row.mode, "Where it goes", "Mail: every 5 minutes your alts mail what they carry of it to you. "
-            .. "Guild bank: every 30 seconds they deposit it in their guild bank (alts without a guild skip it). Click to switch.")
+        row.mode:SetText(bank and "Guild bank" or "Mail")
+        W.HookTip(row.mode, "Where it goes", "Mail: every 5 minutes your alts mail what they carry of it to the receiver. "
+            .. "Guild bank: every 30 seconds they deposit it in their own guild bank (alts without a guild skip it). "
+            .. "Click to switch.")
         row.mode:SetScript("OnClick", function()
             r.mode = r.mode == "bank" and "mail" or "bank"
             SyncRules(); RefreshRules()
         end)
+        W.SetRecipientShown(row.to, not bank)
+        if bank then row.bankText:Show() else row.bankText:Hide() end
+        if not row.to:HasFocus() then row.to:SetText(to) end
+        row.to.placeholder:Hide()
+        W.TextColor(row.to, known and C.text or C.bad)
+        row.to.onCommit = function(box) W.SetRuleRecipient(r, box:GetText()) end
+        row.onPick = function(name) W.SetRuleRecipient(r, name) end
         row.toggle:SetText(r.on and "On" or "Off")
         row.toggle:SetActive(r.on)
         W.HookTip(row.toggle, "On or off", "Turn the rule on or off without removing it.")
@@ -3465,7 +3586,7 @@ RefreshRules = function()
             SetStatus(ItemLabel(r.id) .. (r.on and ": rule on." or ": rule off."))
         end)
         row.remove:SetScript("OnClick", function()
-            table.remove(W.MyRules(), index)
+            table.remove(W.StandingRules(), index)
             SyncRules(); RefreshRules()
         end)
         y = y - 40
@@ -3489,10 +3610,11 @@ BuildRulesPane = function(body)
     help:SetWidth(ROW_W)
     help:SetJustifyH("LEFT")
     W.TextColor(help, C.muted)
-    help:SetText("While a rule is on, every alt of yours that is spawned keeps sending that item: by mail to this character "
-        .. "every 5 minutes, or into its guild bank every 30 seconds. Soulbound items and profession tools are never sent.")
+    help:SetText("These rules are shared by every character on this realm. While a rule is on, every spawned alt keeps "
+        .. "sending that item: by mail to the receiver every 5 minutes, or into its own guild bank every 30 seconds. "
+        .. "Soulbound items and profession tools are never sent.")
 
-    local box = W.MakeEditBox(pane, 240, 24)
+    local box = W.MakeEditBox(pane, 220, 24)
     box:SetPoint("TOPLEFT", 0, -56)
     box.placeholder = box:CreateFontString(nil, "OVERLAY", "AltBotsFontSmall")
     box.placeholder:SetPoint("LEFT", 8, 0)
@@ -3502,50 +3624,79 @@ BuildRulesPane = function(body)
     table.insert(ui.linkBoxes, box)
 
     local mode = "mail"
-    local modeBtn = W.MakeTextBtn(pane, 96, 24, "Mail to me")
+    local modeBtn = W.MakeTextBtn(pane, 88, 24, "Mail")
     modeBtn:SetPoint("LEFT", box, "RIGHT", 6, 0)
+    W.HookTip(modeBtn, "Where it goes", "Mail to the receiver, or the alt's own guild bank. Click to switch.")
+
+    local toBox = W.MakeRecipientBox(pane, function(name)
+        ui.newRuleToBox:SetText(name)
+        ui.newRuleToBox.placeholder:Hide()
+    end)
+    toBox:SetPoint("LEFT", modeBtn, "RIGHT", 6, 0)
+    toBox:SetText(UnitName("player") or "")
+    toBox.placeholder:Hide()
+    toBox.onCommit = function(self)
+        local text = self:GetText()
+        if text == "" then return end
+        local name = ResolveAlt(text)
+        if name then
+            self:SetText(name)
+        else
+            Print("'" .. text .. "' is not one of your saved characters. Log into it once, or pick one from the list.")
+        end
+    end
+    ui.newRuleToBox = toBox
+
     modeBtn:SetScript("OnClick", function(self)
         mode = mode == "bank" and "mail" or "bank"
-        self:SetText(mode == "bank" and "Guild bank" or "Mail to me")
+        self:SetText(mode == "bank" and "Guild bank" or "Mail")
+        W.SetRecipientShown(toBox, mode ~= "bank")
     end)
-    W.HookTip(modeBtn, "Where it goes", "Mail to this character, or the alt's guild bank. Click to switch.")
 
     local addBtn = W.MakeTextBtn(pane, 80, 24, "Add rule")
-    addBtn:SetPoint("LEFT", modeBtn, "RIGHT", 6, 0)
+    addBtn:SetPoint("LEFT", toBox.pick, "RIGHT", 6, 0)
     addBtn:SetScript("OnClick", function()
-        box:ClearFocus()
+        box:ClearFocus(); toBox:ClearFocus()
         local id = ItemIdFrom(box:GetText())
         if not id then
             Print("Shift-click an item link into the box, or type an item ID.")
             return
         end
-        local rules = W.MyRules()
-        for _, rule in ipairs(rules) do
-            if rule.id == id then
-                rule.mode, rule.on = mode, true
-                SyncRules(); RefreshRules()
+        local to
+        if mode ~= "bank" then
+            to = ResolveAlt(toBox:GetText())
+            if not to then
+                Print("Type or pick which of your characters receives the mail.")
                 return
             end
         end
-        table.insert(rules, { id = id, mode = mode, on = true })
+        local rules = W.StandingRules()
+        local rule = W.FindRule(rules, id)
+        if rule then
+            rule.mode, rule.on = mode, true
+            if to then rule.to = to end
+        else
+            table.insert(rules, { id = id, mode = mode, on = true, to = to or UnitName("player") })
+        end
         box:SetText("")
         if box.placeholder then box.placeholder:Show() end
         SyncRules(); RefreshRules()
-        SetStatus(ItemLabel(id) .. ": rule added.")
+        SetStatus(ItemLabel(id) .. (rule and ": rule updated." or ": rule added."))
     end)
 
-    local allOff = W.MakeTextBtn(pane, 80, 24, "All off")
+    local allOff = W.MakeTextBtn(pane, 64, 24, "All off")
     allOff:SetPoint("LEFT", addBtn, "RIGHT", 6, 0)
     W.HookTip(allOff, "All off", "Turn every rule off.")
     allOff:SetScript("OnClick", function()
-        for _, rule in ipairs(W.MyRules()) do rule.on = false end
+        for _, rule in ipairs(W.StandingRules()) do rule.on = false end
         SyncRules(); RefreshRules()
     end)
 
     ui.rulesEmpty = W.EmptyText(pane, "AltBotsFontBody")
     ui.rulesEmpty:SetPoint("CENTER", 0, -40)
     W.TextColor(ui.rulesEmpty, C.muted)
-    ui.rulesEmpty:SetText("No rules yet.\nShift-click an item into the box above, pick Mail or Guild bank, and press Add rule.")
+    ui.rulesEmpty:SetText("No rules yet.\nShift-click an item into the box above, pick Mail and a receiver or Guild bank, "
+        .. "and press Add rule.")
     local sf, child = W.MakeScroll("AltBotsRulesScroll", pane, ROW_W)
     sf:SetPoint("TOPLEFT", 0, -92)
     sf:SetPoint("BOTTOMRIGHT", -18, 0)
@@ -4122,6 +4273,7 @@ OnAltsChanged = function()
         W.UpdateHeaderSummary()
         if ui.activeTab == "alts" then RefreshAlts()
         elseif ui.activeTab == "commands" then RefreshCommands()
+        elseif ui.activeTab == "rules" then RefreshRules()
         end
     end
 end
