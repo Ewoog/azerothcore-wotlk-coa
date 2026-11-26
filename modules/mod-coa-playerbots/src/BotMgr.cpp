@@ -555,6 +555,7 @@ BotMgr::GatherSourceInfo BuildGatherSourceInfo(uint32 itemEntry)
         return info;
 
     std::unordered_map<uint32, std::pair<uint8, uint8>> levels; // creature entry -> min/max level
+    std::unordered_set<uint32> skinOnlyEntries;
     if (CreatureTemplateContainer const* templates = sObjectMgr->GetCreatureTemplates())
     {
         for (auto const& [entry, ct] : *templates)
@@ -573,6 +574,8 @@ BotMgr::GatherSourceInfo BuildGatherSourceInfo(uint32 itemEntry)
                 info.huntCorpseEntries.insert(entry);
             if (skin)
                 info.huntSkinEntries.insert(entry);
+            if (skin && !corpse)
+                skinOnlyEntries.insert(entry);
             levels[entry] = { ct.minlevel, ct.maxlevel };
         }
     }
@@ -592,6 +595,7 @@ BotMgr::GatherSourceInfo BuildGatherSourceInfo(uint32 itemEntry)
         spawn.z = data.posZ;
         spawn.minLevel = lv->second.first;
         spawn.maxLevel = std::max(lv->second.first, lv->second.second);
+        spawn.skinOnly = skinOnlyEntries.count(data.id) != 0;
         info.huntSpawns.push_back(spawn);
         if (!minLevel || spawn.minLevel < minLevel)
             minLevel = spawn.minLevel;
@@ -641,13 +645,25 @@ bool ResolveHuntLocation(BotMgr::GatherSourceInfo const& info, Player* bot, bool
         return true;
     };
 
-    for (int pass = 0; pass < 2; ++pass) // pass 1 drops the retry-avoid rule if it left nothing
+    // A hide source only helps a bot whose Skinning can open at least its lowest-level spawns:
+    // sending a skill-1 skinner to level-30 beasts killed them all and never got a hide.
+    uint32 const skinSkill = bot->HasSkill(SKILL_SKINNING) ? bot->GetSkillValue(SKILL_SKINNING) : 0;
+    auto skinnable = [&](BotMgr::HuntSpawn const& s)
     {
-        bool const useAvoid = pass == 0;
+        return !s.skinOnly || (bot->HasSkill(SKILL_SKINNING) && SkinningSkillForLevel(s.minLevel) <= skinSkill);
+    };
+
+    // Passes: avoid+skill, skill, avoid, nothing -- each drops a rule only when the stricter one left nothing.
+    for (int pass = 0; pass < 4; ++pass)
+    {
+        bool const useAvoid = pass == 0 || pass == 2;
+        bool const useSkill = pass < 2;
         std::vector<BotMgr::HuntSpawn const*> sameMap, otherMap, anyLevel;
         for (BotMgr::HuntSpawn const& s : info.huntSpawns)
         {
             if (useAvoid && avoided(s))
+                continue;
+            if (useSkill && !skinnable(s))
                 continue;
             anyLevel.push_back(&s);
             if (s.maxLevel > level + GATHER_LEVEL_TOLERANCE)
