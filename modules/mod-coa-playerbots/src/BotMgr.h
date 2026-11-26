@@ -219,6 +219,7 @@ public:
     // other Trade Goods to the guild bank, then (bank full) mails them to the requester. Returns
     // true when the item now fits.
     bool MakeRoomForGatherOrder(Player* bot);
+    void ClearBagsForGatherOrder(Player* bot, GuildGatherOrder& order, bool canMail);
 
     // Where an ordered item can come from, computed once per item from the world DB loot tables
     // and the in-memory spawn/template stores (see BuildGatherSourceInfo in BotMgr.cpp).
