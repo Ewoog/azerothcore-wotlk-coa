@@ -22,6 +22,7 @@
 #include "Player.h"
 #include "QuestDef.h"
 #include "ScriptMgr.h"
+#include "Spell.h"
 #include "StringFormat.h"
 #include "World.h"
 #include "WorldSession.h"
@@ -2170,10 +2171,61 @@ namespace BotMaintenance
         return result;
     }
 
+    // Quest-reward containers (Adventurer's Satchel, Cache, Rare Cache) opened through the same
+    // item script a player's right-click runs: rewards go straight to the bags, any overflow by mail.
+    constexpr uint32 ADVENTURER_CONTAINERS[] = { 1397884, 1397885, 1397886 };
+    // One container yields up to three stacks; keep this many general slots free after opening.
+    constexpr uint32 CACHE_OPEN_KEEP_FREE_SLOTS = 4;
+    constexpr uint32 CACHE_OPEN_SLOTS_PER_CACHE = 3;
+    constexpr uint32 CACHE_OPEN_MAX_PER_PASS = 5;
+
+    Item* FindAdventurerContainer(Player* bot)
+    {
+        for (uint32 entry : ADVENTURER_CONTAINERS)
+        {
+            for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+                if (Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                    if (item->GetEntry() == entry)
+                        return item;
+            for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+                if (Bag* bag = bot->GetBagByPos(bagSlot))
+                    for (uint32 slot = 0; slot < bag->GetBagSize(); ++slot)
+                        if (Item* item = bag->GetItemByPos(slot))
+                            if (item->GetEntry() == entry)
+                                return item;
+        }
+        return nullptr;
+    }
+
+    uint32 OpenAdventurerContainers(Player* bot)
+    {
+        if (!CanActOnBags(bot))
+            return 0;
+        uint32 opened = 0;
+        while (opened < CACHE_OPEN_MAX_PER_PASS &&
+            CountFreeGeneralSlotsLocal(bot) >= CACHE_OPEN_KEEP_FREE_SLOTS + CACHE_OPEN_SLOTS_PER_CACHE)
+        {
+            Item* container = FindAdventurerContainer(bot);
+            if (!container)
+                break;
+            uint32 const entry = container->GetEntry();
+            uint32 const before = bot->GetItemCount(entry);
+            SpellCastTargets targets;
+            if (!sScriptMgr->OnItemUse(bot, container, targets) || bot->GetItemCount(entry) >= before)
+                break; // no script answered, or it kept the container (combat, invalid rewards)
+            ++opened;
+        }
+        if (opened)
+            LOG_DEBUG("module.coa-playerbots", "BotMaintenance: '{}' opened {} adventurer container(s).", bot->GetName(),
+                opened);
+        return opened;
+    }
+
     void MaintainBags(Player* bot)
     {
         if (!_settings.cleanupEnable || !bot)
             return;
+        OpenAdventurerContainers(bot);
         Creature* vendor = FindAnyVendor(bot, 20.0f);
         CleanBags(bot, false, true, vendor, nullptr);
     }

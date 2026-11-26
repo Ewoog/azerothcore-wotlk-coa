@@ -49,6 +49,7 @@
 #include "Log.h"
 #include "LootMgr.h"
 #include "Mail.h"
+#include "BotMaintenance.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "PetDefines.h"
@@ -2562,11 +2563,14 @@ bool BotMgr::MakeRoomForGatherOrder(Player* bot)
     BotAI::PrepareBagsForTask(bot);
     if (roomy())
         return true;
+    BotMaintenance::CleanBags(bot, true, true, nullptr, nullptr);
+    if (roomy())
+        return true;
 
     // 2. Carried order items go to the guild bank now and count as banked progress (the update
     //    loop's deposit does the same; doing it here frees their slots before the next node).
     uint32 const carried = std::min(bot->GetItemCount(itemEntry, false), order.remainingCount);
-    if (carried && !order.bankBlocked)
+    if (carried && !order.mailToRequester)
     {
         uint32 const deposited = GuildDepositItem(bot->GetGUID().GetCounter(), itemEntry, carried, nullptr);
         if (deposited)
@@ -2647,8 +2651,101 @@ bool BotMgr::MakeRoomForGatherOrder(Player* bot)
                 "|cffffcc00Guild order #{}:|r the guild bank is full, so {} mailed you {} stack type(s) of other materials to keep bag space for {}.",
                 order.orderNo, bot->GetName(), sent, GatherItemName(itemEntry)));
     }
+    if (roomy())
+        return true;
+
+    // 5. Still full: the bags hold gear and odds and ends no sweep counted as junk (an order bot
+    //    never walks to a vendor). Tradeable blue items go to the requester's mailbox; everything
+    //    else is sold for its vendor price on the spot, cheapest first. Quest items, consumables,
+    //    bags, tools, materials, epics and the upgrade saved per slot are never touched.
+    ClearBagsForGatherOrder(bot, order, canMail);
     // "Room" for the order means the item fits; the 4-slot margin is best effort.
     return CanTakeOneMore(bot, itemEntry) && FreeGeneralBagSlots(bot) > 0;
+}
+
+void BotMgr::ClearBagsForGatherOrder(Player* bot, GuildGatherOrder& order, bool canMail)
+{
+    uint32 const itemEntry = order.itemEntry;
+    auto roomy = [&]()
+    {
+        return CanTakeOneMore(bot, itemEntry) && FreeGeneralBagSlots(bot) >= GATHER_ORDER_MIN_FREE_SLOTS;
+    };
+    BotAI::KeptUpgradeSet const kept = BotAI::KeptUpgrades(bot);
+
+    struct Candidate
+    {
+        Item* item;
+        uint64 value;
+        bool mailable;
+    };
+    std::vector<Candidate> candidates;
+    auto consider = [&](Item* item)
+    {
+        if (!item || item->IsNotEmptyBag() || item->IsRefundable() || item->IsEquipped() || BotGear::Archived(item))
+            return;
+        if (bot->GetLootGUID() == item->GetGUID() || bot->GetTradeData())
+            return;
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!proto || proto->ItemId == itemEntry || proto->Class == ITEM_CLASS_QUEST || proto->StartQuest ||
+            proto->Bonding == BIND_QUEST_ITEM || proto->Bonding == BIND_QUEST_ITEM1 ||
+            proto->Class == ITEM_CLASS_CONTAINER || proto->Class == ITEM_CLASS_QUIVER ||
+            proto->Class == ITEM_CLASS_CONSUMABLE || proto->Class == ITEM_CLASS_TRADE_GOODS ||
+            proto->Class == ITEM_CLASS_KEY || proto->Quality >= ITEM_QUALITY_EPIC || BotAI::IsProfessionTool(proto) ||
+            bot->HasQuestForItem(proto->ItemId, 0, true))
+            return;
+        if (BotEconomy::IsReservedItem(bot, item) || BotAI::IsKeptUpgrade(kept, item))
+            return;
+        bool const mailable = canMail && proto->Quality >= ITEM_QUALITY_RARE && !item->IsSoulBound() &&
+            !item->IsBoundAccountWide();
+        candidates.push_back({ item, uint64(proto->SellPrice) * item->GetCount(), mailable });
+    };
+    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        consider(bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+    for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
+        if (Bag* bag = bot->GetBagByPos(bagSlot))
+        {
+            ItemTemplate const* bagProto = bag->GetTemplate();
+            if (bagProto && bagProto->Class == ITEM_CLASS_CONTAINER && bagProto->SubClass != ITEM_SUBCLASS_CONTAINER)
+                continue;
+            for (uint32 slot = 0; slot < bag->GetBagSize(); ++slot)
+                consider(bag->GetItemByPos(slot));
+        }
+    if (candidates.empty())
+        return;
+    std::sort(candidates.begin(), candidates.end(),
+        [](Candidate const& a, Candidate const& b) { return a.value < b.value; });
+
+    uint32 mailed = 0, sold = 0;
+    uint64 copper = 0;
+    std::string mailedNames;
+    for (Candidate const& c : candidates)
+    {
+        if (roomy())
+            break;
+        std::string const name = c.item->GetTemplate()->Name1;
+        if (c.mailable)
+        {
+            MailCraftedItem(bot, order.requesterLowGuid, c.item, "Room for your guild order");
+            ++mailed;
+            if (mailedNames.size() < 120)
+                mailedNames += (mailedNames.empty() ? "" : ", ") + name;
+            continue;
+        }
+        copper += c.value;
+        bot->DestroyItem(c.item->GetBagSlot(), c.item->GetSlot(), true);
+        ++sold;
+    }
+    if (copper)
+        bot->ModifyMoney(int32(std::min<uint64>(copper, uint64(MAX_MONEY_AMOUNT))));
+    if (!mailed && !sold)
+        return;
+    LOG_INFO("module.coa-playerbots",
+        "BotMgr: order #{} bot '{}' made bag room: mailed {}, sold {} stack(s) for {} copper.", order.orderNo,
+        bot->GetName(), mailed, sold, copper);
+    if (mailed)
+        TellGatherRequester(order, Acore::StringFormat(
+            "|cffffcc00Guild order #{}:|r {} mailed you {} item(s) to make bag room for {}: {}.", order.orderNo,
+            bot->GetName(), mailed, GatherItemName(itemEntry), mailedNames));
 }
 
 void BotMgr::DescribeGatherOrders(ChatHandler* handler) const
@@ -5735,8 +5832,9 @@ void BotMgr::Update(uint32 diff)
                         LOG_INFO("module.coa-playerbots", "BotMgr: order #{} bot '{}' has full bags and could not make room for item {}.",
                             order.orderNo, bot->GetName(), itemEntry);
                         TellGatherRequester(order, Acore::StringFormat(
-                            "|cffff6060Guild order #{}:|r {}'s bags are full and nothing more could be banked or mailed. Free a guild bank slot so it can keep gathering {}.",
-                            order.orderNo, bot->GetName(), GatherItemName(itemEntry)));
+                            "|cffff6060Guild order #{}:|r {}'s bags are full of quest items, consumables and saved gear it "
+                            "keeps, and the guild bank has no room. Free a guild bank slot or clear its bags so it can keep "
+                            "gathering {}.", order.orderNo, bot->GetName(), GatherItemName(itemEntry)));
                     }
                     order.bagsFull = !fits;
                     if (order.remainingCount == 0)
